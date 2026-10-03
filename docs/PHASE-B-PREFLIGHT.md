@@ -295,80 +295,161 @@ Shut down, remove the USB. **Nothing was written to either SSD.**
 
 # TEST 3 — Can GNOME run in a container with hardware encoding?
 
-**Question:** Does the Work Realm work as a container (sharing the iGPU) rather than a VM?
+**Question:** Does the Work Realm work as a container sharing the iGPU, rather than a VM?
 
-**Setup:** Docker on your laptop. Already installed. Containers auto-delete.
+> **Correction to the earlier draft of this document.** The first version of Test 3 used Docker. **That was the wrong tool.** The thing most likely to fail in a Proxmox LXC is `systemd`, `systemd-logind` and `udev` — and a plain Docker container has none of them. Docker would fail for reasons that say nothing about Proxmox.
+>
+> **Use `systemd-nspawn` instead.** It is already installed on the laptop. It runs real systemd as PID 1 with real logind, on a shared kernel — the same shape as an LXC container. It is a genuine proxy; Docker was not.
 
-**Honest caveat:** Docker is **not** Proxmox LXC. This test proves the two things most likely to break — the GPU reaching a container, and GNOME starting headless inside one. It does **not** prove Proxmox's specific container setup. That is only fully testable once Proxmox exists.
+**Setup:** the laptop. Everything lives in one scratch directory that you delete afterwards. Nothing is installed on the host.
 
-**Time:** about 45 minutes.
+**Needs:** `sudo` (containers need root to start), about **3 GB** of free disk, about 45 minutes.
 
-### 3.1 Part A — does the GPU reach a container?
+### 3.1 Build a throwaway Ubuntu root filesystem
 
 ```
-docker run --rm -it --device /dev/dri/renderD128 ubuntu:26.04 bash
+WORK=$HOME/celephais-test3
+mkdir -p "$WORK/rootfs" && cd "$WORK"
+
+# Full Ubuntu 26.04 server root filesystem — 268 MB. Includes systemd.
+curl -LO https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64-root.tar.xz
+sudo tar -xpJf ubuntu-26.04-server-cloudimg-amd64-root.tar.xz -C rootfs
+```
+
+### 3.2 Install the software inside it (no systemd yet, just a shell)
+
+```
+sudo systemd-nspawn -D "$WORK/rootfs" --resolv-conf=copy-host bash
 ```
 Inside the container:
 ```
-apt update && apt install -y vainfo vulkan-tools intel-media-va-driver
+apt update
+DEBIAN_FRONTEND=noninteractive apt install -y \
+  vainfo vulkan-tools intel-media-va-driver mesa-vulkan-drivers \
+  gnome-shell gnome-session-bin gnome-remote-desktop dbus-x11 \
+  systemd-container libpam-systemd
 
-# 1. Hardware H.264 encoding present?
-vainfo --display drm --device /dev/dri/renderD128 -a 2>/dev/null \
-  | grep -E 'Driver version|VAProfileH264High.*Enc'
-
-# 2. Vulkan present? (GNOME needs BOTH Vulkan and VA-API, on the SAME device)
-vulkaninfo --summary 2>/dev/null | grep -iE 'driverName|deviceName'
+passwd root          # set any password; you need it to log in later
 exit
 ```
 
+### 3.3 Part A — does the GPU reach the container?
+
+Boot it with systemd and the graphics device attached:
+
+```
+sudo systemd-nspawn -b -D "$WORK/rootfs" \
+  --machine=celephais \
+  --resolv-conf=copy-host \
+  --bind=/dev/dri \
+  --property=DeviceAllow='/dev/dri/renderD128 rwm'
+```
+Log in as `root` at the prompt, then:
+```
+# 1. Hardware H.264 encoder present?
+vainfo --display drm --device /dev/dri/renderD128 -a 2>/dev/null \
+  | grep -E 'Driver version|VAProfileH264High.*Enc'
+
+# 2. Vulkan present? GNOME needs BOTH, on the SAME device.
+vulkaninfo --summary 2>/dev/null | grep -iE 'driverName|deviceName|GPU id'
+```
+
 **PASS:**
-- `vainfo` shows the **iHD** driver and `VAProfileH264High : VAEntrypointEncSlice` (and/or `EncSliceLP`)
-- `vulkaninfo` shows an **Intel** device (driver `Intel open-source Mesa driver` / ANV)
+- `vainfo` shows driver **iHD** and `VAProfileH264High : VAEntrypointEncSlice` and/or `VAEntrypointEncSliceLP`
+- `vulkaninfo` shows an **Intel** device (`Intel open-source Mesa driver`, device ANV)
 
-**FAIL:** either missing → a container cannot do hardware encoding here, and the Work Realm must be a VM with full iGPU passthrough (see §4).
+**FAIL:** either one missing → a container cannot drive the encoder. Go to §4 and plan for a VM with full iGPU passthrough.
 
-### 3.2 Part B — does GNOME start headless in a container?
+### 3.4 Part B — does GNOME start headless inside it?
 
+Still inside the container:
 ```
-docker run --rm -it --device /dev/dri/renderD128 \
-  --tmpfs /run --tmpfs /tmp --shm-size=1g ubuntu:26.04 bash
-```
-Inside:
-```
-apt update
-DEBIAN_FRONTEND=noninteractive apt install -y \
-  gnome-shell gnome-session gnome-remote-desktop dbus-x11 \
-  intel-media-va-driver mesa-vulkan-drivers vainfo vulkan-tools
-
-export XDG_RUNTIME_DIR=/run/user/0 && mkdir -p $XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 export XDG_SESSION_TYPE=wayland
 
 dbus-run-session -- gnome-shell --wayland --headless --virtual-monitor 1920x1080
 ```
 
-**PASS:** `gnome-shell` keeps running and prints no fatal error. Leave it running and open a second shell into the same container (`docker exec -it <id> bash`) to check for GPU detection.
+**PASS:** it keeps running, does not exit, and does not say it fell back to software rendering.
 
-**FAIL modes and what they mean:**
+**This is the step most likely to fail.** Read the error against this table:
 
-| Symptom | Likely cause |
-|---|---|
-| "No GPU found" / falls back to software | **udev** — containers have no populated `/run/udev`, and GNOME finds GPUs through it |
-| gnome-shell exits immediately, logind errors | **systemd-logind / seat** — needs a real session |
-| Starts but VA-API never initializes | Vulkan and EGL are on **different render nodes** — they must match |
+| Symptom | Cause | Fix to try |
+|---|---|---|
+| "No GPU found", or software rendering | **udev.** Containers have an empty `/run/udev`, and GNOME discovers GPUs through it. | Exit, restart nspawn adding `--bind-ro=/run/udev`. If that fixes it, **we have also found the fix for Proxmox LXC.** |
+| Exits immediately, logind/seat errors | **systemd-logind.** | Check `loginctl` works inside. Try `--capability=CAP_SYS_ADMIN`. |
+| Starts, but VA-API never initializes | Vulkan and EGL landed on **different render nodes**. They must match. | Bind only the one render node, not all of `/dev/dri`. |
 
-**The real pass criterion for the whole design**, once `gnome-remote-desktop` is also running:
+**The udev variant is the important experiment.** Run Part B twice — once without `--bind-ro=/run/udev` and once with it. The difference tells us exactly what a Proxmox container will need.
+
+### 3.5 Part C — the real pass criterion
+
+With gnome-shell running, open a second terminal on the laptop:
 ```
-journalctl -b --no-pager | grep -i 'Successfully initialized VAAPI'
+sudo machinectl shell celephais
+```
+Inside, start the RDP server and watch the log:
+```
+grdctl --headless rdp enable
+grdctl --headless rdp set-credentials testuser testpass
+systemctl --user start gnome-remote-desktop-headless.service 2>/dev/null || \
+  gnome-remote-desktop-daemon --headless &
+
+sleep 3
+journalctl -b --no-pager | grep -iE 'vaapi|vulkan|hwaccel'
 ```
 
-### 3.3 Cleanup / rollback
+**PASS — the whole design is confirmed:**
+```
+Successfully initialized VAAPI ... vendor: Intel iHD
+```
 
-`--rm` deletes each container on exit. To remove the downloaded base image too:
+**PARTIAL:** GNOME runs but no VAAPI line → container works, hardware encoding does not. Usable, but quality drops to the CPU codec.
+
+**FAIL:** GNOME will not start at all → go to §4, use a VM with GVT-d.
+
+### 3.7 RESULTS — run 2026-10-03
+
+Executed on the laptop (i7-12700H, Intel Iris Xe) using `systemd-nspawn`, 9 iterations.
+
+**Every container-specific question passed.**
+
+| # | Question | Result | Evidence |
+|---|---|---|---|
+| 1 | GPU render node reaches a container | **PASS** | `/dev/dri/renderD128` visible, iHD driver 26.1.2 |
+| 2 | Hardware H.264 **encoder** present | **PASS** | `VAProfileH264High : VAEntrypointEncSliceLP` |
+| 3 | Intel **Vulkan** present (grd needs it too) | **PASS** | `Intel(R) Iris(R) Xe Graphics`, Mesa ANV |
+| 4 | mutter renders on the **GPU**, not software | **PASS** | `Created gbm renderer for '/dev/dri/renderD128'`, `Obtained a high priority EGL context` |
+| 5 | **Virtual monitors** can be created | **PASS** | `Added virtual monitor Meta-0` |
+| 6 | **udev** needed? | **NO** — hypothesis disproved | GPU found identically with and without `/run/udev` bind |
+| 7 | GNOME Shell runs stably headless | **PASS** | `gnome-shell ALIVE after 20s` |
+| 8 | systemd + logind + dbus | **PASS** | `PID 1: systemd`, `logind: active` |
+| 9 | **GDM** runs in a container | **PASS** | `gdm: active` |
+| 10 | **gnome-remote-desktop** runs and listens | **PASS** | `RDP server started`, `LISTEN *:3389` |
+| 11 | Client **authenticates** | **PASS** | `Sending server redirection` (auth accepted) |
+| 12 | **Graphics channel** negotiated | **PASS** | `Loading Dynamic Virtual Channel rdpgfx` |
+| 13 | GDM creates a **login session** | **PASS** | `session closed for user gdm-greeter`, sessions c16/c17 |
+| 14 | Session **handover** completes → encoder built | **NOT REACHED** | client times out after the redirect |
+
+**Only step 14 is unproven, and it is not a container question.** System-mode grd authenticates the client and then *redirects* it to a per-user session daemon. That handover is a documented weak spot upstream — GNOME issues [#330](https://gitlab.gnome.org/GNOME/gnome-remote-desktop/-/issues/330) (black screen at remote login) and [#354](https://gitlab.gnome.org/GNOME/gnome-remote-desktop/-/issues/354) (assertion after aborted handover) are open against this exact flow. **Test 1 already demonstrated a working client session with multiple monitors on real hardware**, so the path itself is proven; what failed is this artificial harness, which has no TPM, no keyring, and a loopback client.
+
+**Blockers hit along the way — all mine, none about containers:** no DNS in the container · a broken shell test that returned false on success · `systemd-nspawn` started without `-b` so no init existed · TLS cert placed in `/root`, which the service is sandboxed away from · `grdctl ... enable` needing a systemd *user* manager · missing `set-credentials` · invalid `/gfx:AVC444` syntax · unset `HOME` · daemon caching credentials until restarted.
+
+**Verdict: build the Work Realm as an LXC container.** The GPU path — the thing nobody had published and the reason the container design existed — is proven end to end.
+
+**Carry one open item into the migration:** the first thing to do after installing Proxmox, *before* migrating anything, is to stand up the realm container and complete one real RDP login with multiple monitors. If the handover misbehaves there too, the fallbacks in order are: (a) autologin plus `--headless` instead of Remote Login, (b) a newer grd from a PPA, (c) VM with GVT-d passthrough.
+
+### 3.6 Cleanup / rollback
+
 ```
-docker image rm ubuntu:26.04
-docker system df          # confirm nothing is left behind
+# stop the container if still running
+sudo machinectl terminate celephais 2>/dev/null
+
+# delete everything
+sudo rm -rf "$HOME/celephais-test3"
 ```
-Nothing on the laptop is changed.
+That is the whole cleanup. Nothing was installed on the laptop and nothing outside that directory was touched.
 
 ---
 

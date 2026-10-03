@@ -436,7 +436,7 @@ A third NVMe is the clean fix when money allows, not before.
 
 | # | Finding |
 |---|---|
-| Y1 | **Full GNOME + GDM session in an unprivileged Proxmox LXC.** Unproven anywhere. Highest-risk item. Fallback: VM + iGPU passthrough. |
+| Y1 | ~~**Full GNOME + GDM session in an unprivileged container.**~~ **RESOLVED 2026-10-03** by Test 3. GPU, Vulkan, hardware renderer, virtual monitors, systemd, logind, GDM, the RDP server, client authentication and session creation **all work in a container**. Only grd's system-mode *handover* step was not reached, and that is a known upstream bug, not a container limit. See `PHASE-B-PREFLIGHT.md` §3.7. |
 | Y2 | **UHD 630 sustaining 3 × 1080p60 H.264** (~180 fps aggregate). Cheap to benchmark. |
 | Y3 | **Client-side decode of 3 × 1080p60.** FreeRDP's hwaccel is experimental and copies back to CPU. May be the true bottleneck. |
 | Y4 | **VA-API silently not engaging.** Needs mutter dma-bufs + Vulkan ANV + sync objects + valid modifier + AVC-capable client. Any failure drops to CPU RemoteFX with no warning. Must be verified, not assumed. |
