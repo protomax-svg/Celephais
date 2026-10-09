@@ -29,7 +29,12 @@ import urllib.request
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import celephais_vault  # noqa: E402
 
-HERE = pathlib.Path(__file__).resolve().parent.parent
+if getattr(sys, "frozen", False):
+    # Packed into one executable: the vault sits beside it on the USB stick,
+    # not inside the temporary directory this code was unpacked into.
+    HERE = pathlib.Path(sys.executable).resolve().parent
+else:
+    HERE = pathlib.Path(__file__).resolve().parent.parent
 VAULT = HERE / "celephais.vault"
 ENV_FILE = HERE / ".env"
 

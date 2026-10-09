@@ -3,3 +3,7 @@ vision.md
 celephais.vault
 *.vault.tmp
 __pycache__/
+build/.venv/
+build/work/
+build/dist/
+build/*.spec

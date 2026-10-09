@@ -731,3 +731,36 @@ data differ.
 It looks for an RDP client in this order: `wfreerdp.exe`, `sdl-freerdp3`,
 `xfreerdp3`, `sdl-freerdp`, `xfreerdp`, and says so plainly if none is present.
 It connects with `/f /multimon`, so the Realm covers every monitor.
+
+## One-file Gate — `build/make-gate.sh` / `build/make-gate.ps1` (2026-10-09)
+
+PyInstaller `--onefile`, built in a throwaway venv so nothing is installed
+system-wide. PyInstaller cannot cross-compile, so the `.exe` has to be built on
+a Windows machine; the two scripts take the same arguments.
+
+```bash
+./build/make-gate.sh            # -> build/dist/celephais-gate   (14 MB)
+.\build\make-gate.ps1           # -> build\dist\Gate.exe
+```
+
+The USB layout is then just two files:
+
+```text
+Gate.exe              public, no secrets in it
+celephais.vault       the only secret
+```
+
+When frozen, the Gate resolves the vault next to `sys.executable`, not next to
+the unpacked script, which is what makes the USB layout work at all.
+
+**Verified 2026-10-09:** the Linux build was copied with a vault into an empty
+directory, with no repo and no `.env` present, and listed the live Realms after
+one password. With the vault removed it refuses with a plain message. `strings`
+on the binary does not contain the token.
+
+### Remaining for the full USB flow
+1. **Overlay** — the fullscreen layer and environment selector shown *before* a
+   Realm is picked. FreeRDP already covers the Realm itself with `/f /multimon`.
+2. **Tailscale from the Gate** — right now the client machine must already be on
+   the tailnet. `vision.md` wants the USB to carry its own identity.
+3. **Launch on insert** — the trusted-host helper, per platform, no autorun hacks.
