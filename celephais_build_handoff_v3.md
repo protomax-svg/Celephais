@@ -654,3 +654,48 @@ celephais-gate work
   -> poll until READY             (guest agent IP + TCP 3389 answers)
   -> xfreerdp3 to the Realm IP
 ```
+
+## Target shape, restated by the owner (2026-10-09)
+
+The end product is the USB key flow from `vision.md`, not a terminal command:
+
+```text
+insert USB on any machine
+  -> launch one portable executable
+  -> fullscreen layer over the host OS, across all monitors
+  -> one password, which decrypts the identity material
+  -> Tailscale connection to the Proxmox host
+  -> environment selector
+  -> the Realm, fullscreen, feeling like a different computer
+```
+
+So **Core lives on the Proxmox machine and is always on.** The Gate is the only
+portable part. This overrides the earlier note that preferred Core on a separate
+host: Core is ~150 lines of stdlib Python with no dependencies, so it is run on
+the host as an unprivileged `celephais` user bound to the Tailscale address,
+rather than in its own LXC. If Core ever grows a real dependency stack, move it.
+
+### `deploy/install-core.sh` — run on the Proxmox host, as root
+
+```bash
+./install-core.sh 'PVEAPIToken=gate@pve!core=<uuid>' '<core-token>'
+```
+
+It creates the `celephais` system user, installs `/opt/celephais/celephais_core.py`,
+writes `/etc/celephais/core.env` (0640, root:celephais), and enables
+`celephais-core.service`.
+
+Core then listens **only** on the host's Tailscale IPv4, so the LAN cannot see it
+and the Gate reaches it from anywhere on the tailnet. It talks to Proxmox over
+`127.0.0.1:8006`, so the API token never crosses a network.
+
+Tailscale must already be up on the Proxmox host; the script refuses otherwise.
+
+### Still missing for the USB flow
+1. **Vault** — one password decrypting `CORE_TOKEN` and the Tailscale identity.
+   Do not copy tailnet node state around as a plain config blob.
+2. **Overlay** — fullscreen layer across all monitors, with the environment
+   selector. FreeRDP already covers the Realm itself with `/f /multimon`; what is
+   missing is the selector shown *before* a Realm is picked.
+3. **Portability** — one executable per platform, no install, running from the
+   USB; plus the trusted-host helper that launches it on insert.
