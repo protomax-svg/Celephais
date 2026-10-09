@@ -937,5 +937,28 @@ proves the mechanism: a **new ephemeral node appears in the tailnet** while the
 container runs, which can only come from the Gate's own `tailscaled`. For a
 fully independent check, run the binary on a machine that never had Tailscale.
 
-Already verified without a key: the binary runs in that bare container, unlocks
-the vault and lists live Realms, with no Python and nothing installed.
+**PASS on 2026-10-09**, both the status run and the full flow:
+
+```text
+--- 1. the container is bare ---
+nothing installed
+--- 2. the node must not exist in the tailnet yet ---
+ok: celephais-gate-test is absent
+--- 3. running the Gate in the clean container ---
+Vault password:   tailnet: up
+  work: OFF
+  work: BOOTING
+  work: READY
+192.168.2.114
+PASS: the container joined the tailnet on its own as celephais-gate-test
+```
+
+One password, then the Gate brought up its own tailnet, reached Core, started
+VM 201 headless and waited until RDP was ready, from a container with no
+Tailscale, no Python and no privileges. The ephemeral node disappeared when the
+container exited.
+
+Only the last step, handing over to FreeRDP, was skipped: `--no-connect` is used
+because a container has no display. The proxy argument it would pass is
+`/proxy:socks5://127.0.0.1:<port>`, which FreeRDP 3.32.1 documents under
+`/proxy:`. Run `celephais-gate work` from a desktop to see the window itself.
