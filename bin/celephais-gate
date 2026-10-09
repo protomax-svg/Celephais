@@ -44,8 +44,11 @@ else:
 VAULT = HERE / "celephais.vault"
 ENV_FILE = HERE / ".env"
 
-# Windows has a built-in client, so a clean Windows host needs nothing extra.
-RDP_CLIENTS = (("mstsc.exe",) if os.name == "nt"
+# FreeRDP first wherever it is installed: multimon, dynamic resolution and
+# sound all work there. Windows' own mstsc is the fallback, so a Windows host
+# with nothing installed still works.
+RDP_CLIENTS = (("sdl-freerdp3.exe", "wfreerdp3.exe", "wfreerdp.exe",
+                "sdl-freerdp.exe", "mstsc.exe") if os.name == "nt"
                else ("sdl-freerdp3", "xfreerdp3", "sdl-freerdp", "xfreerdp"))
 
 
@@ -138,7 +141,8 @@ def connect(name, ip, extra):
         target = f"127.0.0.1:{port}"
     try:
         if client.lower().endswith("mstsc.exe"):
-            # mstsc asks for the user and password itself.
+            # Fallback only. mstsc asks for the user and password itself and
+            # takes far fewer options than FreeRDP.
             cmd = [client, f"/v:{target}", "/f"] + extra
         else:
             # No password here. FreeRDP asks for it, so the Gate stores no

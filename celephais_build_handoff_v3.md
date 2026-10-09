@@ -1044,15 +1044,21 @@ PyInstaller cannot cross-compile, so `Gate.exe` has to be built on a Windows
 machine with `build\make-gate.ps1`. Three real problems were found and fixed in
 the code first, so the first Windows run is not spent on them.
 
-### 1. A clean Windows host has no FreeRDP
-It has `mstsc.exe` built in, which is the right thing to use — but `mstsc` has
-no proxy setting, and in userspace networking the Realm is only reachable
-through the SOCKS proxy.
+### 1. A clean Windows host has no FreeRDP *installed*
+FreeRDP is still the client of choice and is used wherever it is present:
+multimon, dynamic resolution and sound all work there. But a Windows machine
+that has never been set up has only `mstsc.exe`, and `mstsc` has no proxy
+setting, while in userspace networking the Realm is reachable only through the
+SOCKS proxy.
 
 **Fix: the Gate carries the connection itself.** `celephais_net.forward()`
 listens on localhost and splices every connection to the Realm through SOCKS5,
-so *any* RDP client works, with no proxy support of its own. The client list is
-now `mstsc.exe` on Windows and the FreeRDP builds elsewhere.
+so *any* RDP client works, with no proxy support of its own. That also makes
+the Linux path simpler, since `/proxy:` is no longer needed at all.
+
+Client order on Windows: `sdl-freerdp3.exe`, `wfreerdp3.exe`, `wfreerdp.exe`,
+`sdl-freerdp.exe`, then `mstsc.exe` as the fallback. Elsewhere: the FreeRDP
+builds, as before.
 
 **Verified against the real thing:** through the real tailnet, an X.224
 connection request sent at `127.0.0.1:<port>` came back as a proper RDP reply
