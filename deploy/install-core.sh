@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
 # Install Celephais Core as a service on the Proxmox host. Run as root, on that host.
 #
-#   ./install-core.sh 'PVEAPIToken=gate@pve!core=<uuid>' '<core-token>'
+#   bash install-core.sh                 # reads ../.env  (preferred: no secrets in argv)
+#   bash install-core.sh 'PVEAPIToken=gate@pve!core=<uuid>' '<core-token>'
 #
 # Core listens only on the host's Tailscale address, so the Gate reaches it from
 # anywhere on the tailnet and nothing on the LAN can see it.
 set -euo pipefail
 
-PVE_TOKEN=${1:?usage: install-core.sh <PVE_TOKEN> <CORE_TOKEN>}
-CORE_TOKEN=${2:?usage: install-core.sh <PVE_TOKEN> <CORE_TOKEN>}
 SRC=$(cd "$(dirname "$0")/.." && pwd)
+
+# Arguments win; otherwise take the tokens from .env, which keeps them out of
+# the command line and the shell history.
+PVE_TOKEN=${1:-${PVE_TOKEN:-}}
+CORE_TOKEN=${2:-${CORE_TOKEN:-}}
+if [ -z "$PVE_TOKEN" ] || [ -z "$CORE_TOKEN" ]; then
+  [ -f "$SRC/.env" ] || { echo "no tokens given and no $SRC/.env found" >&2; exit 1; }
+  set -a; . "$SRC/.env"; set +a
+fi
+[ -n "${PVE_TOKEN:-}" ]  || { echo "PVE_TOKEN is empty" >&2; exit 1; }
+[ -n "${CORE_TOKEN:-}" ] || { echo "CORE_TOKEN is empty" >&2; exit 1; }
 
 command -v tailscale >/dev/null || {
   echo "Tailscale is missing. Install it first:" >&2
