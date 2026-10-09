@@ -7,3 +7,4 @@ build/.venv/
 build/work/
 build/dist/
 build/*.spec
+build/cacert.pem

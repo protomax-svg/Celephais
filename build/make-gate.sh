@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 VENV=build/.venv
 [ -d "$VENV" ] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet pyinstaller cryptography
+"$VENV/bin/pip" install --quiet pyinstaller cryptography certifi
 
 # Carry Tailscale inside the binary so a clean host needs nothing installed.
 TS_BINS=()
@@ -21,13 +21,24 @@ for name in tailscaled tailscale; do
   fi
 done
 
+# Carry a CA bundle too: a minimal host may have no certificate store, and the
+# OAuth path talks to api.tailscale.com over HTTPS.
+CA=$("$VENV/bin/python" -c "import certifi;print(certifi.where())" 2>/dev/null || true)
+[ -n "$CA" ] || CA=/etc/ssl/certs/ca-certificates.crt
+CA_ARG=()
+if [ -f "$CA" ]; then
+  cp "$CA" build/cacert.pem
+  # absolute: --specpath makes relative data paths resolve against the spec dir
+  CA_ARG=(--add-data "$PWD/build/cacert.pem:.")
+fi
+
 "$VENV/bin/pyinstaller" \
   --onefile --clean --noconfirm \
   --name celephais-gate \
   --paths bin \
   --hidden-import celephais_vault \
   --hidden-import celephais_net \
-  "${TS_BINS[@]}" \
+  "${TS_BINS[@]}" "${CA_ARG[@]}" \
   --distpath build/dist --workpath build/work --specpath build \
   bin/celephais-gate
 

@@ -7,7 +7,7 @@ Set-Location (Join-Path $PSScriptRoot "..")
 $venv = "build\.venv"
 if (-not (Test-Path $venv)) { python -m venv $venv }
 & "$venv\Scripts\pip.exe" install --quiet --upgrade pip
-& "$venv\Scripts\pip.exe" install --quiet pyinstaller cryptography
+& "$venv\Scripts\pip.exe" install --quiet pyinstaller cryptography certifi
 
 # Carry Tailscale inside the exe so a clean Windows host needs nothing
 # installed. Install Tailscale once on the BUILD machine, or unpack the
@@ -23,6 +23,12 @@ foreach ($name in @("tailscaled.exe", "tailscale.exe")) {
   else { Write-Warning "$name not found; the build will fall back to host networking" }
 }
 
+# Windows has its own certificate store, but carry the bundle anyway so the
+# behaviour matches the Linux build.
+$ca = & "$venv\Scripts\python.exe" -c "import certifi;print(certifi.where())"
+Copy-Item $ca build\cacert.pem -Force
+$ca = "build\cacert.pem"
+
 & "$venv\Scripts\pyinstaller.exe" `
   --onefile --clean --noconfirm `
   --name Gate `
@@ -30,6 +36,7 @@ foreach ($name in @("tailscaled.exe", "tailscale.exe")) {
   --hidden-import celephais_vault `
   --hidden-import celephais_net `
   @tsArgs `
+  --add-data "$ca;." `
   --distpath build\dist --workpath build\work --specpath build `
   bin\celephais-gate
 

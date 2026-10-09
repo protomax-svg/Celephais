@@ -921,15 +921,23 @@ so at the point it happens.
 
 ### Two kinds of credential, told apart by their prefix
 
-| `TS_AUTHKEY` starts with | What it is | Expires |
+| Vault setting | What it is | Expires |
 |---|---|---|
-| `tskey-auth-` | a plain auth key | after at most 90 days |
-| `tskey-client-` | an OAuth client secret | **never** |
+| `TS_AUTHKEY` | a plain auth key, `tskey-auth-...` | after at most 90 days |
+| `TS_AUTH_CLIENT_SECRET` | an OAuth client secret, `tskey-client-...` | **never** |
+
+The OAuth secret wins when both are present. **Verified on 2026-10-09:** the
+clean-container flow passed on the OAuth path, so nothing needs rotating by hand.
 
 With an OAuth client secret the Gate mints a fresh key on every launch, so
 nothing has to be rotated by hand. Tailscale requires such keys to be tagged,
 so `TS_TAGS` must be set too, and the Gate refuses to start without it rather
 than failing later with an unclear message.
+
+The Gate also carries a CA bundle. A minimal host can have no certificate store
+at all, and the OAuth path calls `api.tailscale.com` over HTTPS; without it the
+bare container failed with `x509: certificate signed by unknown authority`. The
+bundle is handed to the Go binaries through `SSL_CERT_FILE`.
 
 Setting it up, once:
 
@@ -941,7 +949,7 @@ Setting it up, once:
    scope **auth_keys** with write access, tag `tag:celephais-gate`.
 3. Put the secret in the vault:
    ```bash
-   python3 bin/celephais_vault.py set TS_AUTHKEY tskey-client-...
+   python3 bin/celephais_vault.py set TS_AUTH_CLIENT_SECRET tskey-client-...
    python3 bin/celephais_vault.py set TS_TAGS tag:celephais-gate
    ```
 

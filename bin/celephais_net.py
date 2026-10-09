@@ -52,6 +52,24 @@ def bundled(name):
     return found
 
 
+def ca_bundle():
+    """A CA file to hand to the Go binaries, or None to let them decide.
+
+    A minimal host can have no certificate store at all, and the OAuth path
+    calls api.tailscale.com over HTTPS, so the bundle travels with us. Go reads
+    SSL_CERT_FILE on unix and uses the system store on Windows.
+    """
+    if getattr(sys, "frozen", False):
+        packed = pathlib.Path(sys._MEIPASS) / "cacert.pem"
+        if packed.exists():
+            return str(packed)
+    try:
+        import certifi
+        return certifi.where()
+    except Exception:
+        return None
+
+
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -115,7 +133,12 @@ def tailnet(credential, hostname="celephais-gate", tags=""):
             # pipe if the Gate ever runs on a shared Windows host.
             up.append(f"{flag}={credential}")
 
-        result = subprocess.run(up, capture_output=True, text=True, timeout=READY_TIMEOUT)
+        env = dict(os.environ)
+        bundle = ca_bundle()
+        if bundle:
+            env.setdefault("SSL_CERT_FILE", bundle)
+        result = subprocess.run(up, capture_output=True, text=True,
+                                timeout=READY_TIMEOUT, env=env)
         if result.returncode != 0:
             raise NetError(f"tailscale up failed: {(result.stderr or result.stdout).strip()}")
 
