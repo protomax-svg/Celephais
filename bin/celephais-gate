@@ -130,11 +130,25 @@ def rdp_client():
                      + ", ".join(RDP_CLIENTS))
 
 
-def connect(name, ip, extra, say=None):
-    """Open the Realm in an RDP client. `say` reports to the overlay.
+def _last_error(text):
+    """The final complaint out of a FreeRDP log, without its timestamp."""
+    lines = [line for line in (text or "").splitlines() if "[ERROR]" in line]
+    if not lines:
+        return ""
+    return lines[-1].split("] - ", 1)[-1].strip()
 
-    Without it the messages go to print, which nothing reads when the Gate was
-    double-clicked from the stick.
+
+def connect(name, ip, extra, say=None):
+    """Open the Realm in an RDP client. Returns (exit code, what went wrong).
+
+    `say` reports to the overlay. Without it the messages go to print, which
+    nothing reads when the Gate was double-clicked from the stick.
+
+    With `say` the client's stderr is captured and the last error line comes
+    back with the exit code, because from the overlay there is no terminal for
+    it to land in and a bare number says nothing. Without `say` it is left
+    alone: on the command line FreeRDP's own output, and its password prompt,
+    belong to the user's terminal.
     """
     tell = say or (lambda text: print(f"  {text}", flush=True))
     user = cfg("RDP_USER") or getpass.getuser()
@@ -158,7 +172,14 @@ def connect(name, ip, extra, say=None):
                    "/dynamic-resolution", "/clipboard", "/sound",
                    "/cert:ignore"] + extra
         tell(f"connecting to {name} at {ip} as {user}")
-        return subprocess.call(cmd)
+        if say is None:
+            return subprocess.call(cmd), ""
+        # No stdin either. From the overlay there is no terminal to answer a
+        # password prompt on, so let the client fail and say so rather than
+        # block for ever on a question nobody can see.
+        done = subprocess.run(cmd, stderr=subprocess.PIPE, text=True,
+                              stdin=subprocess.DEVNULL)
+        return done.returncode, _last_error(done.stderr)
     finally:
         if listener:
             listener.close()
@@ -199,7 +220,7 @@ def run(args, extra):
     if args.no_connect:
         print(ip)
         return 0
-    return connect(args.realm, ip, extra)
+    return connect(args.realm, ip, extra)[0]
 
 
 def ui_session():
@@ -222,9 +243,9 @@ def ui_session():
         ip = wait_ready(name, say)
         say(f"connecting to {ip}\u2026")
         hide()                        # now, and not a moment earlier
-        code = connect(name, ip, [], say)
+        code, why = connect(name, ip, [], say)
         if code:
-            raise RuntimeError(f"the RDP client exited with code {code}")
+            raise RuntimeError(why or f"the RDP client exited with code {code}")
         return True
 
     def take_seat(name, say):

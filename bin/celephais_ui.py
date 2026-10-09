@@ -44,9 +44,10 @@ FONT = "TkDefaultFont"
 def screens(root):
     """Every physical monitor as (x, y, width, height), in desktop pixels.
 
-    tkinter has no idea where one screen ends and the next begins, so ask the
-    platform. If that fails we fall back to one rectangle covering everything,
-    which still works, it just puts the controls on the seam.
+    Empty when the platform will not say, which is the signal to fall back to
+    a single window and let the window manager fullscreen it wherever it
+    already is. One correct screen beats a window stretched across the whole
+    desktop with its controls sitting on the seam between two monitors.
     """
     rects = []
     try:
@@ -75,8 +76,6 @@ def screens(root):
                 rects.append((int(x), int(y), int(w), int(h)))
     except Exception:                      # no xrandr, no Windows, no display
         pass
-    if not rects:
-        rects = [(0, 0, root.winfo_vrootwidth(), root.winfo_vrootheight())]
     return rects
 
 
@@ -88,17 +87,21 @@ class Overlay:
         self.events = queue.Queue()
         self.root = tk.Tk()
         self.root.title("Celephais")
-        self.rects = screens(self.root)
+        # None means "wherever you are": one window, no placing, which is the
+        # fallback on a host that will not report its monitors.
+        self.rects = screens(self.root) or [None]
 
         self.windows, self.panes = [], []
-        for index, (x, y, w, h) in enumerate(self.rects):
+        for index, rect in enumerate(self.rects):
             win = self.root if index == 0 else tk.Toplevel(self.root)
             win.title("Celephais")
             win.configure(bg=BG)
-            # Place it on the target monitor first; the manager then makes it
-            # fullscreen on the screen it is already sitting on.
-            win.geometry(f"{w}x{h}+{x}+{y}")
-            win.update_idletasks()
+            if rect:
+                # Place it on the target monitor first; the manager then makes
+                # it fullscreen on the screen it is already sitting on.
+                x, y, w, h = rect
+                win.geometry(f"{w}x{h}+{x}+{y}")
+                win.update_idletasks()
             win.attributes("-fullscreen", True)
             win.attributes("-topmost", True)
             win.protocol("WM_DELETE_WINDOW", self.leave)

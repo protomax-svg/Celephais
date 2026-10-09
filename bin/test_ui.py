@@ -125,6 +125,21 @@ try:
     assert pump(app, until=lambda: any("timed out" in t for t in texts(app.panes[0]))), \
         f"a SystemExit vanished instead of being shown: {texts(app.panes[0])}"
 
-    print("PASS")
 finally:
-    app.root.destroy()
+    app.leave()
+
+# A host that will not name its monitors gets one window, fullscreened
+# wherever the manager puts it. One whole screen beats a window stretched
+# across the desktop with its controls on the seam between two monitors.
+real_screens = ui.screens
+ui.screens = lambda root: []
+try:
+    lone = ui.Overlay(hooks)
+    lone.hide()
+    assert lone.rects == [None], lone.rects
+    assert len(lone.windows) == 1 and len(lone.panes) == 1, lone.windows
+    lone.leave()
+finally:
+    ui.screens = real_screens
+
+print("PASS")
