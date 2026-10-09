@@ -569,14 +569,27 @@ pveum user token permissions gate@pve core
 
 ### Run it
 
+Secrets go in `.env` at the repo root, which is gitignored. Copy `.env.example`
+and fill it in. Core reads that file at startup; a real environment variable
+still wins, so systemd can override it.
+
 ```bash
-export PVE_HOST=<proxmox-ip>:8006
-export PVE_NODE=pve
-export PVE_TOKEN='PVEAPIToken=gate@pve!core=<uuid>'
-export CORE_TOKEN=<shared secret for the Gate>
-export PVE_VERIFY_TLS=0          # only while the Proxmox cert is self-signed
+cp .env.example .env
+$EDITOR .env
 python3 bin/celephais_core.py
 ```
+
+Proxmox was found at `192.168.2.103:8006`, node `pve` (read from its TLS cert).
+
+To use the same values in a shell, for a `curl` test:
+
+```bash
+set -a; . ./.env; set +a
+curl -k -i -H "Authorization: $PVE_TOKEN" https://$PVE_HOST/api2/json/version
+```
+
+A Proxmox 401 has an empty body, so `curl -s` with a missing token prints
+nothing at all. Use `-i` when debugging auth.
 
 ### API
 

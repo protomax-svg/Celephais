@@ -24,11 +24,22 @@ not here; the Gate polls until READY and then launches RDP.
 import hmac
 import json
 import os
+import pathlib
 import socket
 import ssl
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Secrets live in .env next to the repo, which is gitignored. A real environment
+# variable still wins, so systemd or a shell export overrides the file.
+_ENV_FILE = pathlib.Path(__file__).resolve().parent.parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
 
 REALMS = {"work": 201, "windows": 100}
 RDP_PORT = 3389
