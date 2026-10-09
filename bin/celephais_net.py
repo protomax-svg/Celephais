@@ -1,0 +1,128 @@
+"""Embedded Tailscale for the Gate. No install, no service, no driver.
+
+Runs the bundled `tailscaled` in userspace networking mode with its state kept
+in memory, so the node registers as ephemeral and disappears when the Gate
+exits. Nothing is written to the host except a short-lived control socket in a
+temporary directory, which carries no secret.
+
+Everything leaves through two local proxies:
+  - an HTTP proxy, used to reach Core
+  - a SOCKS5 proxy, handed to FreeRDP with /proxy:
+
+The auth key is secret vault data. On Linux and macOS it reaches `tailscale up`
+through a FIFO, so it never exists as a file and never appears in the process
+list. Windows has no FIFO, so there it goes on the command line.
+"""
+import contextlib
+import json
+import os
+import pathlib
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+READY_TIMEOUT = int(os.environ.get("TS_READY_TIMEOUT", "60"))
+
+
+class NetError(Exception):
+    pass
+
+
+def bundled(name):
+    """The binary next to us when frozen, otherwise whatever is on PATH."""
+    if getattr(sys, "frozen", False):
+        candidate = pathlib.Path(sys._MEIPASS) / name
+        if candidate.exists():
+            return str(candidate)
+    found = shutil.which(name) or shutil.which(name, path="/usr/sbin:/usr/local/sbin")
+    if not found:
+        raise NetError(f"{name} is not bundled and not on PATH")
+    return found
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _feed_key(path, key):
+    """Write the auth key into the FIFO once tailscale opens it to read."""
+    def run():
+        try:
+            with open(path, "w") as fifo:
+                fifo.write(key)
+        except OSError:
+            pass
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+@contextlib.contextmanager
+def tailnet(authkey, hostname="celephais-gate"):
+    """Bring up userspace Tailscale. Yields {'http_proxy': ..., 'socks5': ...}."""
+    workdir = pathlib.Path(tempfile.mkdtemp(prefix="celephais-"))
+    sock = workdir / "tailscaled.sock"
+    http_port, socks_port = free_port(), free_port()
+    daemon = None
+    try:
+        daemon = subprocess.Popen(
+            [bundled("tailscaled"),
+             "--tun=userspace-networking",
+             "--state=mem:",                      # ephemeral node, nothing on disk
+             f"--socket={sock}",
+             f"--socks5-server=127.0.0.1:{socks_port}",
+             f"--outbound-http-proxy-listen=127.0.0.1:{http_port}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+
+        deadline = time.monotonic() + READY_TIMEOUT
+        while not sock.exists():
+            if daemon.poll() is not None:
+                raise NetError(f"tailscaled exited: {daemon.stderr.read().strip()}")
+            if time.monotonic() > deadline:
+                raise NetError("tailscaled never created its control socket")
+            time.sleep(0.2)
+
+        cli = [bundled("tailscale"), f"--socket={sock}"]
+        up = cli + ["up", f"--hostname={hostname}", "--accept-dns=false"]
+        if hasattr(os, "mkfifo"):
+            fifo = workdir / "key"
+            os.mkfifo(fifo, 0o600)
+            _feed_key(fifo, authkey)
+            up.append(f"--auth-key=file:{fifo}")
+        else:
+            # ponytail: Windows has no FIFO, so the key is on the command line
+            # of a process this user already owns. Replace with a named pipe if
+            # the Gate ever runs on a shared Windows host.
+            up.append(f"--auth-key={authkey}")
+
+        result = subprocess.run(up, capture_output=True, text=True, timeout=READY_TIMEOUT)
+        if result.returncode != 0:
+            raise NetError(f"tailscale up failed: {(result.stderr or result.stdout).strip()}")
+
+        while time.monotonic() < deadline:
+            status = subprocess.run(cli + ["status", "--json"],
+                                    capture_output=True, text=True)
+            if status.returncode == 0:
+                state = json.loads(status.stdout)
+                if state.get("BackendState") == "Running":
+                    break
+            time.sleep(0.5)
+        else:
+            raise NetError("tailnet did not come up in time")
+
+        yield {"http_proxy": f"http://127.0.0.1:{http_port}",
+               "socks5": f"127.0.0.1:{socks_port}"}
+    finally:
+        if daemon and daemon.poll() is None:
+            daemon.terminate()
+            try:
+                daemon.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+        shutil.rmtree(workdir, ignore_errors=True)

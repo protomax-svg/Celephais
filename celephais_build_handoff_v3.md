@@ -882,3 +882,60 @@ Realm that will be restarted and asks for a typed `yes` first; `--yes` skips it.
 `POST /realms/<name>/release` strips the seat from a **stopped** Realm without
 powering anything. It is the inverse of `POST /realms/<name>/seat` and is what
 makes scenario 1's setup deterministic.
+
+## Gate carries its own Tailscale — `bin/celephais_net.py` (2026-10-09)
+
+A clean Windows or Linux host needs nothing installed. Two files are enough:
+
+```text
+Gate.exe / celephais-gate     public, now ~52 MB: tailscaled travels inside it
+celephais.vault               the only secret
+```
+
+### How
+The Gate runs the bundled `tailscaled` with:
+
+```text
+--tun=userspace-networking     no TUN device, no driver, no admin rights
+--state=mem:                   nothing written to disk; registers as EPHEMERAL
+--socket=<temp>/tailscaled.sock
+--socks5-server=127.0.0.1:<port>
+--outbound-http-proxy-listen=127.0.0.1:<port>
+```
+
+Core is reached through the HTTP proxy; FreeRDP gets
+`/proxy:socks5://127.0.0.1:<port>`. When the Gate exits, `tailscaled` is
+terminated and the ephemeral node disappears by itself. No service is
+installed, no machine-wide configuration is written.
+
+### The key
+`TS_AUTHKEY` lives in the vault, like every other secret, and must be a
+**reusable, ephemeral** auth key from the Tailscale admin console. With
+`--state=mem:` there is no saved identity to restore, so each launch is a fresh
+ephemeral node and no interactive login ever happens.
+
+On Linux and macOS the key reaches `tailscale up` through a FIFO, so it is never
+a file and never appears in the process list. Windows has no FIFO, so there it
+goes on the command line of a process the same user already owns; the code says
+so at the point it happens.
+
+`ponytail:` an auth key expires after at most 90 days. The upgrade is an OAuth
+client in the vault that mints an ephemeral key per launch; swap it in when the
+expiry becomes annoying.
+
+Without `TS_AUTHKEY` the Gate simply uses the host's own networking, which is
+how development on an already-connected laptop stays easy. `--no-tailnet`
+forces that.
+
+### Acceptance test — `bin/test_clean_host.sh`
+Runs the built binary and a vault inside a bare `debian:stable-slim` container
+with no tailscale, no tailscaled, no python, no TUN and no added privileges.
+
+**The honest part:** a container still reaches the tailnet through the host's
+routes, so "Core answered" would prove nothing on its own. The test therefore
+proves the mechanism: a **new ephemeral node appears in the tailnet** while the
+container runs, which can only come from the Gate's own `tailscaled`. For a
+fully independent check, run the binary on a machine that never had Tailscale.
+
+Already verified without a key: the binary runs in that bare container, unlocks
+the vault and lists live Realms, with no Python and nothing installed.
