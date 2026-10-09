@@ -15,10 +15,13 @@ def fake_pve(method, path, **form):
     if path.endswith("/network-get-interfaces"):
         if not fake.agent:
             raise OSError("QEMU guest agent is not running")
-        return [{"ip-addresses": [
-            {"ip-address-type": "ipv4", "ip-address": "127.0.0.1"},
-            {"ip-address-type": "ipv6", "ip-address": "fe80::1"},
-            {"ip-address-type": "ipv4", "ip-address": "192.168.2.50"}]}]
+        # the real PVE agent reply is wrapped in "result"
+        return {"result": [
+            {"name": "lo", "ip-addresses": [
+                {"ip-address-type": "ipv4", "ip-address": "127.0.0.1"}]},
+            {"name": "enp6s18", "ip-addresses": [
+                {"ip-address-type": "ipv6", "ip-address": "fe80::1"},
+                {"ip-address-type": "ipv4", "ip-address": "192.168.2.50"}]}]}
     return {}
 
 
@@ -86,6 +89,10 @@ assert code == 200 and {r["realm"] for r in body} == {"work", "windows"}, body
 fake.status = "stopped"
 code, body = call("/realms/work/start", method="POST")
 assert code == 202 and body["vmid"] == 201, body
+
+fake.status = "running"
+code, body = call("/realms/work/stop", method="POST")
+assert body["state"] == "STOPPING", body   # not BOOTING: the agent is already gone
 
 srv.shutdown()
 print("PASS")

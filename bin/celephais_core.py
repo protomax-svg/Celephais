@@ -75,6 +75,8 @@ def realm_ip(vmid):
         # anyway: a silent None hides a permission error as an endless BOOTING.
         print(f"realm_ip({vmid}): {exc}", file=sys.stderr, flush=True)
         return None
+    if isinstance(ifaces, dict):          # PVE wraps the agent reply in "result"
+        ifaces = ifaces.get("result") or []
     for iface in ifaces or []:
         for addr in iface.get("ip-addresses") or []:
             ip = addr.get("ip-address", "")
@@ -137,6 +139,11 @@ class Handler(BaseHTTPRequestHandler):
                     pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/start")
                 elif parts[2] == "stop" and running:
                     pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/shutdown")
+                    # The guest is still "running" to Proxmox for a few seconds
+                    # more, and its agent is already gone, so realm_state would
+                    # read that as BOOTING. Say what was actually asked for.
+                    return self._reply(202, {"realm": name, "vmid": vmid,
+                                             "state": "STOPPING", "ip": None})
                 return self._reply(202, realm_state(name))
         except KeyError:
             return self._reply(404, {"error": "unknown realm"})

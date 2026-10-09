@@ -605,10 +605,14 @@ POST /realms/<name>/stop  -> 202 + current state
 
 All calls need `Authorization: Bearer $CORE_TOKEN`.
 
-States are `OFF -> BOOTING -> READY`. `READY` means the guest agent reported an
-IPv4 address *and* TCP 3389 accepts a connection, so the Gate can connect at once.
-`CONNECTING` and `ONLINE` belong to the Gate, not to Core. There is no `STOPPING`
-state: after a stop the Gate polls until the Realm reads `OFF`.
+States are `OFF -> BOOTING -> READY`, and `STOPPING` as the reply to a stop.
+`READY` means the guest agent reported an IPv4 address *and* TCP 3389 accepts a
+connection, so the Gate can connect at once. `CONNECTING` and `ONLINE` belong to
+the Gate, not to Core. `STOPPING` is returned only by `POST /stop`; polling after
+that reads `BOOTING` briefly, then `OFF`.
+
+**Verified against the real host 2026-10-09 — PASS.** Full cycle on VM 201:
+`OFF -> BOOTING -> READY (ip 192.168.2.114) -> STOPPING -> OFF`.
 
 Realm registry is the `REALMS` dict at the top of the file, same as the switcher.
 
