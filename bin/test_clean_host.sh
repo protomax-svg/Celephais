@@ -27,7 +27,8 @@ NODE=celephais-gate-test
 [ -x "$BIN" ] || { echo "build it first: ./build/make-gate.sh" >&2; exit 1; }
 
 set -a; [ -f .env ] && . ./.env; set +a
-: "${TS_AUTHKEY:?set TS_AUTHKEY (a reusable ephemeral key) in .env}"
+TS_CRED=${TS_AUTH_CLIENT_SECRET:-${TS_AUTHKEY:-}}
+[ -n "$TS_CRED" ] || { echo "set TS_AUTH_CLIENT_SECRET or TS_AUTHKEY in .env" >&2; exit 1; }
 : "${CORE_URL:?set CORE_URL in .env}"
 : "${CORE_TOKEN:?set CORE_TOKEN in .env}"
 
@@ -36,13 +37,14 @@ trap 'rm -rf "$STAGE" "$OUT"; docker rm -f "$NODE" >/dev/null 2>&1 || true' EXIT
 cp "$BIN" "$STAGE/celephais-gate"
 
 PASSWORD="clean-host-test-$RANDOM$RANDOM"
-PASSWORD="$PASSWORD" NODE="$NODE" python3 - "$STAGE" <<'PYEOF'
+PASSWORD="$PASSWORD" NODE="$NODE" TS_CRED="$TS_CRED" python3 - "$STAGE" <<'PYEOF'
 import os, pathlib, sys
 sys.path.insert(0, "bin")
 import celephais_vault as v
 v.save(pathlib.Path(sys.argv[1]) / "celephais.vault", os.environ["PASSWORD"],
        {"CORE_URL": os.environ["CORE_URL"], "CORE_TOKEN": os.environ["CORE_TOKEN"],
-        "TS_AUTHKEY": os.environ["TS_AUTHKEY"], "TS_HOSTNAME": os.environ["NODE"],
+        "TS_AUTH_CLIENT_SECRET": os.environ["TS_CRED"],
+        "TS_TAGS": os.environ.get("TS_TAGS", ""), "TS_HOSTNAME": os.environ["NODE"],
         "RDP_USER": os.environ.get("RDP_USER", "max")})
 PYEOF
 echo "staged: the binary and a vault holding the tailnet key"

@@ -193,7 +193,8 @@ def main():
         raise SystemExit("gate: no CORE_TOKEN. Create a vault with "
                          "`python3 bin/celephais_vault.py init --from-env`.")
 
-    authkey = cfg("TS_AUTHKEY")
+    # An OAuth client secret never expires, so prefer it over a plain auth key.
+    authkey = cfg("TS_AUTH_CLIENT_SECRET") or cfg("TS_AUTHKEY")
     if not authkey or args.no_tailnet:
         return run(args, extra)
 
