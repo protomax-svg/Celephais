@@ -544,11 +544,28 @@ pveum user add gate@pve
 pveum role add CelephaisCore -privs "VM.Audit VM.PowerMgmt VM.Monitor"
 pveum aclmod /vms/201 -user gate@pve -role CelephaisCore
 pveum aclmod /vms/100 -user gate@pve -role CelephaisCore
-pveum user token add gate@pve core --privsep 0
+
+# separated token: it carries its own ACL, it does not inherit the user's
+pveum user token add gate@pve core --privsep 1
+pveum aclmod /vms/201 -token 'gate@pve!core' -role CelephaisCore
+pveum aclmod /vms/100 -token 'gate@pve!core' -role CelephaisCore
 ```
 
-`VM.Monitor` is what lets Core ask the QEMU guest agent for the Realm IP.
-Copy the printed token value once; Proxmox does not show it again.
+Use `--privsep 1`, which is what Proxmox recommends when a token is meant to
+hold its own limited rights. With `--privsep 0` the token simply inherits
+everything the user has, so a later widening of `gate@pve` silently widens the
+token too. With `--privsep 1` the effective rights are the *intersection* of the
+user ACL and the token ACL, so both sets of `aclmod` lines above are required.
+
+`VM.Audit` reads status, `VM.PowerMgmt` starts and shuts down, and `VM.Monitor`
+lets Core ask the QEMU guest agent for the Realm IP. Copy the printed token value
+once; Proxmox does not show it again.
+
+Check the result with:
+
+```bash
+pveum user token permissions gate@pve core
+```
 
 ### Run it
 
