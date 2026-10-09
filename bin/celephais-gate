@@ -130,6 +130,7 @@ def main():
     ap.add_argument("--stop", action="store_true", help="shut the realm down")
     ap.add_argument("--local", action="store_true",
                     help="give this realm the RTX, the monitors and the USB input")
+    ap.add_argument("--yes", action="store_true", help="do not ask before a restart")
     ap.add_argument("--no-connect", action="store_true", help="start and wait, do not launch RDP")
     args, extra = ap.parse_known_args()
 
@@ -150,6 +151,16 @@ def main():
         return 0
 
     if args.local:
+        # PCI passthrough cannot be hot-added, so a Realm that is already
+        # running has to be restarted to take the seat. Unsaved work would be
+        # lost, so say so and ask.
+        victims = [r["realm"] for r in core("/realms")
+                   if r.get("power") in ("BOOTING", "READY")
+                   and (r["realm"] == args.realm or r.get("seat"))]
+        if victims and not args.yes:
+            print(f"  this restarts: {', '.join(victims)}")
+            if input("  unsaved work there will be lost. type yes to go on: ") != "yes":
+                raise SystemExit("gate: cancelled")
         # The Realm takes over the physical desktop, so there is nothing for
         # this machine to connect to.
         reply = core(f"/realms/{args.realm}/seat", "POST")

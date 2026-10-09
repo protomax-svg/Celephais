@@ -134,6 +134,17 @@ assert status_of("/realms/nope/seat", method="POST") == 404
 code, body = call("/seat")
 assert body["owner"] == "work", body
 
+# release is the inverse: it strips the seat without powering anything
+fake.seat_calls = []
+code, body = call("/realms/work/release", method="POST")
+assert code == 200 and fake.seat_calls == [("release", "work")], fake.seat_calls
+assert body["owner"] is None, body
+
+# releasing an already headless realm must not need root at all
+fake.seat, fake.seat_calls = False, []
+code, body = call("/realms/work/release", method="POST")
+assert code == 200 and fake.seat_calls == [], fake.seat_calls
+
 fake.status = "running"
 code, body = call("/realms/work/stop", method="POST")
 assert body["power"] == "STOPPING", body   # not BOOTING: the agent is already gone

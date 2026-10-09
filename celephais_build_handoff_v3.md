@@ -823,3 +823,36 @@ celephais-gate --status       # power and seat for every Realm
 Two Linux Realms at once: one holding the seat on the RTX, the other running
 headless and reachable over RDP. Needs the Personal Realm, VM 202, which does
 not exist yet. Adding it is one line in `REALMS` in both Core and the switcher.
+
+## Hardware scenarios — `bin/test_scenarios.py` (2026-10-09)
+
+Four scenarios that prove power and seat stay independent. This is not a unit
+test: it starts, stops and restarts real VMs and moves the RTX between them, so
+the physical monitors switch while it runs. `--yes` is required.
+
+```bash
+python3 bin/test_scenarios.py --yes            # all four
+python3 bin/test_scenarios.py --yes --only 1,2
+```
+
+| # | Start state | Action | Must happen |
+|---|---|---|---|
+| 1 | work OFF, no seat | remote start | READY, seat stays false, has an IP |
+| 2 | work OFF, **holding** seat | remote start | seat dropped first, then READY remotely |
+| 3 | work READY headless, no seat | `--local` | work takes the RTX and USB |
+| 4 | windows READY with seat, work OFF | remote start work | both keep running, windows keeps the seat |
+
+Scenarios 2, 3 and 4 change passthrough, so **Core must be installed on the
+Proxmox host** first (`deploy/install-core.sh`). Run from a laptop against a
+laptop-hosted Core, they fail with `409 local seat: sudo: interactive
+authentication is required` — which is itself the correct refusal.
+
+### Scenario 3 is a restart, not a hot-plug
+PCI passthrough cannot be hot-added to a running VM. Taking the Local Seat
+therefore means a controlled stop, reconfigure and start. The Gate names every
+Realm that will be restarted and asks for a typed `yes` first; `--yes` skips it.
+
+### New Core endpoint
+`POST /realms/<name>/release` strips the seat from a **stopped** Realm without
+powering anything. It is the inverse of `POST /realms/<name>/seat` and is what
+makes scenario 1's setup deterministic.

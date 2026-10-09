@@ -23,7 +23,8 @@ API:
   GET  /seat                -> {owner: <realm name or null>}
   POST /realms/<name>/start -> 202, started headless, never with the seat
   POST /realms/<name>/stop  -> 202
-  POST /realms/<name>/seat  -> 200, give that Realm the Local Seat
+  POST /realms/<name>/seat    -> 200, give that Realm the Local Seat
+  POST /realms/<name>/release -> 200, strip the seat from a stopped Realm
 
 power: OFF -> BOOTING -> READY, plus STOPPING after a stop and ERROR if
 Proxmox cannot answer for that Realm. seat is a separate boolean. CONNECTING
@@ -184,10 +185,13 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and len(parts) == 2 and parts[0] == "realms":
                 return self._reply(200, realm_state(parts[1]))
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
-                    and parts[2] == "seat"):
-                name = parts[1]
-                REALMS[name]                     # 404 for an unknown realm
-                return self._reply(200, {"result": seat_cmd("switch", name),
+                    and parts[2] in ("seat", "release")):
+                name, vmid = parts[1], REALMS[parts[1]]
+                if parts[2] == "release" and not has_seat(vmid):
+                    return self._reply(200, {"result": "already headless",
+                                             "owner": seat_owner()})
+                action = "switch" if parts[2] == "seat" else "release"
+                return self._reply(200, {"result": seat_cmd(action, name),
                                          "owner": seat_owner()})
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
                     and parts[2] in ("start", "stop")):
