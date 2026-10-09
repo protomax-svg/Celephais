@@ -530,3 +530,59 @@ the logic against a fake `qm`, so it needs no Proxmox.
 
 **Verified on the real Proxmox host 2026-10-09 — PASS.** Work <-> Windows seat switching
 works end to end. Do not repeat the manual `qm set` sequence by hand; use the script.
+
+## Celephais Core — `bin/celephais_core.py` (2026-10-09)
+
+The control plane from the MVP flow above. Stdlib Python only, no dependencies.
+Runs on the service LXC or the always-on server, **not** on the hypervisor.
+It is the only thing that holds the Proxmox credential.
+
+### Proxmox API token — narrow scope, not root
+
+```bash
+pveum user add gate@pve
+pveum role add CelephaisCore -privs "VM.Audit VM.PowerMgmt VM.Monitor"
+pveum aclmod /vms/201 -user gate@pve -role CelephaisCore
+pveum aclmod /vms/100 -user gate@pve -role CelephaisCore
+pveum user token add gate@pve core --privsep 0
+```
+
+`VM.Monitor` is what lets Core ask the QEMU guest agent for the Realm IP.
+Copy the printed token value once; Proxmox does not show it again.
+
+### Run it
+
+```bash
+export PVE_HOST=<proxmox-ip>:8006
+export PVE_NODE=pve
+export PVE_TOKEN='PVEAPIToken=gate@pve!core=<uuid>'
+export CORE_TOKEN=<shared secret for the Gate>
+export PVE_VERIFY_TLS=0          # only while the Proxmox cert is self-signed
+python3 bin/celephais_core.py
+```
+
+### API
+
+```text
+GET  /realms              -> [ {realm, vmid, state, ip}, ... ]
+GET  /realms/<name>       -> {realm, vmid, state, ip}
+POST /realms/<name>/start -> 202 + current state
+POST /realms/<name>/stop  -> 202 + current state
+```
+
+All calls need `Authorization: Bearer $CORE_TOKEN`.
+
+States are `OFF -> BOOTING -> READY`. `READY` means the guest agent reported an
+IPv4 address *and* TCP 3389 accepts a connection, so the Gate can connect at once.
+`CONNECTING` and `ONLINE` belong to the Gate, not to Core. There is no `STOPPING`
+state: after a stop the Gate polls until the Realm reads `OFF`.
+
+Realm registry is the `REALMS` dict at the top of the file, same as the switcher.
+
+`bin/test_core.py` checks state resolution, token auth and routing against a fake
+Proxmox, so it needs no Proxmox. Not yet run against the real host.
+
+### Not built yet
+Gate client · Realm-local Tailscale or subnet router · calling the Local Seat
+switcher from Core · any persistent state. Core is stateless; it reads the truth
+from Proxmox on every request.
