@@ -9,9 +9,17 @@ Everything leaves through two local proxies:
   - an HTTP proxy, used to reach Core
   - a SOCKS5 proxy, handed to FreeRDP with /proxy:
 
-The auth key is secret vault data. On Linux and macOS it reaches `tailscale up`
-through a FIFO, so it never exists as a file and never appears in the process
-list. Windows has no FIFO, so there it goes on the command line.
+The credential is secret vault data. On Linux and macOS it reaches
+`tailscale up` through a FIFO, so it never exists as a file and never appears
+in the process list. Windows has no FIFO, so there it goes on the command line.
+
+Two kinds of credential are accepted, told apart by their prefix:
+
+  tskey-auth-...    a plain auth key. Expires after at most 90 days.
+  tskey-client-...  an OAuth client secret. Does NOT expire, mints a fresh key
+                    on every launch, and requires tags.
+
+The node is ephemeral either way, because the state is kept in memory.
 """
 import contextlib
 import json
@@ -64,8 +72,11 @@ def _feed_key(path, key):
 
 
 @contextlib.contextmanager
-def tailnet(authkey, hostname="celephais-gate"):
+def tailnet(credential, hostname="celephais-gate", tags=""):
     """Bring up userspace Tailscale. Yields {'http_proxy': ..., 'socks5': ...}."""
+    oauth = credential.startswith("tskey-client-")
+    if oauth and not tags:
+        raise NetError("an OAuth client secret needs TS_TAGS, e.g. tag:celephais-gate")
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="celephais-"))
     sock = workdir / "tailscaled.sock"
     http_port, socks_port = free_port(), free_port()
@@ -90,16 +101,19 @@ def tailnet(authkey, hostname="celephais-gate"):
 
         cli = [bundled("tailscale"), f"--socket={sock}"]
         up = cli + ["up", f"--hostname={hostname}", "--accept-dns=false"]
+        if tags:
+            up.append(f"--advertise-tags={tags}")
+        flag = "--client-secret" if oauth else "--auth-key"
         if hasattr(os, "mkfifo"):
             fifo = workdir / "key"
             os.mkfifo(fifo, 0o600)
-            _feed_key(fifo, authkey)
-            up.append(f"--auth-key=file:{fifo}")
+            _feed_key(fifo, credential)
+            up.append(f"{flag}=file:{fifo}")
         else:
-            # ponytail: Windows has no FIFO, so the key is on the command line
-            # of a process this user already owns. Replace with a named pipe if
-            # the Gate ever runs on a shared Windows host.
-            up.append(f"--auth-key={authkey}")
+            # ponytail: Windows has no FIFO, so the secret is on the command
+            # line of a process this user already owns. Replace with a named
+            # pipe if the Gate ever runs on a shared Windows host.
+            up.append(f"{flag}={credential}")
 
         result = subprocess.run(up, capture_output=True, text=True, timeout=READY_TIMEOUT)
         if result.returncode != 0:

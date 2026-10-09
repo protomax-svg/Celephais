@@ -198,7 +198,8 @@ def main():
         return run(args, extra)
 
     try:
-        with celephais_net.tailnet(authkey, cfg("TS_HOSTNAME", "celephais-gate")) as net:
+        with celephais_net.tailnet(authkey, cfg("TS_HOSTNAME", "celephais-gate"),
+                                   cfg("TS_TAGS")) as net:
             NET.update(net)
             print("  tailnet: up", flush=True)
             return run(args, extra)

@@ -919,9 +919,34 @@ a file and never appears in the process list. Windows has no FIFO, so there it
 goes on the command line of a process the same user already owns; the code says
 so at the point it happens.
 
-`ponytail:` an auth key expires after at most 90 days. The upgrade is an OAuth
-client in the vault that mints an ephemeral key per launch; swap it in when the
-expiry becomes annoying.
+### Two kinds of credential, told apart by their prefix
+
+| `TS_AUTHKEY` starts with | What it is | Expires |
+|---|---|---|
+| `tskey-auth-` | a plain auth key | after at most 90 days |
+| `tskey-client-` | an OAuth client secret | **never** |
+
+With an OAuth client secret the Gate mints a fresh key on every launch, so
+nothing has to be rotated by hand. Tailscale requires such keys to be tagged,
+so `TS_TAGS` must be set too, and the Gate refuses to start without it rather
+than failing later with an unclear message.
+
+Setting it up, once:
+
+1. In the ACL, allow the tag and let yourself own it:
+   ```json
+   "tagOwners": { "tag:celephais-gate": ["autogroup:admin"] }
+   ```
+2. https://login.tailscale.com/admin/settings/oauth -> **Generate OAuth client**,
+   scope **auth_keys** with write access, tag `tag:celephais-gate`.
+3. Put the secret in the vault:
+   ```bash
+   python3 bin/celephais_vault.py set TS_AUTHKEY tskey-client-...
+   python3 bin/celephais_vault.py set TS_TAGS tag:celephais-gate
+   ```
+
+The node stays ephemeral either way, because that comes from `--state=mem:`,
+not from the key.
 
 Without `TS_AUTHKEY` the Gate simply uses the host's own networking, which is
 how development on an already-connected laptop stays easy. `--no-tailnet`
