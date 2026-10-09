@@ -995,3 +995,45 @@ Only the last step, handing over to FreeRDP, was skipped: `--no-connect` is used
 because a container has no display. The proxy argument it would pass is
 `/proxy:socks5://127.0.0.1:<port>`, which FreeRDP 3.32.1 documents under
 `/proxy:`. Run `celephais-gate work` from a desktop to see the window itself.
+
+## The overlay — `bin/celephais_ui.py` (2026-10-09)
+
+The black layer from `vision.md`, over whatever the host OS is already running.
+
+```text
+launch -> black layer on every monitor -> one password -> environment selector
+```
+
+Plain tkinter, which ships with Python, so the one-file build gains no
+dependency. The window is borderless (`overrideredirect`), topmost, and sized
+to the **virtual desktop** rather than to one screen, which is what spans
+several monitors on both X11 and Windows. Measured here: 5120x1440 across two.
+
+Slow work — the tailnet coming up, a Realm booting — runs in a worker thread
+and reports back through `after`, so the layer never freezes. Esc leaves.
+
+Each Realm row offers the two operations the model keeps separate:
+
+| Button | What it does |
+|---|---|
+| **open here** | remote: headless start, wait for READY, RDP on this machine |
+| **use the monitors** | the Local Seat: that Realm takes the RTX and the physical screens |
+
+A Realm holding the seat is marked `on the monitors`. While RDP is running the
+overlay hides itself and drops topmost, so the session is not covered, and comes
+back when the session ends.
+
+### How it starts
+`--ui` forces it. The frozen binary with **no arguments at all** also shows it,
+which is the double-click-from-the-USB case. Everything else stays the command
+line it was.
+
+### `bin/test_ui.py`
+Builds both screens with fake hooks in a **hidden** window, so it is safe to run
+on a desktop in use. It checks that the layer is frameless and spans the whole
+desktop, that the password is masked, that a wrong password returns to the same
+screen carrying the reason, and that the Realm list shows power and seat.
+
+It found a real bug on the first run: Python clears the name bound by
+`except ... as exc` at the end of the block, so the callback that reported the
+failure raised `NameError` instead, and every error would have been silent.

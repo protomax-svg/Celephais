@@ -19,6 +19,7 @@ password. If there is no vault yet it falls back to `.env`, for development:
   RDP_USER    guest username (default: the local username)
 """
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -98,7 +99,7 @@ def core(path, method="GET"):
         raise SystemExit(f"gate: cannot reach Core at {cfg('CORE_URL')}: {exc}")
 
 
-def wait_ready(name):
+def wait_ready(name, say=None):
     """Poll until the Realm can take an RDP connection. Returns its IP."""
     deadline = time.monotonic() + int(cfg("BOOT_TIMEOUT", "180"))
     last = None
@@ -106,7 +107,8 @@ def wait_ready(name):
         realm = core(f"/realms/{name}")
         if realm["power"] != last:
             last = realm["power"]
-            print(f"  {name}: {last}", flush=True)
+            (say or (lambda text: print(f"  {text}", flush=True)))(
+                f"{name}: {last}" if say is None else last.lower())
         if realm["power"] == "READY":
             return realm["ip"]
         if realm["power"] == "ERROR":
@@ -175,6 +177,38 @@ def run(args, extra):
     return connect(args.realm, ip, extra)
 
 
+def ui_session():
+    """Hooks for the overlay. One ExitStack keeps the tailnet up throughout."""
+    stack = contextlib.ExitStack()
+
+    def unlock(password):
+        CFG.clear()
+        CFG.update(celephais_vault.load(VAULT, password))
+        credential = cfg("TS_AUTH_CLIENT_SECRET") or cfg("TS_AUTHKEY")
+        if credential:
+            NET.update(stack.enter_context(celephais_net.tailnet(
+                credential, cfg("TS_HOSTNAME", "celephais-gate"), cfg("TS_TAGS"))))
+        core("/realms")               # fail here, while there is a place to say so
+        return True
+
+    def open_remote(name, say):
+        say("starting\u2026")
+        core(f"/realms/{name}/start", "POST")
+        ip = wait_ready(name, say)
+        say(f"connecting to {ip}\u2026")
+        connect(name, ip, [])
+        return True
+
+    def take_seat(name, say):
+        say("handing over the monitors\u2026")
+        reply = core(f"/realms/{name}/seat", "POST")
+        say(f"local seat: {reply['owner']}")
+        return True
+
+    return stack, {"unlock": unlock, "realms": lambda: core("/realms"),
+                   "open_remote": open_remote, "take_seat": take_seat}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Open a Celephais Realm.")
     ap.add_argument("realm", nargs="?", help="realm name, e.g. work")
@@ -185,8 +219,18 @@ def main():
     ap.add_argument("--yes", action="store_true", help="do not ask before a restart")
     ap.add_argument("--no-tailnet", action="store_true",
                     help="use the host network instead of the Gate's own tailnet")
+    ap.add_argument("--ui", action="store_true",
+                    help="the fullscreen overlay instead of the command line")
     ap.add_argument("--no-connect", action="store_true", help="start and wait, do not launch RDP")
     args, extra = ap.parse_known_args()
+
+    # Double-clicked from the USB stick, with no arguments: show the overlay.
+    if args.ui or (getattr(sys, "frozen", False) and len(sys.argv) == 1):
+        import celephais_ui
+        stack, hooks = ui_session()
+        with stack:
+            celephais_ui.run(hooks)
+        return 0
 
     CFG.update(secrets())
     if not cfg("CORE_TOKEN"):

@@ -35,6 +35,7 @@ $ca = "build\cacert.pem"
   --paths bin `
   --hidden-import celephais_vault `
   --hidden-import celephais_net `
+  --hidden-import celephais_ui `
   @tsArgs `
   --add-data "$ca;." `
   --distpath build\dist --workpath build\work --specpath build `

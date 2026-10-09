@@ -38,6 +38,7 @@ fi
   --paths bin \
   --hidden-import celephais_vault \
   --hidden-import celephais_net \
+  --hidden-import celephais_ui \
   "${TS_BINS[@]}" "${CA_ARG[@]}" \
   --distpath build/dist --workpath build/work --specpath build \
   bin/celephais-gate
