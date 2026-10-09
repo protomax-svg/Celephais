@@ -24,7 +24,9 @@ overlay never freezes.
 `hooks` is supplied by the Gate:
   unlock(password)        -> opens the vault and brings the tailnet up
   realms()                -> list of {realm, vmid, power, seat, ip}
-  open_remote(name, say)  -> starts it, waits for READY, launches RDP
+  open_remote(name, say, hide)
+                          -> starts it, waits for READY, launches RDP.
+                             It calls hide() just before the RDP window opens.
   take_seat(name, say)    -> hands it the physical monitors
 """
 import queue
@@ -174,7 +176,11 @@ class Overlay:
         def run():
             try:
                 result = job()
-            except Exception as exc:                # show it, never swallow it
+            except (Exception, SystemExit) as exc:  # show it, never swallow it
+                # SystemExit is a BaseException, so `except Exception` let it
+                # past. The Gate raises it for a boot timeout and for a missing
+                # RDP client, and the thread died silently every time: no
+                # message, and the overlay stayed hidden for ever.
                 # Python clears the name at the end of the except block, so
                 # the callback has to capture it under its own name.
                 failure = exc
@@ -307,14 +313,20 @@ class Overlay:
             self.show_realms(str(error) if error else "")
 
         if action == "open_remote":
-            # The RDP window has to be on top of us, not under us.
-            self.hide()
+            # Stay visible and keep reporting while the Realm boots. Only the
+            # RDP window itself has to be on top of us, and the Gate says when
+            # it is about to open one.
+            def hide_now():
+                """Called from the worker thread, so hand it to the UI one."""
+                hidden = threading.Event()
+                self.post(lambda: (self.hide(), hidden.set()))
+                hidden.wait(timeout=5)
 
             def finished(result, error):
                 self.show()
                 done(result, error)
 
-            self.work(lambda: self.hooks[action](name, say), finished)
+            self.work(lambda: self.hooks[action](name, say, hide_now), finished)
         else:
             self.work(lambda: self.hooks[action](name, say), done)
 

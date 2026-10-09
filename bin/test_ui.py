@@ -31,7 +31,7 @@ hooks = {
     "unlock": lambda password: (calls.append(("unlock", password)) or True
                                 if password == "right" else _wrong()),
     "realms": lambda: REALMS,
-    "open_remote": lambda name, say: calls.append(("open", name)),
+    "open_remote": lambda name, say, hide: calls.append(("open", name)),
     "take_seat": lambda name, say: calls.append(("seat", name)),
 }
 
@@ -113,6 +113,17 @@ try:
     assert any("on the monitors" in t for t in shown), f"seat not shown: {shown}"
     assert any("ready" in t for t in shown), f"power not shown: {shown}"
     assert ("unlock", "right") in calls, calls
+
+    # A hook that raises SystemExit must still reach the screen. wait_ready and
+    # rdp_client both raise it, and `except Exception` used to let it past: the
+    # worker thread died without a word and the overlay waited for ever.
+    def explode(name, say):
+        raise SystemExit("the boot timed out")
+
+    hooks["take_seat"] = explode
+    app.go("take_seat", "work")
+    assert pump(app, until=lambda: any("timed out" in t for t in texts(app.panes[0]))), \
+        f"a SystemExit vanished instead of being shown: {texts(app.panes[0])}"
 
     print("PASS")
 finally:

@@ -130,7 +130,13 @@ def rdp_client():
                      + ", ".join(RDP_CLIENTS))
 
 
-def connect(name, ip, extra):
+def connect(name, ip, extra, say=None):
+    """Open the Realm in an RDP client. `say` reports to the overlay.
+
+    Without it the messages go to print, which nothing reads when the Gate was
+    double-clicked from the stick.
+    """
+    tell = say or (lambda text: print(f"  {text}", flush=True))
     user = cfg("RDP_USER") or getpass.getuser()
     client = rdp_client()
     target, listener = ip, None
@@ -151,7 +157,7 @@ def connect(name, ip, extra):
             cmd = [client, f"/v:{target}", f"/u:{user}", "/f", "/multimon",
                    "/dynamic-resolution", "/clipboard", "/sound",
                    "/cert:ignore"] + extra
-        print(f"  connecting to {name} at {ip} as {user}", flush=True)
+        tell(f"connecting to {name} at {ip} as {user}")
         return subprocess.call(cmd)
     finally:
         if listener:
@@ -210,12 +216,15 @@ def ui_session():
         core("/realms")               # fail here, while there is a place to say so
         return True
 
-    def open_remote(name, say):
+    def open_remote(name, say, hide):
         say("starting\u2026")
         core(f"/realms/{name}/start", "POST")
         ip = wait_ready(name, say)
         say(f"connecting to {ip}\u2026")
-        connect(name, ip, [])
+        hide()                        # now, and not a moment earlier
+        code = connect(name, ip, [], say)
+        if code:
+            raise RuntimeError(f"the RDP client exited with code {code}")
         return True
 
     def take_seat(name, say):
