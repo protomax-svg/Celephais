@@ -89,6 +89,16 @@ try:
     entry = [c for c in app.panes[0].winfo_children() if isinstance(c, tkinter.Entry)][0]
     assert entry.cget("show") != "", "the password must not be shown in clear"
     assert "leave" in texts(app.panes[0]), "there must be a way out with the mouse"
+    # A password typed under the wrong keyboard layout looks exactly like a
+    # password typed wrong, so it has to be possible to look at it.
+    eye = [c for c in app.panes[0].winfo_children()
+           if isinstance(c, tkinter.Button) and "key" in str(c.cget("text"))][0]
+    eye.invoke()
+    assert all(e.cget("show") == "" for p in app.panes
+               for e in p.winfo_children() if isinstance(e, tkinter.Entry)), \
+        "show the key must reveal it on every monitor"
+    eye.invoke()
+    assert entry.cget("show") != "", "and hide it again"
     assert app.root.bind_all("<Escape>"), "Esc must be bound"
     # typing on one monitor fills the copies on the others
     assert all(e.cget("textvariable") == str(app.password)

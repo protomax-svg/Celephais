@@ -158,6 +158,11 @@ class Overlay:
 
     def leave(self):
         try:
+            # Drop the queued callbacks first. Destroying with `after` jobs
+            # still pending makes Tcl complain about commands that no longer
+            # exist, which reads like a crash and is only litter.
+            for job in self.root.tk.call("after", "info"):
+                self.root.after_cancel(job)
             self.root.destroy()
         except tk.TclError:
             pass
@@ -226,7 +231,21 @@ class Overlay:
     def ask_password(self, message=None):
         self.clear()
         self.password = tk.StringVar()            # shared by every copy
-        entries, status = [], []
+        entries, status, eyes = [], [], []
+        shown = tk.BooleanVar(value=False)
+
+        def reveal():
+            """Show the key. A wrong keyboard layout is invisible otherwise.
+
+            Three layouts on one machine is normal here, and a password typed
+            under the wrong one looks exactly like a password typed wrong.
+            """
+            shown.set(not shown.get())
+            for widget in entries:
+                widget.config(show="" if shown.get() else "\u2022")
+            for widget in eyes:
+                widget.config(text="hide the key" if shown.get() else "show the key")
+
         for pane in self.panes:
             self.label(pane, "CELEPHAIS", 30, FG, pady=0)
             self.label(pane, "insert the key", 12, DIM, pady=(2, 18))
@@ -238,6 +257,9 @@ class Overlay:
             entry.bind("<Return>", lambda _e: submit())
             entry.bind("<Button-1>", lambda e: e.widget.focus_set())
             entries.append(entry)
+            eye = self.button(pane, "show the key", reveal)
+            eye.pack(pady=(8, 0))
+            eyes.append(eye)
             status.append(self.label(pane, message or "", 11,
                                      BAD if message else DIM))
 

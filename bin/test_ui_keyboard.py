@@ -52,6 +52,13 @@ if not display.value:
     skip("cannot open the display")
 
 
+def x_focus():
+    """The window X is actually sending key presses to."""
+    window, revert = ctypes.c_ulong(), ctypes.c_int()
+    xlib.XGetInputFocus(display, ctypes.byref(window), ctypes.byref(revert))
+    return window.value
+
+
 def press(letter):
     """Press one key the way a keyboard does, through the X server."""
     keysym = xlib.XStringToKeysym(letter.encode())
@@ -68,11 +75,37 @@ hooks = {"unlock": lambda password: True, "realms": lambda: [],
 app = ui.Overlay(hooks)
 try:
     app.ask_password()
-    for _ in range(40):             # let the manager map it and hand over focus
+
+    # Wait for the keyboard to actually arrive before judging anything. X
+    # resource ids carry the client in their high bits, so any window of ours
+    # counts. If something else is holding it, a fullscreen RDP session for
+    # instance, this machine cannot answer the question and must not pretend
+    # it did: the test is about the overlay, not about who won a focus race.
+    ours = app.root.winfo_id() >> 20
+    for _ in range(60):
+        app.root.update()
+        time.sleep(0.05)
+        if x_focus() >> 20 == ours:
+            break
+    else:
+        app.leave()
+        skip("another window holds the keyboard; close it and run this again")
+
+    # Holding the X focus is not the same as being ready for it. claim_focus
+    # keeps re-pointing each window at its own entry for about a second after
+    # the window manager hands the keyboard over, and a key that lands before
+    # that is lost. Let it finish.
+    for _ in range(50):
         app.root.update()
         time.sleep(0.03)
 
+    # Hold the keyboard for the whole word, not just at the start. A
+    # fullscreen window next door can take it back between two keys, and a
+    # letter typed into something else is not evidence about anything.
     for letter in "abcd":
+        if x_focus() >> 20 != ours:
+            app.leave()
+            skip("the keyboard was taken away mid-word; close the other window")
         press(letter)
         time.sleep(0.05)
         app.root.update()
