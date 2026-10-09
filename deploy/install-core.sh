@@ -87,9 +87,11 @@ EnvironmentFile=/etc/celephais/core.env
 ExecStart=/usr/bin/python3 /opt/celephais/celephais_core.py
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=yes
+# No NoNewPrivileges here: it blocks sudo, and the whole point of the one
+# sudoers rule is to let Core call the seat switcher as root.
 PrivateTmp=yes
-ProtectSystem=strict
+# "full" and not "strict": sudo writes its timestamp under /var.
+ProtectSystem=full
 ProtectHome=yes
 
 [Install]
