@@ -847,6 +847,10 @@ Proxmox host** first (`deploy/install-core.sh`). Run from a laptop against a
 laptop-hosted Core, they fail with `409 local seat: sudo: interactive
 authentication is required` — which is itself the correct refusal.
 
+**Scenario 1: PASS on the real host, 2026-10-09.** work OFF with no seat, remote
+start, READY at 192.168.2.114, `seat` still false throughout. Scenarios 2–4 are
+blocked until Core is installed on the Proxmox host.
+
 ### Scenario 3 is a restart, not a hot-plug
 PCI passthrough cannot be hot-added to a running VM. Taking the Local Seat
 therefore means a controlled stop, reconfigure and start. The Gate names every
