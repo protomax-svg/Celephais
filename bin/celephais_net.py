@@ -41,11 +41,18 @@ class NetError(Exception):
 
 
 def bundled(name):
-    """The binary next to us when frozen, otherwise whatever is on PATH."""
+    """The binary next to us when frozen, otherwise whatever is on PATH.
+
+    On Windows the packed file keeps its .exe suffix, so looking for the bare
+    name finds nothing and a clean Windows host falls back to a PATH search
+    that was never going to succeed. Try both spellings.
+    """
+    names = [name, name + ".exe"] if sys.platform == "win32" else [name]
     if getattr(sys, "frozen", False):
-        candidate = pathlib.Path(sys._MEIPASS) / name
-        if candidate.exists():
-            return str(candidate)
+        for spelling in names:
+            candidate = pathlib.Path(sys._MEIPASS) / spelling
+            if candidate.exists():
+                return str(candidate)
     found = shutil.which(name) or shutil.which(name, path="/usr/sbin:/usr/local/sbin")
     if not found:
         raise NetError(f"{name} is not bundled and not on PATH")
@@ -186,6 +193,8 @@ def tailnet(credential, hostname="celephais-gate", tags=""):
         raise NetError("an OAuth client secret needs TS_TAGS, e.g. tag:celephais-gate")
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="celephais-"))
     # Windows has no unix socket; tailscaled listens on a named pipe there.
+    # That one is a plain string, not a Path, so everything that waits on it
+    # has to go through os.path rather than Path.exists.
     sock = (rf"\\.\pipe\celephais-{os.getpid()}" if os.name == "nt"
             else workdir / "tailscaled.sock")
     http_port, socks_port = free_port(), free_port()
@@ -201,7 +210,7 @@ def tailnet(credential, hostname="celephais-gate", tags=""):
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
         deadline = time.monotonic() + READY_TIMEOUT
-        while not sock.exists():
+        while not os.path.exists(sock):
             if daemon.poll() is not None:
                 raise NetError(f"tailscaled exited: {daemon.stderr.read().strip()}")
             if time.monotonic() > deadline:

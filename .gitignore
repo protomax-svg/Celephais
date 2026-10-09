@@ -8,3 +8,6 @@ build/work/
 build/dist/
 build/*.spec
 build/cacert.pem
+build/win-tools/
+build/dist-win/
+build/work-win/

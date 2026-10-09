@@ -123,4 +123,25 @@ try:
 except OSError:
     pass
 
+# The packed Tailscale keeps its .exe suffix on Windows. Looking for the bare
+# name found nothing there, so a clean Windows host fell back to a PATH search
+# that was always going to fail.
+import tempfile                                           # noqa: E402
+
+with tempfile.TemporaryDirectory() as packed:
+    pathlib.Path(packed, "tailscaled.exe").write_bytes(b"")
+    was_platform, was_frozen, was_meipass = (
+        sys.platform, getattr(sys, "frozen", None), getattr(sys, "_MEIPASS", None))
+    sys.platform, sys.frozen, sys._MEIPASS = "win32", True, packed
+    try:
+        found = n.bundled("tailscaled")
+        assert found.endswith("tailscaled.exe"), found
+    finally:
+        sys.platform = was_platform
+        for name, value in (("frozen", was_frozen), ("_MEIPASS", was_meipass)):
+            if value is None:
+                delattr(sys, name)
+            else:
+                setattr(sys, name, value)
+
 print("PASS")
