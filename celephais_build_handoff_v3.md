@@ -847,9 +847,31 @@ Proxmox host** first (`deploy/install-core.sh`). Run from a laptop against a
 laptop-hosted Core, they fail with `409 local seat: sudo: interactive
 authentication is required` — which is itself the correct refusal.
 
-**Scenario 1: PASS on the real host, 2026-10-09.** work OFF with no seat, remote
-start, READY at 192.168.2.114, `seat` still false throughout. Scenarios 2–4 are
-blocked until Core is installed on the Proxmox host.
+**ALL FOUR PASS on the real host, 2026-10-09**, with Core installed on the
+Proxmox machine:
+
+1. work OFF, no seat -> remote start -> READY at 192.168.2.114, seat still false.
+2. work OFF but holding the seat in config -> remote start -> seat dropped
+   first, then READY remotely. This is the case that would otherwise have taken
+   over the physical monitors from a cafe.
+3. work READY headless -> take the seat -> controlled restart, READY with the
+   RTX, `/seat` reports `work`.
+4. windows takes the seat and keeps it while work starts headless. Both running,
+   only one on the RTX. **The concurrent-Realm requirement is proven.**
+
+### Five setup bugs this run exposed, all in the deployment
+Each produced a clean 409 refusal rather than a half-done seat change.
+
+| Symptom | Cause |
+|---|---|
+| unit not found | Proxmox had no `sudo` package; the installer died at `visudo` |
+| service never started | the unit asked the `celephais` user to run `tailscale ip`, which only root may do |
+| 409 "no new privileges" | `NoNewPrivileges=yes` blocks the very sudo rule the design depends on |
+| the fix did not apply | `systemctl enable --now` leaves a running service on the old unit file |
+| 409 read-only filesystem | `ProtectSystem=full` makes `/etc` read-only, and Proxmox keeps VM config in `/etc/pve` |
+
+The unit now keeps `PrivateTmp`, `ProtectHome` and `ProtectSystem=true`, and the
+installer restarts rather than merely enabling.
 
 ### Scenario 3 is a restart, not a hot-plug
 PCI passthrough cannot be hot-added to a running VM. Taking the Local Seat
