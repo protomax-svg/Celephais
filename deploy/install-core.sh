@@ -36,12 +36,26 @@ install -m 755 "$SRC/bin/celephais_core.py" /opt/celephais/celephais_core.py
 install -m 755 "$SRC/bin/celephais-seat" /usr/local/bin/celephais-seat
 
 # Proxmox lets only root change PCI passthrough, so Core calls the switcher
-# through sudo. One command, no password, nothing else.
+# through sudo. One command, no password, nothing else. A minimal Proxmox
+# install has no sudo package at all.
+if ! command -v sudo >/dev/null; then
+  echo "installing sudo..."
+  apt-get update -qq && apt-get install -y -qq sudo
+fi
+command -v sudo >/dev/null || {
+  echo "sudo is still missing. Install it, then run this script again:" >&2
+  echo "  apt-get install sudo" >&2
+  exit 1
+}
+
+install -d -m 755 /etc/sudoers.d
 cat > /etc/sudoers.d/celephais <<'EOF'
 celephais ALL=(root) NOPASSWD: /usr/local/bin/celephais-seat
 EOF
 chmod 440 /etc/sudoers.d/celephais
-visudo -cf /etc/sudoers.d/celephais >/dev/null
+if command -v visudo >/dev/null; then
+  visudo -cf /etc/sudoers.d/celephais >/dev/null
+fi
 
 install -d -m 750 -o root -g celephais /etc/celephais
 umask 027
