@@ -90,8 +90,10 @@ RestartSec=5
 # No NoNewPrivileges here: it blocks sudo, and the whole point of the one
 # sudoers rule is to let Core call the seat switcher as root.
 PrivateTmp=yes
-# "full" and not "strict": sudo writes its timestamp under /var.
-ProtectSystem=full
+# Only /usr, /boot and /efi are read-only. Not "full" and not "strict":
+# sudo writes its timestamp under /var, and the seat switcher writes VM
+# configuration into /etc/pve, the Proxmox cluster filesystem.
+ProtectSystem=true
 ProtectHome=yes
 
 [Install]
