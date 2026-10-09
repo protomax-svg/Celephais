@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Check the overlay without showing it. Run: python3 bin/test_ui.py
 
-The window is hidden straight away, so this is safe to run on a desktop you
-are using. It needs a display; skip it on a headless machine.
+The overlay shows for about half a second and is then hidden for the rest of
+the check, so this is safe to run on a desktop you are using. That half second
+is not waste: the window manager applies fullscreen asynchronously, so the
+placement cannot be read until it has been given a moment to act.
+
+It needs a display; skip it on a headless machine.
 """
 import pathlib
 import sys
@@ -58,17 +62,27 @@ def texts(widget):
 
 
 app = ui.Overlay(hooks)
-app.root.withdraw()                           # never show it during the check
+for _ in range(20):                           # let the manager apply fullscreen
+    app.root.update()
+    time.sleep(0.02)
+placed = [(bool(w.attributes("-fullscreen")), w.winfo_geometry())
+          for w in app.windows]
+app.hide()                                    # off the screen for the rest
 try:
-    assert app.root.overrideredirect(), "the overlay must have no window frame"
+    # The window manager must know about every window. An overrideredirect
+    # window is refused the keyboard, which is how the overlay went deaf.
+    assert not app.root.overrideredirect(), "the manager must see the window"
     rects = ui.screens(app.root)
+    assert len(app.windows) == len(rects), "one window per monitor"
+    for (full, where), (x, y, w, h) in zip(placed, rects):
+        assert full, f"window not fullscreen: {placed}"
+        assert where == f"{w}x{h}+{x}+{y}", f"wrong monitor: {where} != {w}x{h}+{x}+{y}"
     assert rects and all(w > 0 and h > 0 for _x, _y, w, h in rects), rects
     assert len(app.panes) == len(rects), "one set of controls per monitor"
-    # Every pane sits inside its own monitor, never across the seam.
-    for pane, (_x, _y, w, h) in zip(app.panes, rects):
-        area = pane.master
-        assert (area.place_info()["width"], area.place_info()["height"]) == \
-            (str(w), str(h)), (area.place_info(), w, h)
+    # Each set of controls is centred in its own window, never across the seam.
+    for pane, win in zip(app.panes, app.windows):
+        assert pane.master is win, "controls must live in that monitor's window"
+        assert pane.place_info()["anchor"] == "center", pane.place_info()
 
     app.ask_password()
     app.root.update()

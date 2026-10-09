@@ -1,17 +1,21 @@
 """The Gate overlay: a black layer over the running desktop, on every monitor.
 
 Deliberately plain tkinter, which ships with Python, so the one-file build
-gains no dependency. The window is borderless, topmost and sized to the whole
-virtual desktop, which is what spans several monitors on both X11 and Windows.
+gains no dependency.
 
-The controls are drawn once per physical monitor, so nothing lands on the seam
-between two screens. All the copies share one password variable, so typing into
-whichever copy has the pointer fills them all.
+One real window per physical monitor, each one fullscreen on its own screen.
+That is the whole trick, and it was learned the hard way. The first version
+used a single `overrideredirect` window stretched across the virtual desktop.
+`overrideredirect` hides a window from the window manager, and KWin, like most
+managers, then refuses it the keyboard and claws focus back to the window
+underneath. `focus_force` does not survive that: Tk believes it holds the
+focus while X disagrees, so nothing typed and Esc never fired. A managed
+window gets the keyboard normally, Alt+Tab still works, and the overlay can
+never trap the desktop.
 
-`overrideredirect` hides the window from the window manager, and a window the
-manager does not know about is never given the keyboard. So focus is taken by
-force, and every screen carries a "leave" button: the mouse is the one way out
-that cannot depend on a key press arriving.
+Controls are drawn once per monitor, so nothing lands on the seam between two
+screens. The copies share one password variable, so typing into whichever copy
+holds the keyboard fills them all.
 
 Two screens: a password, then the Realms. Slow work (the tailnet coming up, a
 Realm booting) runs in a worker thread and reports back through `after`, so the
@@ -40,7 +44,7 @@ def screens(root):
 
     tkinter has no idea where one screen ends and the next begins, so ask the
     platform. If that fails we fall back to one rectangle covering everything,
-    which is the old behaviour and still usable.
+    which still works, it just puts the controls on the seam.
     """
     rects = []
     try:
@@ -75,51 +79,77 @@ def screens(root):
 
 
 class Overlay:
+    focus_widgets = ()
+
     def __init__(self, hooks):
         self.hooks = hooks
         self.events = queue.Queue()
         self.root = tk.Tk()
         self.root.title("Celephais")
-        self.root.configure(bg=BG)
-        self.root.overrideredirect(True)          # no title bar, no decoration
-        self.root.attributes("-topmost", True)
-        self.root.update_idletasks()
+        self.rects = screens(self.root)
 
-        rects = screens(self.root)
-        left = min(x for x, _y, _w, _h in rects)
-        top = min(y for _x, y, _w, _h in rects)
-        width = max(x + w for x, _y, w, _h in rects) - left
-        height = max(y + h for _x, y, _w, h in rects) - top
-        self.root.geometry(f"{width}x{height}+{left}+{top}")
-
-        # One content frame per monitor, centred inside that monitor.
-        self.panes = []
-        for x, y, w, h in rects:
-            area = tk.Frame(self.root, bg=BG)
-            area.place(x=x - left, y=y - top, width=w, height=h)
-            content = tk.Frame(area, bg=BG)
+        self.windows, self.panes = [], []
+        for index, (x, y, w, h) in enumerate(self.rects):
+            win = self.root if index == 0 else tk.Toplevel(self.root)
+            win.title("Celephais")
+            win.configure(bg=BG)
+            # Place it on the target monitor first; the manager then makes it
+            # fullscreen on the screen it is already sitting on.
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            win.update_idletasks()
+            win.attributes("-fullscreen", True)
+            win.attributes("-topmost", True)
+            win.protocol("WM_DELETE_WINDOW", self.leave)
+            content = tk.Frame(win, bg=BG)
             content.place(relx=0.5, rely=0.5, anchor="center")
+            self.windows.append(win)
             self.panes.append(content)
 
         self.root.bind_all("<Escape>", lambda _e: self.leave())
         self.root.after(80, self._drain)
-        self.claim_focus()
 
     # --- plumbing -------------------------------------------------------
-    def claim_focus(self, tries=12):
-        """Take the keyboard. The window manager will not hand it to us."""
+    def claim_focus(self, tries=8):
+        """Point every window at its own entry, then ask for the keyboard.
+
+        Tk keeps a separate focus for each toplevel. The manager hands the
+        keyboard to one window of its choosing, usually the last one mapped,
+        so setting the focus on one window's entry is not enough: keys arrive
+        at a different window where nothing is focused and vanish. Every
+        window gets its own entry focused, and then it does not matter which
+        one the manager picks.
+
+        Asking is repeated for about a second, because a desktop that was busy
+        starting something else can take a moment to settle.
+        """
         try:
             if self.root.state() == "withdrawn":
                 return
-            self.root.focus_force()
-            if self.focus_widget is not None:
-                self.focus_widget.focus_set()
+            for widget in self.focus_widgets:
+                widget.focus_set()                # per window, not per app
+            self.root.focus_force()               # prefer the primary monitor
         except tk.TclError:                       # window already gone
             return
         if tries:
             self.root.after(150, self.claim_focus, tries - 1)
 
-    focus_widget = None
+    def hide(self):
+        """Get out of the way of a child window, such as the RDP client."""
+        for win in self.windows:
+            try:
+                win.attributes("-topmost", False)
+                win.withdraw()
+            except tk.TclError:
+                pass
+
+    def show(self):
+        for win in self.windows:
+            try:
+                win.deiconify()
+                win.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+        self.claim_focus()
 
     def leave(self):
         try:
@@ -154,7 +184,7 @@ class Overlay:
         threading.Thread(target=run, daemon=True).start()
 
     def clear(self):
-        self.focus_widget = None
+        self.focus_widgets = ()
         for pane in self.panes:
             for child in pane.winfo_children():
                 child.destroy()
@@ -219,11 +249,11 @@ class Overlay:
 
         for pane in self.panes:
             self.button(pane, "unlock", submit, accent=True).pack(pady=14)
-            self.button(pane, "leave", self.leave).pack(pady=(0, 0))
+            self.button(pane, "leave", self.leave).pack()
             self.label(pane, "or press Esc", 9, DIM, pady=(10, 0))
 
         self.submit = submit            # the hidden self-check calls this
-        self.focus_widget = entries[0]
+        self.focus_widgets = entries
         self.claim_focus()
 
     def show_realms(self, note=""):
@@ -278,13 +308,10 @@ class Overlay:
 
         if action == "open_remote":
             # The RDP window has to be on top of us, not under us.
-            self.root.attributes("-topmost", False)
-            self.root.withdraw()
+            self.hide()
 
             def finished(result, error):
-                self.root.deiconify()
-                self.root.attributes("-topmost", True)
-                self.claim_focus()
+                self.show()
                 done(result, error)
 
             self.work(lambda: self.hooks[action](name, say), finished)
