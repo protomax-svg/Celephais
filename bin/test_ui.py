@@ -61,28 +61,40 @@ app = ui.Overlay(hooks)
 app.root.withdraw()                           # never show it during the check
 try:
     assert app.root.overrideredirect(), "the overlay must have no window frame"
-    width = app.root.winfo_vrootwidth()
-    assert width >= app.root.winfo_screenwidth(), "it must span the whole desktop"
+    rects = ui.screens(app.root)
+    assert rects and all(w > 0 and h > 0 for _x, _y, w, h in rects), rects
+    assert len(app.panes) == len(rects), "one set of controls per monitor"
+    # Every pane sits inside its own monitor, never across the seam.
+    for pane, (_x, _y, w, h) in zip(app.panes, rects):
+        area = pane.master
+        assert (area.place_info()["width"], area.place_info()["height"]) == \
+            (str(w), str(h)), (area.place_info(), w, h)
 
     app.ask_password()
     app.root.update()
-    entry = [c for c in app.body.winfo_children() if isinstance(c, tkinter.Entry)][0]
+    entry = [c for c in app.panes[0].winfo_children() if isinstance(c, tkinter.Entry)][0]
     assert entry.cget("show") != "", "the password must not be shown in clear"
+    assert "leave" in texts(app.panes[0]), "there must be a way out with the mouse"
+    assert app.root.bind_all("<Escape>"), "Esc must be bound"
+    # typing on one monitor fills the copies on the others
+    assert all(e.cget("textvariable") == str(app.password)
+               for p in app.panes
+               for e in p.winfo_children() if isinstance(e, tkinter.Entry))
 
     # wrong password comes back to the same screen with the reason
     entry.insert(0, "nope")
     app.submit()
-    assert pump(app, until=lambda: any("tampered" in t for t in texts(app.body))), \
-        f"no error shown: {texts(app.body)}"
+    assert pump(app, until=lambda: any("tampered" in t for t in texts(app.panes[0]))), \
+        f"no error shown: {texts(app.panes[0])}"
 
     # right password reaches the realm list
-    entry = [c for c in app.body.winfo_children() if isinstance(c, tkinter.Entry)][0]
+    entry = [c for c in app.panes[0].winfo_children() if isinstance(c, tkinter.Entry)][0]
     entry.insert(0, "right")
     app.submit()
-    assert pump(app, until=lambda: "work" in texts(app.body)), \
-        f"the realms never appeared: {texts(app.body)}"
+    assert pump(app, until=lambda: "work" in texts(app.panes[0])), \
+        f"the realms never appeared: {texts(app.panes[0])}"
 
-    shown = texts(app.body)
+    shown = texts(app.panes[0])
     assert "windows" in shown, shown
     assert any("on the monitors" in t for t in shown), f"seat not shown: {shown}"
     assert any("ready" in t for t in shown), f"power not shown: {shown}"

@@ -4,6 +4,15 @@ Deliberately plain tkinter, which ships with Python, so the one-file build
 gains no dependency. The window is borderless, topmost and sized to the whole
 virtual desktop, which is what spans several monitors on both X11 and Windows.
 
+The controls are drawn once per physical monitor, so nothing lands on the seam
+between two screens. All the copies share one password variable, so typing into
+whichever copy has the pointer fills them all.
+
+`overrideredirect` hides the window from the window manager, and a window the
+manager does not know about is never given the keyboard. So focus is taken by
+force, and every screen carries a "leave" button: the mouse is the one way out
+that cannot depend on a key press arriving.
+
 Two screens: a password, then the Realms. Slow work (the tailnet coming up, a
 Realm booting) runs in a worker thread and reports back through `after`, so the
 overlay never freezes.
@@ -15,11 +24,54 @@ overlay never freezes.
   take_seat(name, say)    -> hands it the physical monitors
 """
 import queue
+import re
+import subprocess
+import sys
 import threading
 import tkinter as tk
 
 BG, FG, DIM, ACCENT = "#07080a", "#e8e6e3", "#6b7280", "#7dd3fc"
+BAD = "#f87171"
 FONT = "TkDefaultFont"
+
+
+def screens(root):
+    """Every physical monitor as (x, y, width, height), in desktop pixels.
+
+    tkinter has no idea where one screen ends and the next begins, so ask the
+    platform. If that fails we fall back to one rectangle covering everything,
+    which is the old behaviour and still usable.
+    """
+    rects = []
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            proc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                      ctypes.c_void_p, ctypes.POINTER(RECT),
+                                      ctypes.c_double)
+
+            def collect(_monitor, _dc, box, _data):
+                r = box.contents
+                rects.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+                return 1
+
+            ctypes.windll.user32.EnumDisplayMonitors(None, None, proc(collect), 0)
+        else:
+            out = subprocess.run(["xrandr", "--listmonitors"], timeout=5,
+                                 capture_output=True, text=True).stdout
+            for w, h, x, y in re.findall(r"(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)",
+                                         out):
+                rects.append((int(x), int(y), int(w), int(h)))
+    except Exception:                      # no xrandr, no Windows, no display
+        pass
+    if not rects:
+        rects = [(0, 0, root.winfo_vrootwidth(), root.winfo_vrootheight())]
+    return rects
 
 
 class Overlay:
@@ -32,14 +84,49 @@ class Overlay:
         self.root.overrideredirect(True)          # no title bar, no decoration
         self.root.attributes("-topmost", True)
         self.root.update_idletasks()
-        self.root.geometry(f"{self.root.winfo_vrootwidth()}x"
-                           f"{self.root.winfo_vrootheight()}+0+0")
-        self.root.bind("<Escape>", lambda _e: self.root.destroy())
-        self.body = tk.Frame(self.root, bg=BG)
-        self.body.place(relx=0.5, rely=0.5, anchor="center")
+
+        rects = screens(self.root)
+        left = min(x for x, _y, _w, _h in rects)
+        top = min(y for _x, y, _w, _h in rects)
+        width = max(x + w for x, _y, w, _h in rects) - left
+        height = max(y + h for _x, y, _w, h in rects) - top
+        self.root.geometry(f"{width}x{height}+{left}+{top}")
+
+        # One content frame per monitor, centred inside that monitor.
+        self.panes = []
+        for x, y, w, h in rects:
+            area = tk.Frame(self.root, bg=BG)
+            area.place(x=x - left, y=y - top, width=w, height=h)
+            content = tk.Frame(area, bg=BG)
+            content.place(relx=0.5, rely=0.5, anchor="center")
+            self.panes.append(content)
+
+        self.root.bind_all("<Escape>", lambda _e: self.leave())
         self.root.after(80, self._drain)
+        self.claim_focus()
 
     # --- plumbing -------------------------------------------------------
+    def claim_focus(self, tries=12):
+        """Take the keyboard. The window manager will not hand it to us."""
+        try:
+            if self.root.state() == "withdrawn":
+                return
+            self.root.focus_force()
+            if self.focus_widget is not None:
+                self.focus_widget.focus_set()
+        except tk.TclError:                       # window already gone
+            return
+        if tries:
+            self.root.after(150, self.claim_focus, tries - 1)
+
+    focus_widget = None
+
+    def leave(self):
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
     def _drain(self):
         """Apply whatever the worker thread sent us. Tk is not thread safe."""
         while True:
@@ -67,12 +154,14 @@ class Overlay:
         threading.Thread(target=run, daemon=True).start()
 
     def clear(self):
-        for child in self.body.winfo_children():
-            child.destroy()
+        self.focus_widget = None
+        for pane in self.panes:
+            for child in pane.winfo_children():
+                child.destroy()
 
-    def label(self, text, size=14, colour=FG, pady=4):
-        widget = tk.Label(self.body, text=text, bg=BG, fg=colour,
-                          font=(FONT, size))
+    # --- widgets --------------------------------------------------------
+    def label(self, parent, text, size=14, colour=FG, pady=4):
+        widget = tk.Label(parent, text=text, bg=BG, fg=colour, font=(FONT, size))
         widget.pack(pady=pady)
         return widget
 
@@ -85,24 +174,41 @@ class Overlay:
                          highlightbackground=ACCENT if accent else DIM,
                          font=(FONT, 11))
 
+    @staticmethod
+    def say_on(widgets, text, colour=DIM):
+        """Same message on every monitor's copy of a label."""
+        for widget in widgets:
+            try:
+                widget.config(text=text, fg=colour)
+            except tk.TclError:
+                pass
+
     # --- screens --------------------------------------------------------
     def ask_password(self, message=None):
         self.clear()
-        self.label("CELEPHAIS", 30, FG, pady=(0))
-        self.label("insert the key", 12, DIM, pady=(2, 18))
-        entry = tk.Entry(self.body, show="•", width=26, justify="center",
-                         bg="#101317", fg=FG, insertbackground=FG,
-                         relief="flat", font=(FONT, 16))
-        entry.pack(ipady=8, pady=6)
-        entry.focus_set()
-        status = self.label(message or "", 11, "#f87171" if message else DIM)
+        self.password = tk.StringVar()            # shared by every copy
+        entries, status = [], []
+        for pane in self.panes:
+            self.label(pane, "CELEPHAIS", 30, FG, pady=0)
+            self.label(pane, "insert the key", 12, DIM, pady=(2, 18))
+            entry = tk.Entry(pane, show="•", width=26, justify="center",
+                             textvariable=self.password,
+                             bg="#101317", fg=FG, insertbackground=FG,
+                             relief="flat", font=(FONT, 16))
+            entry.pack(ipady=8, pady=6)
+            entry.bind("<Return>", lambda _e: submit())
+            entry.bind("<Button-1>", lambda e: e.widget.focus_set())
+            entries.append(entry)
+            status.append(self.label(pane, message or "", 11,
+                                     BAD if message else DIM))
 
         def submit(_event=None):
-            password = entry.get()
+            password = self.password.get()
             if not password:
                 return
-            entry.config(state="disabled")
-            status.config(text="opening the vault…", fg=DIM)
+            for entry in entries:
+                entry.config(state="disabled")
+            self.say_on(status, "opening the vault…")
             self.work(lambda: self.hooks["unlock"](password), after_unlock)
 
         def after_unlock(_result, error):
@@ -111,54 +217,64 @@ class Overlay:
             else:
                 self.show_realms()
 
-        entry.bind("<Return>", submit)
+        for pane in self.panes:
+            self.button(pane, "unlock", submit, accent=True).pack(pady=14)
+            self.button(pane, "leave", self.leave).pack(pady=(0, 0))
+            self.label(pane, "or press Esc", 9, DIM, pady=(10, 0))
+
         self.submit = submit            # the hidden self-check calls this
-        self.button(self.body, "unlock", submit, accent=True).pack(pady=14)
-        self.label("Esc to leave", 9, DIM, pady=(14, 0))
+        self.focus_widget = entries[0]
+        self.claim_focus()
 
     def show_realms(self, note=""):
         self.clear()
-        self.label("choose an environment", 20, FG, pady=(0, 16))
-        rows = tk.Frame(self.body, bg=BG)
-        rows.pack()
-        status = self.label(note, 11, DIM, pady=(18, 0))
+        tables, status = [], []
+        for pane in self.panes:
+            self.label(pane, "choose an environment", 20, FG, pady=(0, 16))
+            rows = tk.Frame(pane, bg=BG)
+            rows.pack()
+            tables.append(rows)
+            status.append(self.label(pane, note, 11, DIM, pady=(18, 0)))
+            self.button(pane, "leave", self.leave).pack(pady=(14, 0))
 
         def refresh(realms, error):
             if error:
-                status.config(text=str(error), fg="#f87171")
+                self.say_on(status, str(error), BAD)
                 return
-            for index, realm in enumerate(realms):
-                seat = "  ● on the monitors" if realm.get("seat") else ""
-                tk.Label(rows, text=realm["realm"], bg=BG, fg=FG,
-                         font=(FONT, 15), anchor="w", width=12
-                         ).grid(row=index, column=0, sticky="w", pady=6)
-                tk.Label(rows, text=f"{realm['power'].lower()}{seat}", bg=BG,
-                         fg=DIM, font=(FONT, 11), anchor="w", width=22
-                         ).grid(row=index, column=1, sticky="w", padx=10)
-                name = realm["realm"]
-                self.button(rows, "open here",
-                            lambda n=name: self.go("open_remote", n, status),
-                            accent=True).grid(row=index, column=2, padx=6)
-                self.button(rows, "use the monitors",
-                            lambda n=name: self.go("take_seat", n, status)
-                            ).grid(row=index, column=3, padx=6)
+            self.say_on(status, note)
+            for rows in tables:
+                for index, realm in enumerate(realms):
+                    seat = "  ● on the monitors" if realm.get("seat") else ""
+                    tk.Label(rows, text=realm["realm"], bg=BG, fg=FG,
+                             font=(FONT, 15), anchor="w", width=12
+                             ).grid(row=index, column=0, sticky="w", pady=6)
+                    tk.Label(rows, text=f"{realm['power'].lower()}{seat}", bg=BG,
+                             fg=DIM, font=(FONT, 11), anchor="w", width=22
+                             ).grid(row=index, column=1, sticky="w", padx=10)
+                    name = realm["realm"]
+                    self.button(rows, "open here",
+                                lambda n=name: self.go("open_remote", n),
+                                accent=True).grid(row=index, column=2, padx=6)
+                    self.button(rows, "use the monitors",
+                                lambda n=name: self.go("take_seat", n)
+                                ).grid(row=index, column=3, padx=6)
 
-        status.config(text="reading the realms…", fg=DIM)
+        self.say_on(status, "reading the realms…")
         self.work(self.hooks["realms"], refresh)
 
-    def go(self, action, name, status):
+    def go(self, action, name):
         self.clear()
-        self.label(name, 26, FG, pady=(0, 10))
-        line = self.label("starting…", 12, DIM)
+        lines = []
+        for pane in self.panes:
+            self.label(pane, name, 26, FG, pady=(0, 10))
+            lines.append(self.label(pane, "starting…", 12, DIM))
+            self.button(pane, "leave", self.leave).pack(pady=(18, 0))
 
         def say(text):
-            self.post(lambda: line.config(text=text))
+            self.post(lambda: self.say_on(lines, text))
 
         def done(_result, error):
-            if error:
-                self.show_realms(str(error))
-            else:
-                self.show_realms()
+            self.show_realms(str(error) if error else "")
 
         if action == "open_remote":
             # The RDP window has to be on top of us, not under us.
@@ -168,6 +284,7 @@ class Overlay:
             def finished(result, error):
                 self.root.deiconify()
                 self.root.attributes("-topmost", True)
+                self.claim_focus()
                 done(result, error)
 
             self.work(lambda: self.hooks[action](name, say), finished)
