@@ -699,3 +699,35 @@ Tailscale must already be up on the Proxmox host; the script refuses otherwise.
    missing is the selector shown *before* a Realm is picked.
 3. **Portability** — one executable per platform, no install, running from the
    USB; plus the trusted-host helper that launches it on insert.
+
+## The vault — `celephais.vault` + `bin/celephais_vault.py` (2026-10-09)
+
+The Gate binary is public. Only the vault beside it is secret. It holds
+`CORE_URL`, `CORE_TOKEN`, `RDP_USER`, and later the Tailscale identity.
+It never holds the Proxmox token: that belongs to Core alone, and `init --from-env`
+strips `PVE_*` on the way in.
+
+- key derivation: `hashlib.scrypt` from the standard library, N=32768, r=8, p=1
+- cipher: AES-256-GCM (`cryptography`, the one dependency; wheels exist for Windows)
+- the KDF parameters live in the file **and** are authenticated as additional data,
+  so N can be raised later and nobody can weaken it by editing the file
+- a fresh salt and nonce per save; writes go to a temp file and are renamed, so a
+  crash never leaves half a vault
+
+```bash
+python3 bin/celephais_vault.py init --from-env   # one password, asked twice
+python3 bin/celephais_vault.py set CORE_URL http://100.x.x.x:8080
+python3 bin/celephais_vault.py list              # key names only, never values
+```
+
+The Gate opens the vault if it exists and falls back to `.env` otherwise, which
+keeps development easy. `.env`, `celephais.vault` and `*.vault.tmp` are gitignored.
+
+`bin/test_vault.py` checks the round trip, three wrong passwords, a tampered
+ciphertext, a tampered salt, a downgraded KDF, and that two saves of the same
+data differ.
+
+### Gate is now Windows-aware
+It looks for an RDP client in this order: `wfreerdp.exe`, `sdl-freerdp3`,
+`xfreerdp3`, `sdl-freerdp`, `xfreerdp`, and says so plainly if none is present.
+It connects with `/f /multimon`, so the Realm covers every monitor.

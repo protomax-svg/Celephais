@@ -1,2 +1,5 @@
 vision.md
 .env
+celephais.vault
+*.vault.tmp
+__pycache__/
