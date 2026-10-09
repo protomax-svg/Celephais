@@ -51,6 +51,7 @@ PVE_NODE=$(hostname -s)
 PVE_TOKEN=$PVE_TOKEN
 CORE_TOKEN=$CORE_TOKEN
 PVE_VERIFY_TLS=0
+CORE_BIND=$TS_IP:8080
 EOF
 chown root:celephais /etc/celephais/core.env
 chmod 640 /etc/celephais/core.env
@@ -60,12 +61,16 @@ cat > /etc/systemd/system/celephais-core.service <<'EOF'
 Description=Celephais Core control plane
 After=network-online.target tailscaled.service pve-cluster.service
 Wants=network-online.target
+# Keep retrying: the Tailscale address may not be up at the first attempt.
+StartLimitIntervalSec=0
 
 [Service]
 User=celephais
 EnvironmentFile=/etc/celephais/core.env
-# The Tailscale address only exists once tailscaled is up, so resolve it here.
-ExecStart=/bin/sh -c 'CORE_BIND="$(tailscale ip -4 | head -1):8080" exec /usr/bin/python3 /opt/celephais/celephais_core.py'
+# CORE_BIND is the Tailscale address, written at install time: the celephais
+# user cannot query tailscaled itself. If the address is not up yet the start
+# fails and Restart= retries until it is.
+ExecStart=/usr/bin/python3 /opt/celephais/celephais_core.py
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
