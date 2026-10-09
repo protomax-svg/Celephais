@@ -1037,3 +1037,55 @@ screen carrying the reason, and that the Realm list shows power and seat.
 It found a real bug on the first run: Python clears the name bound by
 `except ... as exc` at the end of the block, so the callback that reported the
 failure raised `NameError` instead, and every error would have been silent.
+
+## Windows build, prepared 2026-10-09
+
+PyInstaller cannot cross-compile, so `Gate.exe` has to be built on a Windows
+machine with `build\make-gate.ps1`. Three real problems were found and fixed in
+the code first, so the first Windows run is not spent on them.
+
+### 1. A clean Windows host has no FreeRDP
+It has `mstsc.exe` built in, which is the right thing to use — but `mstsc` has
+no proxy setting, and in userspace networking the Realm is only reachable
+through the SOCKS proxy.
+
+**Fix: the Gate carries the connection itself.** `celephais_net.forward()`
+listens on localhost and splices every connection to the Realm through SOCKS5,
+so *any* RDP client works, with no proxy support of its own. The client list is
+now `mstsc.exe` on Windows and the FreeRDP builds elsewhere.
+
+**Verified against the real thing:** through the real tailnet, an X.224
+connection request sent at `127.0.0.1:<port>` came back as a proper RDP reply
+from VM 201 — `030000130ed00000`.
+
+`bin/test_forward.py` covers the handshake with a fake SOCKS server and no
+network: a large payload round trip, the hostname reaching the proxy rather
+than an IP, a reply that dribbles in one byte at a time, a refusal, and a dead
+proxy.
+
+### 2. The bundled binaries are `.exe` on Windows
+`bundled()` looked for a file called exactly `tailscaled`, which never exists
+there. It now tries both names.
+
+### 3. tailscaled has no unix socket on Windows
+It listens on a named pipe, so waiting for a socket *file* to appear would have
+hung until the timeout. The wait now asks the CLI whether the daemon answers,
+which works on both.
+
+### Left to find out on the machine itself
+Whether `tailscaled --tun=userspace-networking` runs on Windows **without
+administrator rights**. Userspace mode needs no TUN driver, which is the usual
+reason for admin, but this is unverified. If it does need admin, the fallback
+is Tailscale installed normally plus `--no-tailnet`, and the Gate says so
+clearly rather than hanging.
+
+### Build it
+```powershell
+# once: install Python 3 from python.org (tick "Add python.exe to PATH")
+# once: install Tailscale, so tailscaled.exe exists to bundle
+git clone <this repo>; cd Cloud_infrastructure
+.\build\make-gate.ps1          # -> build\dist\Gate.exe
+```
+
+Then copy `Gate.exe` and a `celephais.vault` into one folder and double-click
+it: no arguments means the overlay.

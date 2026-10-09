@@ -89,6 +89,95 @@ def _feed_key(path, key):
     return thread
 
 
+def _recv_exact(sock, count):
+    """A socket may hand back less than asked for. Keep going until it does not."""
+    buffer = b""
+    while len(buffer) < count:
+        chunk = sock.recv(count - len(buffer))
+        if not chunk:
+            raise NetError("the SOCKS proxy closed the connection early")
+        buffer += chunk
+    return buffer
+
+
+def _socks_connect(proxy, host, port, timeout=10):
+    """One SOCKS5 CONNECT, no authentication. Returns the open socket."""
+    proxy_host, proxy_port = proxy.rsplit(":", 1)
+    sock = socket.create_connection((proxy_host, int(proxy_port)), timeout)
+    try:
+        sock.sendall(b"\x05\x01\x00")                      # version 5, "no auth"
+        if _recv_exact(sock, 2) != b"\x05\x00":
+            raise NetError("the SOCKS proxy refused the greeting")
+        name = host.encode()
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name
+                     + port.to_bytes(2, "big"))
+        reply = _recv_exact(sock, 4)
+        if reply[1] != 0:
+            raise NetError(f"the SOCKS proxy refused {host}:{port}, code {reply[1]}")
+        # Read past the bound address that follows; we have no use for it.
+        kind = reply[3]
+        if kind == 1:
+            length = 4
+        elif kind == 4:
+            length = 16
+        elif kind == 3:
+            length = _recv_exact(sock, 1)[0]
+        else:
+            raise NetError(f"the SOCKS proxy sent an unknown address type {kind}")
+        _recv_exact(sock, length + 2)
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
+def _splice(a, b):
+    try:
+        while True:
+            chunk = a.recv(65536)
+            if not chunk:
+                break
+            b.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        for side in (a, b):
+            try:
+                side.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            side.close()
+
+
+def forward(proxy, host, port):
+    """Listen on localhost and carry every connection to host:port via SOCKS.
+
+    This is what lets any RDP client reach the Realm, including Windows' own
+    mstsc, which has no proxy setting of its own.
+    """
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+
+    def serve():
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                remote = _socks_connect(proxy, host, port)
+            except Exception:
+                client.close()
+                continue
+            threading.Thread(target=_splice, args=(client, remote), daemon=True).start()
+            threading.Thread(target=_splice, args=(remote, client), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener.getsockname()[1], listener
+
+
 @contextlib.contextmanager
 def tailnet(credential, hostname="celephais-gate", tags=""):
     """Bring up userspace Tailscale. Yields {'http_proxy': ..., 'socks5': ...}."""
@@ -96,7 +185,9 @@ def tailnet(credential, hostname="celephais-gate", tags=""):
     if oauth and not tags:
         raise NetError("an OAuth client secret needs TS_TAGS, e.g. tag:celephais-gate")
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="celephais-"))
-    sock = workdir / "tailscaled.sock"
+    # Windows has no unix socket; tailscaled listens on a named pipe there.
+    sock = (rf"\\.\pipe\celephais-{os.getpid()}" if os.name == "nt"
+            else workdir / "tailscaled.sock")
     http_port, socks_port = free_port(), free_port()
     daemon = None
     try:

@@ -44,8 +44,9 @@ else:
 VAULT = HERE / "celephais.vault"
 ENV_FILE = HERE / ".env"
 
-# Candidates in preference order: Windows first, then the Linux builds.
-RDP_CLIENTS = ("wfreerdp.exe", "sdl-freerdp3", "xfreerdp3", "sdl-freerdp", "xfreerdp")
+# Windows has a built-in client, so a clean Windows host needs nothing extra.
+RDP_CLIENTS = (("mstsc.exe",) if os.name == "nt"
+               else ("sdl-freerdp3", "xfreerdp3", "sdl-freerdp", "xfreerdp"))
 
 
 def secrets():
@@ -128,15 +129,29 @@ def rdp_client():
 
 def connect(name, ip, extra):
     user = cfg("RDP_USER") or getpass.getuser()
-    # No password here. FreeRDP asks for it, so the Gate stores no guest secret.
-    cmd = [rdp_client(), f"/v:{ip}", f"/u:{user}", "/f", "/multimon",
-           "/dynamic-resolution", "/clipboard", "/sound", "/cert:ignore"]
+    client = rdp_client()
+    target, listener = ip, None
     if NET.get("socks5"):
-        cmd.append(f"/proxy:socks5://{NET['socks5']}")
-    cmd += extra
-    print(f"  connecting to {name} at {ip} as {user}", flush=True)
-    # ponytail: /cert:ignore is the LAN prototype. Pin the Realm cert for WAN.
-    return subprocess.call(cmd)
+        # Carry the connection ourselves rather than rely on the client having
+        # a proxy setting. Windows' own mstsc has none.
+        port, listener = celephais_net.forward(NET["socks5"], ip, 3389)
+        target = f"127.0.0.1:{port}"
+    try:
+        if client.lower().endswith("mstsc.exe"):
+            # mstsc asks for the user and password itself.
+            cmd = [client, f"/v:{target}", "/f"] + extra
+        else:
+            # No password here. FreeRDP asks for it, so the Gate stores no
+            # guest secret.
+            # ponytail: /cert:ignore is the LAN prototype. Pin the Realm cert for WAN.
+            cmd = [client, f"/v:{target}", f"/u:{user}", "/f", "/multimon",
+                   "/dynamic-resolution", "/clipboard", "/sound",
+                   "/cert:ignore"] + extra
+        print(f"  connecting to {name} at {ip} as {user}", flush=True)
+        return subprocess.call(cmd)
+    finally:
+        if listener:
+            listener.close()
 
 
 def run(args, extra):

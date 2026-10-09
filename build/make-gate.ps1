@@ -1,6 +1,10 @@
 # Build one standalone Gate.exe. Run on Windows, in PowerShell, from the repo root:
 #   .\build\make-gate.ps1
 # Needs Python 3 from python.org with "Add python.exe to PATH" ticked.
+#
+# The exe keeps its console, so the command line still works. The overlay is
+# fullscreen and topmost, so it covers that console on a double-click.
+# ponytail: build a second --windowed exe if the console flash ever annoys.
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
@@ -27,7 +31,8 @@ foreach ($name in @("tailscaled.exe", "tailscale.exe")) {
 # behaviour matches the Linux build.
 $ca = & "$venv\Scripts\python.exe" -c "import certifi;print(certifi.where())"
 Copy-Item $ca build\cacert.pem -Force
-$ca = "build\cacert.pem"
+# Absolute: --specpath makes relative data paths resolve against the spec dir.
+$ca = (Resolve-Path build\cacert.pem).Path
 
 & "$venv\Scripts\pyinstaller.exe" `
   --onefile --clean --noconfirm `
