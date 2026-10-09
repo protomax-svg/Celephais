@@ -541,7 +541,7 @@ It is the only thing that holds the Proxmox credential.
 
 ```bash
 pveum user add gate@pve
-pveum role add CelephaisCore -privs "VM.Audit VM.PowerMgmt VM.Monitor"
+pveum role add CelephaisCore -privs "VM.Audit VM.PowerMgmt VM.GuestAgent.Audit"
 pveum aclmod /vms/201 -user gate@pve -role CelephaisCore
 pveum aclmod /vms/100 -user gate@pve -role CelephaisCore
 
@@ -557,8 +557,11 @@ everything the user has, so a later widening of `gate@pve` silently widens the
 token too. With `--privsep 1` the effective rights are the *intersection* of the
 user ACL and the token ACL, so both sets of `aclmod` lines above are required.
 
-`VM.Audit` reads status, `VM.PowerMgmt` starts and shuts down, and `VM.Monitor`
-lets Core ask the QEMU guest agent for the Realm IP. Copy the printed token value
+`VM.Audit` reads status, `VM.PowerMgmt` starts and shuts down, and
+`VM.GuestAgent.Audit` lets Core ask the QEMU guest agent for the Realm IP.
+`VM.Monitor` is *not* enough: on PVE 9 the `/agent/` endpoints answer 403 with
+`Permission check failed (/vms/201, VM.GuestAgent.Audit|VM.GuestAgent.Unrestricted)`,
+which Core shows as a Realm stuck in `BOOTING` forever. Copy the printed token value
 once; Proxmox does not show it again.
 
 Check the result with:

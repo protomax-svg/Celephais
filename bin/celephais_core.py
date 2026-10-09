@@ -26,6 +26,7 @@ import json
 import os
 import pathlib
 import socket
+import sys
 import ssl
 import urllib.parse
 import urllib.request
@@ -69,7 +70,10 @@ def realm_ip(vmid):
     """First non-loopback IPv4 the guest agent reports, or None if the agent is not up."""
     try:
         ifaces = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/agent/network-get-interfaces")
-    except Exception:
+    except Exception as exc:
+        # A booting guest has no agent yet, so this is normal early on. Say why
+        # anyway: a silent None hides a permission error as an endless BOOTING.
+        print(f"realm_ip({vmid}): {exc}", file=sys.stderr, flush=True)
         return None
     for iface in ifaces or []:
         for addr in iface.get("ip-addresses") or []:
