@@ -620,6 +620,37 @@ Realm registry is the `REALMS` dict at the top of the file, same as the switcher
 Proxmox, so it needs no Proxmox. Not yet run against the real host.
 
 ### Not built yet
-Gate client · Realm-local Tailscale or subnet router · calling the Local Seat
-switcher from Core · any persistent state. Core is stateless; it reads the truth
-from Proxmox on every request.
+Realm-local Tailscale or subnet router · calling the Local Seat switcher from
+Core · any persistent state. Core is stateless; it reads the truth from Proxmox
+on every request.
+
+
+## Celephais Gate — `bin/celephais-gate` (2026-10-09)
+
+The client. One command opens a Realm:
+
+```bash
+bin/celephais-gate work          # start if needed, wait for READY, launch RDP
+bin/celephais-gate --status      # list realms
+bin/celephais-gate work --stop   # shut it down
+bin/celephais-gate work --no-connect   # start and wait, print the IP, no RDP
+```
+
+Anything it does not recognise is passed straight through to FreeRDP, so
+`bin/celephais-gate work /f /scale:140` works.
+
+It talks only to Core. It holds no Proxmox credential, and no guest password
+either: FreeRDP asks for that. Reads `CORE_URL`, `CORE_TOKEN` and `RDP_USER`
+from the same `.env`.
+
+Client used: `xfreerdp3` (FreeRDP 3.32.1), with `/multimon /dynamic-resolution
+/clipboard /sound`. `/cert:ignore` stays only while this is a LAN prototype.
+
+### The whole chain now
+```text
+celephais-gate work
+  -> POST /realms/work/start      (Core)
+  -> Core -> Proxmox API          (VM 201 start)
+  -> poll until READY             (guest agent IP + TCP 3389 answers)
+  -> xfreerdp3 to the Realm IP
+```

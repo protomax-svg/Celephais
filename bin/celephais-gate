@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Celephais Gate - the client. One command opens a Realm.
+
+    celephais-gate work          # start it if needed, wait, connect
+    celephais-gate --status      # just show what is running
+    celephais-gate work --stop   # shut the Realm down
+
+It asks Core, waits for READY, then hands over to FreeRDP. It never speaks to
+Proxmox and holds no Proxmox credential; CORE_TOKEN is all it has.
+
+Environment, read from .env at the repo root or from the real environment:
+  CORE_URL    default http://127.0.0.1:8080
+  CORE_TOKEN  the shared secret Core expects
+  RDP_USER    guest username (default: the local username)
+"""
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+_ENV_FILE = pathlib.Path(__file__).resolve().parent.parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
+
+CORE_URL = os.environ.get("CORE_URL", "http://127.0.0.1:8080").rstrip("/")
+CORE_TOKEN = os.environ.get("CORE_TOKEN", "")
+RDP_USER = os.environ.get("RDP_USER") or os.environ.get("USER", "")
+BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "180"))
+
+
+def core(path, method="GET"):
+    req = urllib.request.Request(CORE_URL + path, method=method,
+                                 headers={"Authorization": "Bearer " + CORE_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        raise SystemExit(f"gate: core said {exc.code}: {body}")
+    except OSError as exc:
+        raise SystemExit(f"gate: cannot reach Core at {CORE_URL}: {exc}")
+
+
+def wait_ready(name):
+    """Poll until the Realm can take an RDP connection. Returns its IP."""
+    deadline = time.monotonic() + BOOT_TIMEOUT
+    last = None
+    while time.monotonic() < deadline:
+        realm = core(f"/realms/{name}")
+        if realm["state"] != last:
+            last = realm["state"]
+            print(f"  {name}: {last}", flush=True)
+        if realm["state"] == "READY":
+            return realm["ip"]
+        time.sleep(3)
+    raise SystemExit(f"gate: {name} was still {last} after {BOOT_TIMEOUT}s")
+
+
+def connect(name, ip, extra):
+    # No password here. FreeRDP asks for it, so the Gate stores no guest secret.
+    cmd = ["xfreerdp3", f"/v:{ip}", f"/u:{RDP_USER}", "/multimon",
+           "/dynamic-resolution", "/clipboard", "/sound", "/cert:ignore"] + extra
+    print(f"  connecting to {name} at {ip} as {RDP_USER}", flush=True)
+    # ponytail: /cert:ignore is the LAN prototype. Pin the Realm cert for WAN.
+    return subprocess.call(cmd)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Open a Celephais Realm.")
+    ap.add_argument("realm", nargs="?", help="realm name, e.g. work")
+    ap.add_argument("--status", action="store_true", help="list realms and exit")
+    ap.add_argument("--stop", action="store_true", help="shut the realm down")
+    ap.add_argument("--no-connect", action="store_true", help="start and wait, do not launch RDP")
+    args, extra = ap.parse_known_args()
+
+    if not CORE_TOKEN:
+        raise SystemExit("gate: set CORE_TOKEN (in .env or the environment)")
+
+    if args.status or not args.realm:
+        for realm in core("/realms"):
+            print(f"{realm['realm']:<10} vm {realm['vmid']:<5} {realm['state']:<9} "
+                  f"{realm['ip'] or ''}")
+        return 0
+
+    if args.stop:
+        print(json.dumps(core(f"/realms/{args.realm}/stop", "POST")))
+        return 0
+
+    core(f"/realms/{args.realm}/start", "POST")
+    ip = wait_ready(args.realm)
+    if args.no_connect:
+        print(ip)
+        return 0
+    return connect(args.realm, ip, extra)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
