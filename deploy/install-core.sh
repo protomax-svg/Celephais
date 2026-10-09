@@ -99,7 +99,10 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now celephais-core.service
+systemctl enable celephais-core.service
+# restart, not "enable --now": that would leave an already running service
+# on the old unit file, which is exactly how a fixed setting goes unnoticed.
+systemctl restart celephais-core.service
 sleep 2
 systemctl --no-pager --lines=15 status celephais-core.service || true
 
