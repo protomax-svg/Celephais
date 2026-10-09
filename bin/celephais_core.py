@@ -12,20 +12,32 @@ Environment:
   PVE_VERIFY_TLS  0 to accept the self-signed Proxmox cert (LAN prototype only)
   CORE_BIND       default 127.0.0.1:8080
 
-API:
-  GET  /realms              -> [ {realm, vmid, state, ip}, ... ]
-  GET  /realms/<name>       -> {realm, vmid, state, ip}
-  POST /realms/<name>/start -> 202 + current state
-  POST /realms/<name>/stop  -> 202 + current state
+Powering a Realm and giving it the Local Seat are two separate operations.
+Starting a Realm never claims the RTX 2060, the physical monitors or the USB
+keyboard and mouse; a start first strips any seat the previous session left in
+the VM config. Several Realms may run at once, but only one may hold the seat.
 
-States: OFF -> BOOTING -> READY. CONNECTING and ONLINE belong to the Gate,
-not here; the Gate polls until READY and then launches RDP.
+API:
+  GET  /realms              -> [ {realm, vmid, power, seat, ip}, ... ]
+  GET  /realms/<name>       -> one of those
+  GET  /seat                -> {owner: <realm name or null>}
+  POST /realms/<name>/start -> 202, started headless, never with the seat
+  POST /realms/<name>/stop  -> 202
+  POST /realms/<name>/seat  -> 200, give that Realm the Local Seat
+
+power: OFF -> BOOTING -> READY, plus STOPPING after a stop and ERROR if
+Proxmox cannot answer for that Realm. seat is a separate boolean. CONNECTING
+and ONLINE belong to the Gate; it polls until READY and then launches RDP.
+
+Changing passthrough is restricted to root@pam by Proxmox, so the seat
+operations shell out to the hardware-tested bin/celephais-seat through sudo.
 """
 import hmac
 import json
 import os
 import pathlib
 import socket
+import subprocess
 import sys
 import ssl
 import urllib.parse
@@ -42,8 +54,10 @@ if _ENV_FILE.exists():
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
 
+# Add a Realm here once its VM exists. "personal" (202) is planned, not built.
 REALMS = {"work": 201, "windows": 100}
 RDP_PORT = 3389
+SEAT_CMD = os.environ.get("SEAT_CMD", "sudo -n /usr/local/bin/celephais-seat").split()
 
 PVE_HOST = os.environ.get("PVE_HOST", "")
 PVE_NODE = os.environ.get("PVE_NODE", "pve")
@@ -93,15 +107,51 @@ def port_open(ip, port, timeout=1.0):
         return False
 
 
+def has_seat(vmid):
+    """True if this VM's config claims the GPU. Readable with VM.Audit."""
+    config = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/config")
+    return "hostpci0" in config
+
+
+def seat_cmd(*args):
+    """Run the hardware-tested switcher. Proxmox lets only root change passthrough."""
+    proc = subprocess.run(SEAT_CMD + list(args), capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SeatError((proc.stderr or proc.stdout).strip()
+                        or f"{' '.join(SEAT_CMD)} failed with {proc.returncode}")
+    return proc.stdout.strip()
+
+
+class SeatError(Exception):
+    pass
+
+
 def realm_state(name):
     vmid = REALMS[name]
-    status = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current")["status"]
+    try:
+        status = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current")["status"]
+        seat = has_seat(vmid)
+    except KeyError:
+        raise
+    except Exception as exc:
+        return {"realm": name, "vmid": vmid, "power": "ERROR", "seat": None,
+                "ip": None, "error": str(exc)}
     if status != "running":
-        return {"realm": name, "vmid": vmid, "state": "OFF", "ip": None}
+        return {"realm": name, "vmid": vmid, "power": "OFF", "seat": seat, "ip": None}
     ip = realm_ip(vmid)
     # READY means the desktop can actually be connected to, not just that the VM runs.
-    state = "READY" if ip and port_open(ip, RDP_PORT) else "BOOTING"
-    return {"realm": name, "vmid": vmid, "state": state, "ip": ip}
+    power = "READY" if ip and port_open(ip, RDP_PORT) else "BOOTING"
+    return {"realm": name, "vmid": vmid, "power": power, "seat": seat, "ip": ip}
+
+
+def seat_owner():
+    for name, vmid in REALMS.items():
+        try:
+            if has_seat(vmid):
+                return name
+        except Exception:
+            continue
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -129,13 +179,26 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parts == ["realms"]:
                 return self._reply(200, [realm_state(n) for n in REALMS])
+            if method == "GET" and parts == ["seat"]:
+                return self._reply(200, {"owner": seat_owner()})
             if method == "GET" and len(parts) == 2 and parts[0] == "realms":
                 return self._reply(200, realm_state(parts[1]))
+            if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
+                    and parts[2] == "seat"):
+                name = parts[1]
+                REALMS[name]                     # 404 for an unknown realm
+                return self._reply(200, {"result": seat_cmd("switch", name),
+                                         "owner": seat_owner()})
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
                     and parts[2] in ("start", "stop")):
                 name, vmid = parts[1], REALMS[parts[1]]
                 running = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current")["status"] == "running"
                 if parts[2] == "start" and not running:
+                    # A start is always headless. Never inherit a seat the last
+                    # session left behind, or a remote start would silently take
+                    # over the physical monitors.
+                    if has_seat(vmid):
+                        seat_cmd("release", name)
                     pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/start")
                 elif parts[2] == "stop" and running:
                     pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/shutdown")
@@ -143,10 +206,15 @@ class Handler(BaseHTTPRequestHandler):
                     # more, and its agent is already gone, so realm_state would
                     # read that as BOOTING. Say what was actually asked for.
                     return self._reply(202, {"realm": name, "vmid": vmid,
-                                             "state": "STOPPING", "ip": None})
+                                             "power": "STOPPING", "seat": has_seat(vmid),
+                                             "ip": None})
                 return self._reply(202, realm_state(name))
         except KeyError:
             return self._reply(404, {"error": "unknown realm"})
+        except SeatError as exc:
+            # Refusing is the safe answer: never start a Realm that would grab
+            # the GPU because the seat could not be released.
+            return self._reply(409, {"error": f"local seat: {exc}"})
         except Exception as exc:
             return self._reply(502, {"error": f"proxmox: {exc}"})
         self._reply(404, {"error": "not found"})

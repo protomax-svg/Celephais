@@ -6,12 +6,16 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import celephais_core as c  # noqa: E402
 
-fake = type("fake", (), {"status": "stopped", "agent": False, "rdp": False})
+fake = type("fake", (), {"status": "stopped", "agent": False, "rdp": False,
+                         "seat": False, "seat_calls": [], "seat_fails": False})
 
 
 def fake_pve(method, path, **form):
     if path.endswith("/status/current"):
         return {"status": fake.status}
+    if path.endswith("/config"):
+        return ({"hostpci0": "0000:01:00.0,pcie=1", "usb0": "host=1532:02a2"}
+                if fake.seat else {"name": "vm"})
     if path.endswith("/network-get-interfaces"):
         if not fake.agent:
             raise OSError("QEMU guest agent is not running")
@@ -25,23 +29,41 @@ def fake_pve(method, path, **form):
     return {}
 
 
+def fake_seat(*args):
+    fake.seat_calls.append(args)
+    if fake.seat_fails:
+        raise c.SeatError("another realm is still running with the seat")
+    fake.seat = args[0] == "switch"
+    return "ok"
+
+
 c.pve = fake_pve
 c.port_open = lambda ip, port, timeout=1.0: fake.rdp
+c.seat_cmd = fake_seat
 
 s = c.realm_state("work")
-assert s == {"realm": "work", "vmid": 201, "state": "OFF", "ip": None}, s
+assert s == {"realm": "work", "vmid": 201, "power": "OFF", "seat": False, "ip": None}, s
 
 fake.status = "running"
 s = c.realm_state("work")
-assert s["state"] == "BOOTING" and s["ip"] is None, s   # agent not up yet
+assert s["power"] == "BOOTING" and s["ip"] is None, s   # agent not up yet
 
 fake.agent = True
 s = c.realm_state("work")
-assert s["state"] == "BOOTING", s                        # agent up, RDP not listening
-assert s["ip"] == "192.168.2.50", s                      # loopback and IPv6 skipped
+assert s["power"] == "BOOTING", s                       # agent up, RDP not listening
+assert s["ip"] == "192.168.2.50", s                     # loopback and IPv6 skipped
 
 fake.rdp = True
-assert c.realm_state("work")["state"] == "READY"
+assert c.realm_state("work")["power"] == "READY"
+
+# power and seat are independent: a running Realm may or may not hold the seat
+assert c.realm_state("work")["seat"] is False
+assert c.seat_owner() is None
+fake.seat = True
+assert c.realm_state("work")["power"] == "READY", "the seat changed the power state"
+assert c.realm_state("work")["seat"] is True
+assert c.seat_owner() == "work"
+fake.seat = False
 
 try:
     c.realm_state("nope")
@@ -86,13 +108,35 @@ assert status_of("/nonsense") == 404
 code, body = call("/realms")
 assert code == 200 and {r["realm"] for r in body} == {"work", "windows"}, body
 
-fake.status = "stopped"
+# A start of a seatless Realm must not touch the switcher at all.
+fake.status, fake.seat, fake.seat_calls = "stopped", False, []
 code, body = call("/realms/work/start", method="POST")
 assert code == 202 and body["vmid"] == 201, body
+assert fake.seat_calls == [], fake.seat_calls
+
+# A start of a Realm that still holds the seat must release it first.
+fake.status, fake.seat, fake.seat_calls = "stopped", True, []
+call("/realms/work/start", method="POST")
+assert fake.seat_calls == [("release", "work")], fake.seat_calls
+
+# If the seat cannot be released, refuse rather than grab the monitors.
+fake.status, fake.seat, fake.seat_fails = "stopped", True, True
+assert status_of("/realms/work/start", method="POST") == 409
+fake.seat_fails = False
+
+# Asking for the seat is a separate operation.
+fake.status, fake.seat, fake.seat_calls = "running", False, []
+code, body = call("/realms/work/seat", method="POST")
+assert code == 200 and body["owner"] == "work", body
+assert fake.seat_calls == [("switch", "work")], fake.seat_calls
+assert status_of("/realms/nope/seat", method="POST") == 404
+
+code, body = call("/seat")
+assert body["owner"] == "work", body
 
 fake.status = "running"
 code, body = call("/realms/work/stop", method="POST")
-assert body["state"] == "STOPPING", body   # not BOOTING: the agent is already gone
+assert body["power"] == "STOPPING", body   # not BOOTING: the agent is already gone
 
 srv.shutdown()
 print("PASS")

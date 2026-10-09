@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Celephais Gate - the client. One command opens a Realm.
 
-    celephais-gate work          # start it if needed, wait, connect
-    celephais-gate --status      # just show what is running
+    celephais-gate work          # open it remotely: start headless, wait, connect
+    celephais-gate work --local  # give it the physical monitors instead
+    celephais-gate --status      # show power and seat for every Realm
     celephais-gate work --stop   # shut the Realm down
+
+Opening a Realm remotely and giving it the Local Seat are different things.
+The default never touches the RTX 2060 or the physical monitors.
 
 It asks Core, waits for READY, then hands over to FreeRDP. It never speaks to
 Proxmox and holds no Proxmox credential; CORE_TOKEN is all it has.
@@ -89,11 +93,13 @@ def wait_ready(name):
     last = None
     while time.monotonic() < deadline:
         realm = core(f"/realms/{name}")
-        if realm["state"] != last:
-            last = realm["state"]
+        if realm["power"] != last:
+            last = realm["power"]
             print(f"  {name}: {last}", flush=True)
-        if realm["state"] == "READY":
+        if realm["power"] == "READY":
             return realm["ip"]
+        if realm["power"] == "ERROR":
+            raise SystemExit(f"gate: {name}: {realm.get('error', 'unknown error')}")
         time.sleep(3)
     raise SystemExit(f"gate: {name} was still {last} after {cfg('BOOT_TIMEOUT', '180')}s")
 
@@ -122,6 +128,8 @@ def main():
     ap.add_argument("realm", nargs="?", help="realm name, e.g. work")
     ap.add_argument("--status", action="store_true", help="list realms and exit")
     ap.add_argument("--stop", action="store_true", help="shut the realm down")
+    ap.add_argument("--local", action="store_true",
+                    help="give this realm the RTX, the monitors and the USB input")
     ap.add_argument("--no-connect", action="store_true", help="start and wait, do not launch RDP")
     args, extra = ap.parse_known_args()
 
@@ -132,12 +140,20 @@ def main():
 
     if args.status or not args.realm:
         for realm in core("/realms"):
-            print(f"{realm['realm']:<10} vm {realm['vmid']:<5} {realm['state']:<9} "
-                  f"{realm['ip'] or ''}")
+            seat = "seat" if realm.get("seat") else "    "
+            print(f"{realm['realm']:<10} vm {realm['vmid']:<5} {realm['power']:<9} "
+                  f"{seat}  {realm.get('ip') or ''}")
         return 0
 
     if args.stop:
         print(json.dumps(core(f"/realms/{args.realm}/stop", "POST")))
+        return 0
+
+    if args.local:
+        # The Realm takes over the physical desktop, so there is nothing for
+        # this machine to connect to.
+        reply = core(f"/realms/{args.realm}/seat", "POST")
+        print(f"  local seat -> {reply['owner']}")
         return 0
 
     core(f"/realms/{args.realm}/start", "POST")

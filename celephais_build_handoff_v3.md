@@ -764,3 +764,62 @@ on the binary does not contain the token.
 2. **Tailscale from the Gate** — right now the client machine must already be on
    the tailnet. `vision.md` wants the USB to carry its own identity.
 3. **Launch on insert** — the trusted-host helper, per platform, no autorun hacks.
+
+## Power and Local Seat are separate — the model (2026-10-09)
+
+Stated by the owner and now enforced in code. Two independent facts:
+
+```text
+Realm power:         OFF | BOOTING | READY | STOPPING | ERROR
+Local Seat owner:    exactly one Realm, or nobody
+```
+
+Several Realms may run at once. Only one may hold the RTX 2060, the three
+physical monitors and the USB keyboard/mouse. **Owning the seat is not required
+for a Linux Realm to run**, so a remote start must never claim it.
+
+The hazard was real: Proxmox keeps `hostpci0` in the VM config, so a Realm shut
+down while holding the seat still holds it in config. A remote start would then
+quietly take over the physical desktop. Every start therefore releases the seat
+first, and refuses to start at all if the release fails.
+
+### API
+
+```text
+GET  /realms              -> [ {realm, vmid, power, seat, ip}, ... ]
+GET  /realms/<name>
+GET  /seat                -> {"owner": "<realm>"} or {"owner": null}
+POST /realms/<name>/start -> headless, never with the seat
+POST /realms/<name>/stop
+POST /realms/<name>/seat  -> explicitly give this Realm the Local Seat
+```
+
+Changing passthrough is restricted to `root@pam` by Proxmox, which the token
+cannot do. Reading it is allowed with `VM.Audit`, so Core *detects* the seat over
+the API, and *changes* it by calling the hardware-tested `bin/celephais-seat`
+through one narrow sudo rule:
+
+```text
+celephais ALL=(root) NOPASSWD: /usr/local/bin/celephais-seat
+```
+
+`install-core.sh` writes that rule and installs the switcher. One implementation
+of the seat rules, not two.
+
+### Gate
+```bash
+celephais-gate work           # remote: headless start, wait for READY, open RDP
+celephais-gate work --local   # explicit: hand this Realm the physical desktop
+celephais-gate --status       # power and seat for every Realm
+```
+
+### Verified against the real host 2026-10-09
+- `work` READY at 192.168.2.114 with `seat: false`, while `windows` was OFF and
+  still held the seat keys in its config — the two facts read independently.
+- `POST /realms/windows/start` for that seat-holding Realm was **refused** with
+  409 and VM 100 stayed OFF. The monitors were never touched.
+
+### Still to test on hardware
+Two Linux Realms at once: one holding the seat on the RTX, the other running
+headless and reachable over RDP. Needs the Personal Realm, VM 202, which does
+not exist yet. Adding it is one line in `REALMS` in both Core and the switcher.

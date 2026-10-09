@@ -23,6 +23,15 @@ id celephais >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/s
 
 install -d -m 755 /opt/celephais
 install -m 755 "$SRC/bin/celephais_core.py" /opt/celephais/celephais_core.py
+install -m 755 "$SRC/bin/celephais-seat" /usr/local/bin/celephais-seat
+
+# Proxmox lets only root change PCI passthrough, so Core calls the switcher
+# through sudo. One command, no password, nothing else.
+cat > /etc/sudoers.d/celephais <<'EOF'
+celephais ALL=(root) NOPASSWD: /usr/local/bin/celephais-seat
+EOF
+chmod 440 /etc/sudoers.d/celephais
+visudo -cf /etc/sudoers.d/celephais >/dev/null
 
 install -d -m 750 -o root -g celephais /etc/celephais
 umask 027
@@ -65,4 +74,5 @@ systemctl --no-pager --lines=15 status celephais-core.service || true
 
 echo
 echo "Core is listening on http://$TS_IP:8080"
+echo "Local Seat switcher: /usr/local/bin/celephais-seat"
 echo "On the client, put this in .env:  CORE_URL=http://$TS_IP:8080"

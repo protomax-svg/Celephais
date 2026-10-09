@@ -47,6 +47,19 @@ cmd_status() {
   done
 }
 
+# Make a stopped Realm headless: no GPU, no Local Seat USB. Powering a Realm
+# and giving it the Local Seat are separate operations, so start must never
+# inherit a seat left in the config by the previous session.
+cmd_release() {
+  local target=${1:-} vmid
+  [ -n "$target" ] || die "usage: celephais-seat release <realm>"
+  vmid=${REALMS[$target]:-}
+  [ -n "$vmid" ] || die "unknown realm '$target'. known: ${!REALMS[*]}"
+  [ "$(vm_status "$vmid")" = stopped ] || die "realm '$target' is running; stop it first"
+  detach_seat "$vmid"
+  echo "Local Seat released from $target (VM $vmid)"
+}
+
 cmd_switch() {
   local target=${1:-} vmid name other
   [ -n "$target" ] || die "usage: celephais-seat switch <realm>"
@@ -74,5 +87,6 @@ cmd_switch() {
 case "${1:-status}" in
   status) cmd_status ;;
   switch) shift; cmd_switch "${1:-}" ;;
-  *) die "usage: celephais-seat [status | switch <realm>]" ;;
+  release) shift; cmd_release "${1:-}" ;;
+  *) die "usage: celephais-seat [status | switch <realm> | release <realm>]" ;;
 esac

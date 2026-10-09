@@ -51,7 +51,17 @@ grep -q '^usb1:'     "$tmp/201.config" || fail "USB not attached to work"
 ! grep -q "qm shutdown 201" "$tmp/log" || fail "headless realm was killed"
 grep -q 'qm start 100'    "$tmp/log" || fail "windows was not started"
 
-# 4. unknown realm is refused
+# 4. release strips the seat from a stopped realm, and refuses a running one
+: > "$tmp/log"; seed 201 stopped yes
+"$SEAT" release work > /dev/null
+! grep -q '^hostpci0:' "$tmp/201.config" || fail "release left the GPU attached"
+! grep -q '^usb0:'     "$tmp/201.config" || fail "release left the USB attached"
+! grep -q 'qm start' "$tmp/log" || fail "release started the realm"
+
+seed 201 running yes
+! "$SEAT" release work 2>/dev/null || fail "release accepted a running realm"
+
+# 5. unknown realm is refused
 ! "$SEAT" switch nope 2>/dev/null || fail "unknown realm accepted"
 
 echo "PASS"
