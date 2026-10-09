@@ -126,8 +126,57 @@ def rdp_client():
         found = shutil.which(name)
         if found:
             return found
-    raise SystemExit("gate: no FreeRDP client found. Looked for: "
-                     + ", ".join(RDP_CLIENTS))
+    return None
+
+
+# The Gate carries Tailscale inside itself, but it cannot carry an RDP client:
+# that one needs the host's X11, its sound and its graphics drivers. So on a
+# Linux host without one, install it, once, with the host's own package
+# manager and the host's own password dialog.
+# ponytail: the package names are the obvious ones per family. A distro that
+# calls it something else falls through to the plain error.
+PACKAGERS = (
+    ("apt-get", "apt-get update && "
+                "(apt-get install -y freerdp3-sdl || apt-get install -y freerdp2-x11)"),
+    ("dnf", "dnf install -y freerdp"),
+    ("pacman", "pacman -Sy --noconfirm freerdp"),
+    ("zypper", "zypper --non-interactive install freerdp"),
+    ("apk", "apk add --no-cache freerdp"),
+)
+
+
+def ensure_rdp_client(tell=print):
+    """The path to an RDP client, installing one first if the host has none.
+
+    Windows always has mstsc, so this only ever does anything on Linux. The
+    elevation is pkexec when there is no terminal to type a password into,
+    which is the double-clicked case, and sudo when there is.
+    """
+    client = rdp_client()
+    if client:
+        return client
+    if os.name == "nt":
+        raise SystemExit("gate: no RDP client found. Looked for: "
+                         + ", ".join(RDP_CLIENTS))
+
+    recipe = next((script for tool, script in PACKAGERS if shutil.which(tool)), None)
+    if not recipe:
+        raise SystemExit("gate: no FreeRDP client, and no package manager I "
+                         "recognise. Install one of: " + ", ".join(RDP_CLIENTS))
+
+    has_terminal = sys.stdin is not None and sys.stdin.isatty()
+    if has_terminal or not shutil.which("pkexec"):
+        elevate = ["sudo", "sh", "-c", recipe]
+    else:
+        elevate = ["pkexec", "sh", "-c", recipe]
+    tell("no RDP client here; asking to install one\u2026")
+    if subprocess.call(elevate) != 0:
+        raise SystemExit("gate: installing an RDP client was refused or failed")
+
+    client = rdp_client()
+    if not client:
+        raise SystemExit("gate: the install finished but no RDP client appeared")
+    return client
 
 
 def _last_error(text):
@@ -152,7 +201,9 @@ def connect(name, ip, extra, say=None):
     """
     tell = say or (lambda text: print(f"  {text}", flush=True))
     user = cfg("RDP_USER") or getpass.getuser()
-    client = rdp_client()
+    # The overlay has already stepped aside by now, so the password dialog
+    # this may raise is not hidden underneath it.
+    client = ensure_rdp_client(tell)
     target, listener = ip, None
     if NET.get("socks5"):
         # Carry the connection ourselves rather than rely on the client having

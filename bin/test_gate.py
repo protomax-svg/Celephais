@@ -36,4 +36,21 @@ assert gate._last_error("[ERROR] plain") == "[ERROR] plain"
 assert gate.RDP_CLIENTS[0].startswith("sdl-freerdp"), gate.RDP_CLIENTS
 assert "mstsc.exe" not in gate.RDP_CLIENTS[:-1], gate.RDP_CLIENTS
 
+# A host that already has a client must never reach the package manager.
+import subprocess  # noqa: E402
+
+real_call = subprocess.call
+subprocess.call = lambda *a, **k: (_ for _ in ()).throw(
+    AssertionError(f"tried to install although a client exists: {a}"))
+try:
+    if gate.rdp_client():
+        assert gate.ensure_rdp_client(lambda _t: None) == gate.rdp_client()
+finally:
+    subprocess.call = real_call
+
+# Every recipe must name a manager that could exist and a command to run.
+for tool, script in gate.PACKAGERS:
+    assert script.startswith(tool), f"{tool} recipe does not run {tool}: {script}"
+    assert "freerdp" in script, (tool, script)
+
 print("PASS")
