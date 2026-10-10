@@ -37,7 +37,14 @@ hooks = {
         {"confirm": True, "warning": "the saved desktop cannot be kept"}
         if not confirmed else calls.append(("seat", name)),
     "rdp_login": lambda: ("workrealm", ""),      # nothing stored: it must ask
+    "devices": lambda: DEVICES,
+    "set_device": lambda ident, action: (calls.append(("device", ident, action))
+                                         or DEVICES[0].update(action=action)),
 }
+DEVICES = [{"id": "1532:02a2", "name": "Razer Ornata V3 X", "usb": "1532:02a2",
+            "action": None, "present": True},
+           {"id": "8087:0aaa", "name": "Bluetooth", "usb": "8087:0aaa",
+            "action": "never", "present": True}]
 
 
 def _wrong():
@@ -52,6 +59,15 @@ def pump(app, seconds=3.0, until=None):
             return True
         time.sleep(0.02)
     return False
+
+
+def all_buttons(widget):
+    found = []
+    for child in widget.winfo_children():
+        if isinstance(child, tkinter.Button):
+            found.append(child)
+        found += all_buttons(child)
+    return found
 
 
 def texts(widget):
@@ -158,6 +174,27 @@ try:
     # A hook that raises SystemExit must still reach the screen. wait_ready and
     # rdp_client both raise it, and `except Exception` used to let it past: the
     # worker thread died without a word and the overlay waited for ever.
+    # A device nobody has decided about has to be decided about before the
+    # Realm takes the physical machine: an unapproved keyboard stays on the
+    # host and the Realm comes up without one. One already decided is not asked
+    # about again.
+    calls.clear()
+    app.go("take_seat", "work")
+    assert pump(app, until=lambda: "new devices" in texts(app.panes[0])), \
+        f"it never asked: {texts(app.panes[0])}"
+    shown = texts(app.panes[0])
+    assert "Razer Ornata V3 X" in shown, shown
+    assert "Bluetooth" not in shown, "it asked again about a decided device"
+    assert ("seat", "work") not in calls, "the monitors moved before deciding"
+    with_seat = [c for c in all_buttons(app.panes[0])
+                 if c.cget("text") == "with the monitors"][0]
+    with_seat.invoke()
+    assert pump(app, until=lambda: ("device", "1532:02a2", "seat") in calls), \
+        f"the decision never reached Core: {calls}"
+    pump(app, 1.0)
+    # It stays decided from here on, which is the point: the screens that
+    # follow must not stop to ask about it again.
+
     # Core refuses to throw a saved session away without being told twice, so
     # the overlay must say what is lost and wait for a second, deliberate press.
     calls.clear()

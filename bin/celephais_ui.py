@@ -30,6 +30,8 @@ overlay never freezes.
                           -> starts it, waits for READY, launches RDP.
                              It calls hide() just before the RDP window opens.
   rdp_login()             -> (user, password) already known; password may be ""
+  devices()               -> [ {id, name, usb, action, present}, ... ]
+  set_device(id, action)  -> "seat", "never" or "forget" for that device
   take_seat(name, say, confirmed)
                           -> hands it the physical monitors. Returns the
                              warning dict instead when Core wants telling twice
@@ -407,7 +409,57 @@ class Overlay:
         self.focus_widgets = ()
         self.claim_focus()
 
-    def go(self, action, name, confirmed=False):
+    def ask_devices(self, name, devices):
+        """What is plugged in that nobody has decided about yet.
+
+        A Realm on the monitors can only use the devices the host hands it, so
+        this is the moment to decide: a keyboard nobody approved stays on the
+        host and the Realm comes up without one. Decided once, by make and
+        model, and it holds in any socket.
+        """
+        self.clear()
+        unknown = [d for d in devices if d.get("present") and not d.get("action")]
+        if not unknown:
+            return self.go("take_seat", name, checked=True)
+
+        def decide(ident, action):
+            self.work(lambda: self.hooks["set_device"](ident, action),
+                      lambda _r, error: self.go("take_seat", name)
+                      if not error else self.show_realms(str(error)))
+
+        for pane in self.panes:
+            self.label(pane, "new devices", 24, FG, pady=(0, 4))
+            self.label(pane, "decide before the monitors move", 11, DIM, pady=(0, 16))
+            rows = tk.Frame(pane, bg=BG)
+            rows.pack()
+            for index, device in enumerate(unknown):
+                tk.Label(rows, text=device["name"], bg=BG, fg=FG, anchor="w",
+                         font=(FONT, 13), width=30
+                         ).grid(row=index, column=0, sticky="w", pady=5)
+                tk.Label(rows, text=device["usb"], bg=BG, fg=DIM, anchor="w",
+                         font=(FONT, 10), width=12
+                         ).grid(row=index, column=1, sticky="w", padx=8)
+                self.button(rows, "with the monitors",
+                            lambda i=device["id"]: decide(i, "seat"), accent=True
+                            ).grid(row=index, column=2, padx=5)
+                self.button(rows, "leave it alone",
+                            lambda i=device["id"]: decide(i, "never")
+                            ).grid(row=index, column=3, padx=5)
+            self.button(pane, "go on without deciding",
+                        lambda: self.go("take_seat", name, checked=True)
+                        ).pack(pady=(20, 0))
+            self.button(pane, "back", self.show_realms).pack(pady=(8, 0))
+        self.focus_widgets = ()
+        self.claim_focus()
+
+    def go(self, action, name, confirmed=False, checked=False):
+        if action == "take_seat" and not checked:
+            # The Realm is about to take the physical machine. Look at what is
+            # plugged into it first.
+            return self.work(
+                self.hooks["devices"],
+                lambda result, error: self.go(action, name, confirmed, True)
+                if error else self.ask_devices(name, result))
         if action == "open_remote":
             if self.rdp is None:
                 self.rdp = tuple(self.hooks.get("rdp_login", lambda: ("", ""))())
@@ -427,7 +479,7 @@ class Overlay:
             if isinstance(result, dict) and result.get("confirm"):
                 return self.ask_confirm(
                     name, result.get("warning", "this cannot be undone"),
-                    lambda: self.go(action, name, confirmed=True))
+                    lambda: self.go(action, name, confirmed=True, checked=True))
             self.show_realms(str(error) if error else "")
 
         if action == "open_remote":

@@ -314,6 +314,15 @@ def run(args, extra):
                 raise SystemExit("gate: cancelled")
         # The Realm takes over the physical desktop, so there is nothing for
         # this machine to connect to.
+        # Anything plugged in that nobody has decided about yet would simply
+        # be left on the host, where the Realm cannot see it. Say so before
+        # handing the monitors over, not after.
+        unknown = [d for d in core("/devices") if d["present"] and not d["action"]]
+        for device in unknown:
+            print(f"  not decided: {device['name']} ({device['usb']})")
+        if unknown:
+            print("  decide with: --device <id> --action seat|never")
+
         reply = core(f"/realms/{args.realm}/seat", "POST", allow=(409,))
         if reply.get("confirm"):
             print(f"  {reply['warning']}")
@@ -367,6 +376,10 @@ def ui_session():
         say(reply.get("power", "").lower() or "parked")
         return True
 
+    def set_device(ident, action):
+        return core(f"/devices/{urllib.parse.quote(ident, safe='')}"
+                    f"?action={action}", "POST")
+
     def take_seat(name, say, confirmed=False):
         say("handing over the monitors\u2026")
         query = "?confirm=1" if confirmed else ""
@@ -378,7 +391,9 @@ def ui_session():
 
     return stack, {"unlock": unlock, "realms": lambda: core("/realms"),
                    "open_remote": open_remote, "take_seat": take_seat,
-                   "park": park, "rdp_login": rdp_login}
+                   "park": park, "rdp_login": rdp_login,
+                   "devices": lambda: core("/devices"),
+                   "set_device": set_device}
 
 
 def main():
