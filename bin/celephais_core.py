@@ -169,6 +169,17 @@ def port_open(ip, port, timeout=1.0):
         return False
 
 
+# What a USB class code means in words. A device announces one, or announces
+# zero and leaves it to each interface, which is what a headset does: audio
+# plus a few buttons. Worth saying out loud on the approval screen: handing a
+# Realm an unknown mass-storage device is a different decision from handing it
+# a keyboard.
+USB_KINDS = {"01": "audio", "02": "network", "03": "keyboard or mouse",
+             "05": "controller", "06": "camera", "07": "printer",
+             "08": "storage", "0b": "smart card", "0e": "camera",
+             "0d": "security key", "e0": "wireless"}
+
+
 def _sysfs(path):
     try:
         return path.read_text().strip()
@@ -196,9 +207,14 @@ def usb_devices():
         serial = _sysfs(entry / "serial")
         name = " ".join(part for part in (_sysfs(entry / "manufacturer"),
                                           _sysfs(entry / "product")) if part)
+        codes = [_sysfs(entry / "bDeviceClass")]
+        codes += [_sysfs(iface / "bInterfaceClass")
+                  for iface in sorted(entry.glob("*:*"))]
+        kinds = [USB_KINDS[code] for code in codes if code in USB_KINDS]
         found.append({
             "id": f"{vid}:{pid}:{serial}" if serial else f"{vid}:{pid}",
             "vid": vid, "pid": pid, "serial": serial, "port": entry.name,
+            "kind": kinds[0] if kinds else "",
             "name": name or f"{vid}:{pid}", "usb": f"{vid}:{pid}"})
     seen = [device["id"] for device in found]
     for device in found:
@@ -235,14 +251,16 @@ def devices():
     for device in seen:
         entry = registry.get(device["id"], {})
         listed.append({**device, "action": entry.get("action"),
-                       "role": entry.get("role", ""), "present": True})
+                       "role": entry.get("role") or device["kind"],
+                       "present": True})
     here = {device["id"] for device in seen}
     for ident, entry in sorted(registry.items()):
         if ident not in here:
             listed.append({"id": ident, "usb": entry.get("usb", ""),
                            "name": entry.get("name", ident),
                            "action": entry.get("action"),
-                           "role": entry.get("role", ""), "present": False})
+                           "role": entry.get("role", ""), "kind": "",
+                           "present": False})
     return listed
 
 
@@ -403,7 +421,8 @@ class Handler(BaseHTTPRequestHandler):
                     registry[ident] = {"action": action,
                                        "usb": known.get("usb", ""),
                                        "name": known.get("name", ident),
-                                       "role": known.get("role", "")}
+                                       "role": known.get("role")
+                                       or known.get("kind", "")}
                 save_registry(registry)
                 return self._reply(200, {"id": ident, "action":
                                          None if action == "forget" else action})

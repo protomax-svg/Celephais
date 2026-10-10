@@ -58,7 +58,8 @@ import tempfile  # noqa: E402
 usb_root = pathlib.Path(tempfile.mkdtemp()) / "usb"
 
 
-def fake_usb(name, vid, pid, cls="00", serial="", maker="", product=""):
+def fake_usb(name, vid, pid, cls="00", serial="", maker="", product="",
+             interfaces=()):
     entry = usb_root / name
     entry.mkdir(parents=True)
     for key, value in (("idVendor", vid), ("idProduct", pid),
@@ -66,27 +67,41 @@ def fake_usb(name, vid, pid, cls="00", serial="", maker="", product=""):
                        ("manufacturer", maker), ("product", product)):
         if value:
             (entry / key).write_text(value + "\n")
+    for number, iface_class in enumerate(interfaces):
+        iface = entry / f"{name}:1.{number}"
+        iface.mkdir()
+        (iface / "bInterfaceClass").write_text(iface_class + "\n")
 
 
 fake_usb("1-0:1.0", "", "")                                  # an interface
 fake_usb("1-1", "1d6b", "0002", cls="09")                    # a root hub
 fake_usb("1-4", "1532", "02a2", product="Ornata V3 X", maker="Razer")
-fake_usb("1-5", "046d", "c52b", serial="A17F9C", product="Unifying Receiver")
+fake_usb("1-5", "046d", "c52b", serial="A17F9C", product="Unifying Receiver",
+         interfaces=("03",))
+# A headset announces nothing itself and leaves it to its interfaces.
+fake_usb("1-7", "0b0e", "0309", product="Headset", interfaces=("01", "03"))
 c.USB_ROOT = usb_root
 c.DEVICES_FILE = usb_root.parent / "devices.json"
 
 found = {d["id"]: d for d in c.usb_devices()}
-assert set(found) == {"1532:02a2", "046d:c52b:A17F9C"}, found
+assert set(found) == {"1532:02a2", "046d:c52b:A17F9C", "0b0e:0309"}, found
+# Handing a Realm an unknown storage device is a different decision from
+# handing it a keyboard, so the screen has to be able to say which it is.
+assert found["0b0e:0309"]["kind"] == "audio", found["0b0e:0309"]
+assert found["046d:c52b:A17F9C"]["kind"] == "keyboard or mouse", found
+assert found["1532:02a2"]["kind"] == "", "no class announced anywhere"
 assert found["046d:c52b:A17F9C"]["usb"] == "046d:c52b", found
 assert "Razer Ornata V3 X" == found["1532:02a2"]["name"], found
 
 # Two of the same keyboard: only then does the socket become part of the name.
 fake_usb("1-6", "1532", "02a2", product="Ornata V3 X", maker="Razer")
 twins = {d["id"] for d in c.usb_devices()}
-assert twins == {"1532:02a2@1-4", "1532:02a2@1-6", "046d:c52b:A17F9C"}, twins
+assert twins == {"1532:02a2@1-4", "1532:02a2@1-6", "046d:c52b:A17F9C",
+                 "0b0e:0309"}, twins
 import shutil  # noqa: E402
 shutil.rmtree(usb_root / "1-6")
-assert {d["id"] for d in c.usb_devices()} == {"1532:02a2", "046d:c52b:A17F9C"}
+assert {d["id"] for d in c.usb_devices()} == {"1532:02a2", "046d:c52b:A17F9C",
+                                              "0b0e:0309"}
 
 c.pve = fake_pve
 c.port_open = lambda ip, port, timeout=1.0: fake.rdp
@@ -253,6 +268,12 @@ assert by_id["1532:02a2"]["action"] == "seat", by_id
 assert by_id["046d:c52b:A17F9C"]["action"] == "never", by_id
 assert c.seat_usb() == ["1532:02a2"], c.seat_usb()
 
+# Audio is not a special case: an approved headset travels like anything else.
+call("/devices/0b0e%3A0309?action=seat", method="POST")
+assert c.seat_usb() == ["1532:02a2", "0b0e:0309"], c.seat_usb()
+assert c.device_registry()["0b0e:0309"]["role"] == "audio", c.device_registry()
+call("/devices/0b0e%3A0309?action=forget", method="POST")
+
 # Taking the seat must carry exactly what was approved, and nothing else.
 fake.status, fake.seat, fake.vmstate, fake.seat_calls = "running", False, None, []
 call("/realms/work/seat", method="POST")
@@ -262,8 +283,8 @@ assert fake.seat_calls == [("switch", "work", "1532:02a2")], fake.seat_calls
 c.USB_ROOT = usb_root.parent / "nothing-plugged-in"
 absent = {d["id"]: d for d in c.devices()}
 assert absent["1532:02a2"] == {"id": "1532:02a2", "usb": "1532:02a2",
-                                   "name": "Razer Ornata V3 X", "action": "seat",
-                                   "role": "", "present": False}, absent
+                               "name": "Razer Ornata V3 X", "action": "seat",
+                               "role": "", "kind": "", "present": False}, absent
 assert c.seat_usb() == [], "it offered a device that is not plugged in"
 c.USB_ROOT = usb_root
 call("/devices/1532%3A02a2?action=forget", method="POST")

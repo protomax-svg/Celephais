@@ -270,7 +270,8 @@ def run(args, extra):
         for device in core("/devices"):
             mark = {"seat": "seat ", "never": "never"}.get(device["action"], "  ? ")
             where = device["usb"] if device["present"] else "unplugged"
-            print(f"{mark}  {where:<12} {device['name']}")
+            kind = f" [{device['role']}]" if device.get("role") else ""
+            print(f"{mark}  {where:<12} {device['name']}{kind}")
             print(f"        {device['id']}")
         return 0
 
@@ -319,7 +320,8 @@ def run(args, extra):
         # handing the monitors over, not after.
         unknown = [d for d in core("/devices") if d["present"] and not d["action"]]
         for device in unknown:
-            print(f"  not decided: {device['name']} ({device['usb']})")
+            print(f"  not decided: {device['name']} ({device['usb']}"
+                  + (f", {device['role']}" if device.get("role") else "") + ")")
         if unknown:
             print("  decide with: --device <id> --action seat|never")
 

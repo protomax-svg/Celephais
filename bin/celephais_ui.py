@@ -436,8 +436,11 @@ class Overlay:
                 tk.Label(rows, text=device["name"], bg=BG, fg=FG, anchor="w",
                          font=(FONT, 13), width=30
                          ).grid(row=index, column=0, sticky="w", pady=5)
-                tk.Label(rows, text=device["usb"], bg=BG, fg=DIM, anchor="w",
-                         font=(FONT, 10), width=12
+                about = device["usb"]
+                if device.get("role"):
+                    about += "   " + device["role"]
+                tk.Label(rows, text=about, bg=BG, fg=DIM, anchor="w",
+                         font=(FONT, 10), width=24
                          ).grid(row=index, column=1, sticky="w", padx=8)
                 self.button(rows, "with the monitors",
                             lambda i=device["id"]: decide(i, "seat"), accent=True
