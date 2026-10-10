@@ -336,12 +336,22 @@ class Overlay:
             for rows in tables:
                 for index, realm in enumerate(realms):
                     seat = "  ● on the monitors" if realm.get("seat") else ""
+                    # A Realm Proxmox cannot answer for says only "error" in a
+                    # column this narrow, which tells nobody anything.
+                    trouble = realm.get("error")
                     tk.Label(rows, text=realm["realm"], bg=BG, fg=FG,
                              font=(FONT, 15), anchor="w", width=12
                              ).grid(row=index, column=0, sticky="w", pady=6)
                     tk.Label(rows, text=f"{realm['power'].lower()}{seat}", bg=BG,
-                             fg=DIM, font=(FONT, 11), anchor="w", width=22
+                             fg=BAD if trouble else DIM, font=(FONT, 11),
+                             anchor="w", width=22
                              ).grid(row=index, column=1, sticky="w", padx=10)
+                    if trouble:
+                        tk.Label(rows, text=trouble, bg=BG, fg=BAD, anchor="w",
+                                 font=(FONT, 10), wraplength=520, justify="left"
+                                 ).grid(row=index, column=2, columnspan=5,
+                                        sticky="w", padx=5)
+                        continue
                     name = realm["realm"]
                     # One row shows only what makes sense for that Realm right
                     # now: no parking what is not running, no taking monitors

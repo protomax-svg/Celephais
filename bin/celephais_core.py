@@ -180,6 +180,12 @@ USB_KINDS = {"01": "audio", "02": "network", "03": "keyboard or mouse",
              "0d": "security key", "e0": "wireless"}
 
 
+def log(message):
+    """Every change of state, in the journal. When a Realm is wedged at three
+    in the morning, the question is always what was done to it last."""
+    print(f"celephais: {message}", file=sys.stderr, flush=True)
+
+
 def _sysfs(path):
     try:
         return path.read_text().strip()
@@ -402,6 +408,7 @@ class Handler(BaseHTTPRequestHandler):
                 # to answer, not a list baked into the switcher.
                 extra = seat_usb() if parts[2] == "seat" else []
                 action = "switch" if parts[2] == "seat" else "release"
+                log(f"{action} {name} (vm {vmid}) usb={extra or 'default'}")
                 return self._reply(200, {"result": seat_cmd(action, name, *extra),
                                          "owner": seat_owner()})
             if method == "GET" and parts == ["devices"]:
@@ -424,6 +431,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "role": known.get("role")
                                        or known.get("kind", "")}
                 save_registry(registry)
+                log(f"device {ident} -> {action}")
                 return self._reply(200, {"id": ident, "action":
                                          None if action == "forget" else action})
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
@@ -432,6 +440,7 @@ class Handler(BaseHTTPRequestHandler):
                 if pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current"
                        )["status"] != "running":
                     return self._reply(200, realm_state(name))   # nothing to save
+                log(f"park {name} (vm {vmid}): suspending to disk")
                 park(vmid)
                 # Saving the memory takes a while and Proxmox answers at once,
                 # so report what was asked for rather than a half-written state.
@@ -440,6 +449,7 @@ class Handler(BaseHTTPRequestHandler):
                                          "ip": None})
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
                     and parts[2] == "logout"):
+                log(f"logout {parts[1]}")
                 return self._reply(200, logout_realm(REALMS[parts[1]]))
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
                     and parts[2] in ("start", "stop")):
@@ -450,9 +460,12 @@ class Handler(BaseHTTPRequestHandler):
                     # session left behind, or a remote start would silently take
                     # over the physical monitors.
                     if has_seat(vmid):
+                        log(f"start {name}: releasing the seat it still holds")
                         seat_cmd("release", name)
+                    log(f"start {name} (vm {vmid}) headless")
                     pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/start")
                 elif parts[2] == "stop" and running:
+                    log(f"stop {name} (vm {vmid}): asking the guest to shut down")
                     pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/shutdown")
                     # The guest is still "running" to Proxmox for a few seconds
                     # more, and its agent is already gone, so realm_state would
@@ -464,6 +477,7 @@ class Handler(BaseHTTPRequestHandler):
         except KeyError:
             return self._reply(404, {"error": "unknown realm"})
         except SeatError as exc:
+            log(f"refused: local seat: {exc}")
             # Refusing is the safe answer: never start a Realm that would grab
             # the GPU because the seat could not be released.
             return self._reply(409, {"error": f"local seat: {exc}"})

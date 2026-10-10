@@ -146,6 +146,16 @@ try:
     assert "stop" in shown and "park" in shown, f"nothing to do with work: {shown}"
     assert "give the monitors back" in shown, f"windows holds the seat: {shown}"
     assert "windows" in shown, shown
+
+    # A Realm Proxmox cannot answer for must say what went wrong, not "error".
+    REALMS.append({"realm": "broken", "vmid": 999, "power": "ERROR", "seat": None,
+                   "ip": None, "error": "proxmox: HTTP Error 596: nope"})
+    app.show_realms()
+    assert pump(app, until=lambda: any("596" in t for t in texts(app.panes[0]))), \
+        f"the reason never reached the screen: {texts(app.panes[0])}"
+    REALMS.pop()
+    app.show_realms()
+    pump(app, 1.0)
     assert any("on the monitors" in t for t in shown), f"seat not shown: {shown}"
     assert any("ready" in t for t in shown), f"power not shown: {shown}"
     assert ("unlock", "right") in calls, calls
