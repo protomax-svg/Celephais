@@ -9,7 +9,8 @@ import celephais_core as c  # noqa: E402
 fake = type("fake", (), {"status": "stopped", "agent": False, "rdp": False,
                          "seat": False, "seat_calls": [], "seat_fails": False,
                          "vmstate": None, "suspended": [],
-                         "exec_cmd": None, "exec_exit": 0, "exec_fails": False})
+                         "exec_cmd": None, "exec_exit": 0, "exec_fails": False,
+                         "exec_out": "", "exec_cmds": []})
 
 
 def fake_pve(method, path, **form):
@@ -28,9 +29,11 @@ def fake_pve(method, path, **form):
         if fake.exec_fails:
             raise OSError("QEMU guest agent is not running")
         fake.exec_cmd = form["command"]
+        fake.exec_cmds.append(form["command"])
         return {"pid": 7}
     if "/agent/exec-status" in path:
-        return {"exited": 1, "exitcode": fake.exec_exit, "out-data": ""}
+        return {"exited": 1, "exitcode": fake.exec_exit,
+                "out-data": fake.exec_out}
     if path.endswith("/network-get-interfaces"):
         if not fake.agent:
             raise OSError("QEMU guest agent is not running")
@@ -255,6 +258,32 @@ fake.vmstate = None
 fake.status, fake.seat, fake.suspended = "stopped", False, []
 code, body = call("/realms/work/park", method="POST")
 assert code == 200 and fake.suspended == [], body
+
+# --- egress: read it from the Realm, never from memory ---
+fake.exec_exit = 0            # the logout tests left a failure behind
+fake.exec_out = ('{"ExitNodeID": "nkLfnDPEGa11CNTRL", "ExitNodeIP": ""}')
+assert c.egress(201) == {"mode": "exit-node", "node": "nkLfnDPEGa11CNTRL"}, c.egress(201)
+fake.exec_out = '{"ExitNodeID": "", "ExitNodeIP": ""}'
+assert c.egress(201) == {"mode": "direct", "node": ""}, c.egress(201)
+fake.exec_out = ""                      # no tailscale in that Realm at all
+assert c.egress(201)["mode"] == "direct", c.egress(201)
+assert "not installed" in c.egress(201)["detail"], c.egress(201)
+
+code, body = call("/realms/work/egress")
+assert code == 200 and body["mode"] == "direct", body
+assert status_of("/realms/work/egress?mode=sideways", method="POST") == 400
+
+# Asking for an exit node when none is configured must say so, not go quiet.
+c.EXIT_NODE = ""
+assert status_of("/realms/work/egress?mode=exit-node", method="POST") == 400
+c.EXIT_NODE = "server-yo"
+fake.exec_out = '{"ExitNodeID": "abc", "ExitNodeIP": "100.124.90.77"}'
+fake.exec_cmds = []
+code, body = call("/realms/work/egress?mode=exit-node", method="POST")
+assert code == 200 and body["node"] == "100.124.90.77", body
+assert ["/bin/sh", "-c", "tailscale set --exit-node=server-yo"] \
+    in fake.exec_cmds, fake.exec_cmds
+fake.exec_out = ""
 
 # --- devices over HTTP ---
 code, body = call("/devices")

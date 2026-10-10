@@ -294,6 +294,13 @@ def run(args, extra):
         print(json.dumps(core(f"/realms/{args.realm}/stop", "POST")))
         return 0
 
+    if args.egress:
+        where = f"/realms/{args.realm}/egress"
+        reply = (core(f"{where}?mode={args.egress}", "POST")
+                 if args.egress != "show" else core(where))
+        print(json.dumps(reply))
+        return 0
+
     if args.release:
         print(json.dumps(core(f"/realms/{args.realm}/release", "POST")))
         return 0
@@ -422,6 +429,9 @@ def main():
     ap.add_argument("realm", nargs="?", help="realm name, e.g. work")
     ap.add_argument("--status", action="store_true", help="list realms and exit")
     ap.add_argument("--stop", action="store_true", help="shut the realm down")
+    ap.add_argument("--egress", nargs="?", const="show",
+                    choices=("show", "exit-node", "direct"),
+                    help="how the realm reaches the internet")
     ap.add_argument("--release", action="store_true",
                     help="take the RTX and the monitors back off a stopped realm")
     ap.add_argument("--park", action="store_true",

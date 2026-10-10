@@ -98,6 +98,9 @@ PVE_TOKEN=$PVE_TOKEN
 CORE_TOKEN=$CORE_TOKEN
 PVE_VERIFY_TLS=0
 CORE_BIND=$TS_IP:8080
+# The Tailscale node a Realm goes out through when asked for exit-node egress.
+# A name or an address from `tailscale exit-node list`. Empty: nobody chose one.
+EXIT_NODE=${EXIT_NODE:-}
 EOF
 chown root:celephais /etc/celephais/core.env
 chmod 640 /etc/celephais/core.env

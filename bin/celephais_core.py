@@ -29,6 +29,8 @@ API:
   POST /realms/<name>/release -> 200, strip the seat from a stopped Realm
   POST /realms/<name>/logout  -> 200, log out the Realm's desktop session
   POST /realms/<name>/park    -> 202, save the live session to disk and stop
+  GET  /realms/<name>/egress  -> {mode: exit-node|direct, node}
+  POST /realms/<name>/egress?mode=exit-node|direct
   GET  /devices             -> every USB device on the host, with what we do with it
   POST /devices/<id>?action=seat|never|forget
 
@@ -45,6 +47,7 @@ import hmac
 import json
 import os
 import pathlib
+import shlex
 import socket
 import subprocess
 import sys
@@ -78,6 +81,10 @@ DEVICES_FILE = pathlib.Path(os.environ.get("CELEPHAIS_DEVICES",
 # Add a Realm here once its VM exists.
 REALMS = {"work": 201, "personal": 202, "windows": 100}
 RDP_PORT = 3389
+# Which Tailscale node a Realm goes out through when it is not going out
+# directly. One name for the household; a Realm that should go out directly
+# is simply never switched. Empty means nobody has chosen one yet.
+EXIT_NODE = os.environ.get("EXIT_NODE", "")
 SEAT_CMD = os.environ.get("SEAT_CMD", "sudo -n /usr/local/bin/celephais-seat").split()
 
 PVE_HOST = os.environ.get("PVE_HOST", "")
@@ -149,6 +156,40 @@ def guest_exec(vmid, *cmd, timeout=30):
                                            + st.get("err-data", "")).strip()
         time.sleep(0.5)
     raise TimeoutError(f"the guest agent did not finish in {timeout}s")
+
+
+def egress(vmid):
+    """How this Realm reaches the internet: through an exit node, or straight out.
+
+    Read from the Realm itself rather than remembered here, because anybody
+    can change it inside the guest and a remembered answer would be a lie.
+    """
+    try:
+        _code, out = guest_exec(
+            vmid, "/bin/sh", "-c",
+            "command -v tailscale >/dev/null && tailscale debug prefs || true")
+    except Exception as exc:
+        return {"mode": "unknown", "detail": str(exc)}
+    if not out.lstrip().startswith("{"):
+        return {"mode": "direct", "detail": "tailscale is not installed here"}
+    try:
+        prefs = json.loads(out)
+    except ValueError:
+        return {"mode": "unknown", "detail": out[:200]}
+    node = prefs.get("ExitNodeIP") or prefs.get("ExitNodeID") or ""
+    return {"mode": "exit-node" if node else "direct", "node": node}
+
+
+def set_egress(vmid, mode):
+    if mode == "exit-node" and not EXIT_NODE:
+        raise ValueError("no exit node is configured; set EXIT_NODE in "
+                         "/etc/celephais/core.env")
+    target = EXIT_NODE if mode == "exit-node" else ""
+    code, out = guest_exec(vmid, "/bin/sh", "-c",
+                           f"tailscale set --exit-node={shlex.quote(target)}")
+    if code != 0:
+        raise ValueError(out or f"tailscale set exited {code}")
+    return egress(vmid)
 
 
 def logout_realm(vmid):
@@ -434,6 +475,20 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"device {ident} -> {action}")
                 return self._reply(200, {"id": ident, "action":
                                          None if action == "forget" else action})
+            if (len(parts) == 3 and parts[0] == "realms" and parts[2] == "egress"):
+                vmid = REALMS[parts[1]]
+                if method == "GET":
+                    return self._reply(200, egress(vmid))
+                mode = urllib.parse.parse_qs(query).get("mode", [""])[0]
+                if mode not in ("exit-node", "direct"):
+                    return self._reply(400, {"error": "mode must be exit-node "
+                                                      "or direct"})
+                try:
+                    result = set_egress(vmid, mode)
+                except ValueError as exc:
+                    return self._reply(400, {"error": str(exc)})
+                log(f"egress {parts[1]} -> {mode} ({result.get('node') or 'none'})")
+                return self._reply(200, result)
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
                     and parts[2] == "park"):
                 name, vmid = parts[1], REALMS[parts[1]]
