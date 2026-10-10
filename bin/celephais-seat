@@ -6,7 +6,9 @@ set -euo pipefail
 # Local Seat hardware. Verify with: lspci -nn | grep -i nvidia ; lsusb
 SEAT_PCI=(0000:01:00.0 0000:01:00.1)   # GPU + HDMI/DP audio
 SEAT_USB=(1532:02a2 046d:c52b)         # Razer Ornata V3 X, Logitech Unifying
-# ponytail: VID:PID identity only. Add serial if two identical devices appear.
+# Core passes the approved devices as extra arguments to switch, taken from
+# its own registry, where a serial number identifies a device properly. The
+# list above is the fallback for running this by hand on a fresh host.
 
 declare -A REALMS=( [work]=201 [personal]=202 [windows]=100 )
 
@@ -59,9 +61,12 @@ detach_seat() {
 
 attach_seat() {
   local vmid=$1 i
+  shift
+  local usb=("$@")
+  [ ${#usb[@]} -gt 0 ] || usb=("${SEAT_USB[@]}")
   refuse_if_parked "$vmid"
   for i in "${!SEAT_PCI[@]}"; do qm set "$vmid" "-hostpci$i" "${SEAT_PCI[$i]},pcie=1"; done
-  for i in "${!SEAT_USB[@]}"; do qm set "$vmid" "-usb$i"     "host=${SEAT_USB[$i]}"; done
+  for i in "${!usb[@]}";      do qm set "$vmid" "-usb$i"     "host=${usb[$i]}"; done
 }
 
 stop_realm() {
@@ -94,7 +99,8 @@ cmd_release() {
 
 cmd_switch() {
   local target=${1:-} vmid name other
-  [ -n "$target" ] || die "usage: celephais-seat switch <realm>"
+  [ -n "$target" ] || die "usage: celephais-seat switch <realm> [vid:pid ...]"
+  shift
   vmid=${REALMS[$target]:-}
   [ -n "$vmid" ] || die "unknown realm '$target'. known: ${!REALMS[*]}"
 
@@ -112,14 +118,14 @@ cmd_switch() {
 
   wake_and_stop "$vmid"
   detach_seat "$vmid"
-  attach_seat "$vmid"
+  attach_seat "$vmid" "$@"
   qm start "$vmid"
   echo "Local Seat -> $target (VM $vmid)"
 }
 
 case "${1:-status}" in
   status) cmd_status ;;
-  switch) shift; cmd_switch "${1:-}" ;;
+  switch) shift; cmd_switch "$@" ;;
   release) shift; cmd_release "${1:-}" ;;
   *) die "usage: celephais-seat [status | switch <realm> | release <realm>]" ;;
 esac

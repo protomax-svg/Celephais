@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -265,6 +266,19 @@ def connect(name, ip, extra, say=None, user="", password=""):
 
 def run(args, extra):
     """Everything the Gate does once the network, if any, is up."""
+    if args.devices:
+        for device in core("/devices"):
+            mark = {"seat": "seat ", "never": "never"}.get(device["action"], "  ? ")
+            where = device["usb"] if device["present"] else "unplugged"
+            print(f"{mark}  {where:<12} {device['name']}")
+            print(f"        {device['id']}")
+        return 0
+
+    if args.device:
+        ident = urllib.parse.quote(args.device, safe="")
+        print(json.dumps(core(f"/devices/{ident}?action={args.action}", "POST")))
+        return 0
+
     if args.status or not args.realm:
         for realm in core("/realms"):
             seat = "seat" if realm.get("seat") else "    "
@@ -374,6 +388,12 @@ def main():
     ap.add_argument("--stop", action="store_true", help="shut the realm down")
     ap.add_argument("--park", action="store_true",
                     help="save the realm's session to disk and free its RAM")
+    ap.add_argument("--devices", action="store_true",
+                    help="list the USB devices on the host and what happens to them")
+    ap.add_argument("--device", metavar="ID",
+                    help="the device --action applies to, as --devices prints it")
+    ap.add_argument("--action", choices=("seat", "never", "forget"), default="seat",
+                    help="seat: travels with the monitors; never: leave it alone")
     ap.add_argument("--logout", action="store_true",
                     help="end the realm's desktop session; its open windows are lost")
     ap.add_argument("--local", action="store_true",

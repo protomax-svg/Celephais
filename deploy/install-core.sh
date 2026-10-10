@@ -84,6 +84,11 @@ if [ -n "$TOKENID" ] && command -v pveum >/dev/null; then
   done
 fi
 
+# Core's own writable state: which USB devices may travel with the Local Seat.
+# Deliberately not in /etc/celephais, which holds the credentials Core may read
+# and must never be able to replace.
+install -d -m 750 -o celephais -g celephais /var/lib/celephais
+
 install -d -m 750 -o root -g celephais /etc/celephais
 umask 027
 cat > /etc/celephais/core.env <<EOF
@@ -122,6 +127,8 @@ PrivateTmp=yes
 # configuration into /etc/pve, the Proxmox cluster filesystem.
 ProtectSystem=true
 ProtectHome=yes
+# The USB registry lives here, and nothing else Core writes does.
+ReadWritePaths=/var/lib/celephais
 
 [Install]
 WantedBy=multi-user.target

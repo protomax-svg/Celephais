@@ -52,6 +52,42 @@ def fake_seat(*args):
     return "ok"
 
 
+# --- the USB registry: a fake sysfs tree, no host hardware needed ---
+import tempfile  # noqa: E402
+
+usb_root = pathlib.Path(tempfile.mkdtemp()) / "usb"
+
+
+def fake_usb(name, vid, pid, cls="00", serial="", maker="", product=""):
+    entry = usb_root / name
+    entry.mkdir(parents=True)
+    for key, value in (("idVendor", vid), ("idProduct", pid),
+                       ("bDeviceClass", cls), ("serial", serial),
+                       ("manufacturer", maker), ("product", product)):
+        if value:
+            (entry / key).write_text(value + "\n")
+
+
+fake_usb("1-0:1.0", "", "")                                  # an interface
+fake_usb("1-1", "1d6b", "0002", cls="09")                    # a root hub
+fake_usb("1-4", "1532", "02a2", product="Ornata V3 X", maker="Razer")
+fake_usb("1-5", "046d", "c52b", serial="A17F9C", product="Unifying Receiver")
+c.USB_ROOT = usb_root
+c.DEVICES_FILE = usb_root.parent / "devices.json"
+
+found = {d["id"]: d for d in c.usb_devices()}
+assert set(found) == {"1532:02a2", "046d:c52b:A17F9C"}, found
+assert found["046d:c52b:A17F9C"]["usb"] == "046d:c52b", found
+assert "Razer Ornata V3 X" == found["1532:02a2"]["name"], found
+
+# Two of the same keyboard: only then does the socket become part of the name.
+fake_usb("1-6", "1532", "02a2", product="Ornata V3 X", maker="Razer")
+twins = {d["id"] for d in c.usb_devices()}
+assert twins == {"1532:02a2@1-4", "1532:02a2@1-6", "046d:c52b:A17F9C"}, twins
+import shutil  # noqa: E402
+shutil.rmtree(usb_root / "1-6")
+assert {d["id"] for d in c.usb_devices()} == {"1532:02a2", "046d:c52b:A17F9C"}
+
 c.pve = fake_pve
 c.port_open = lambda ip, port, timeout=1.0: fake.rdp
 c.seat_cmd = fake_seat
@@ -204,6 +240,34 @@ fake.vmstate = None
 fake.status, fake.seat, fake.suspended = "stopped", False, []
 code, body = call("/realms/work/park", method="POST")
 assert code == 200 and fake.suspended == [], body
+
+# --- devices over HTTP ---
+code, body = call("/devices")
+assert code == 200 and all(d["action"] is None for d in body), body
+assert status_of("/devices/1532:02a2@1-4", method="POST") == 400   # no action
+
+call("/devices/1532%3A02a2?action=seat", method="POST")
+call("/devices/046d%3Ac52b%3AA17F9C?action=never", method="POST")
+by_id = {d["id"]: d for d in call("/devices")[1]}
+assert by_id["1532:02a2"]["action"] == "seat", by_id
+assert by_id["046d:c52b:A17F9C"]["action"] == "never", by_id
+assert c.seat_usb() == ["1532:02a2"], c.seat_usb()
+
+# Taking the seat must carry exactly what was approved, and nothing else.
+fake.status, fake.seat, fake.vmstate, fake.seat_calls = "running", False, None, []
+call("/realms/work/seat", method="POST")
+assert fake.seat_calls == [("switch", "work", "1532:02a2")], fake.seat_calls
+
+# A decision survives the device being unplugged, and can be taken back.
+c.USB_ROOT = usb_root.parent / "nothing-plugged-in"
+absent = {d["id"]: d for d in c.devices()}
+assert absent["1532:02a2"] == {"id": "1532:02a2", "usb": "1532:02a2",
+                                   "name": "Razer Ornata V3 X", "action": "seat",
+                                   "role": "", "present": False}, absent
+assert c.seat_usb() == [], "it offered a device that is not plugged in"
+c.USB_ROOT = usb_root
+call("/devices/1532%3A02a2?action=forget", method="POST")
+assert c.seat_usb() == [], c.seat_usb()
 
 fake.status = "running"
 code, body = call("/realms/work/stop", method="POST")

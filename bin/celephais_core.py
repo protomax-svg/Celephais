@@ -29,6 +29,8 @@ API:
   POST /realms/<name>/release -> 200, strip the seat from a stopped Realm
   POST /realms/<name>/logout  -> 200, log out the Realm's desktop session
   POST /realms/<name>/park    -> 202, save the live session to disk and stop
+  GET  /devices             -> every USB device on the host, with what we do with it
+  POST /devices/<id>?action=seat|never|forget
 
 power: OFF -> BOOTING -> READY, plus PARKED for a Realm whose live session is
 saved on disk, STOPPING after a stop, PARKING after a park, and ERROR if
@@ -61,6 +63,17 @@ if _ENV_FILE.exists():
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
+
+# The host's USB tree. Core reads it straight from sysfs rather than asking
+# Proxmox: it runs on the host anyway, and sysfs carries the serial numbers and
+# the physical port, which the API summary does not.
+USB_ROOT = pathlib.Path("/sys/bus/usb/devices")
+# What to do with which device, by stable id. Kept here and not in any VM's
+# configuration: an approval belongs to the household, not to one Realm.
+# /var, not /etc/celephais: Core writes this one itself, and /etc/celephais
+# holds the credentials, which it must not be able to replace.
+DEVICES_FILE = pathlib.Path(os.environ.get("CELEPHAIS_DEVICES",
+                                           "/var/lib/celephais/devices.json"))
 
 # Add a Realm here once its VM exists.
 REALMS = {"work": 201, "personal": 202, "windows": 100}
@@ -154,6 +167,90 @@ def port_open(ip, port, timeout=1.0):
             return True
     except OSError:
         return False
+
+
+def _sysfs(path):
+    try:
+        return path.read_text().strip()
+    except OSError:              # unplugged between the listing and the read
+        return ""
+
+
+def usb_devices():
+    """Every USB device plugged into the host, hubs left out.
+
+    Bus and device numbers change on every replug, so they are no identity at
+    all. A serial number is one when the maker bothered to write one. Without a
+    serial the make and model still identify the thing wherever it is plugged
+    in, which is what you want: approve the keyboard once, not once per socket.
+    The physical port is added only to tell two identical devices apart, since
+    that is the one case where make and model are not enough.
+    """
+    found = []
+    for entry in sorted(USB_ROOT.glob("[0-9]*")):
+        if ":" in entry.name:                      # an interface, not a device
+            continue
+        vid, pid = _sysfs(entry / "idVendor"), _sysfs(entry / "idProduct")
+        if not vid or not pid or _sysfs(entry / "bDeviceClass") == "09":
+            continue                               # no id, or a hub
+        serial = _sysfs(entry / "serial")
+        name = " ".join(part for part in (_sysfs(entry / "manufacturer"),
+                                          _sysfs(entry / "product")) if part)
+        found.append({
+            "id": f"{vid}:{pid}:{serial}" if serial else f"{vid}:{pid}",
+            "vid": vid, "pid": pid, "serial": serial, "port": entry.name,
+            "name": name or f"{vid}:{pid}", "usb": f"{vid}:{pid}"})
+    seen = [device["id"] for device in found]
+    for device in found:
+        if seen.count(device["id"]) > 1:           # two of the same thing
+            device["id"] += "@" + device["port"]
+    return found
+
+
+def device_registry():
+    try:
+        return json.loads(DEVICES_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_registry(registry):
+    DEVICES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DEVICES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n")
+    tmp.replace(DEVICES_FILE)
+
+
+def devices():
+    """The host's USB devices, each with the standing decision about it.
+
+    action is "seat" to hand it to whichever Realm holds the Local Seat,
+    "never" to leave it alone, and null for one nobody has decided about yet.
+    A device in the registry but not plugged in is listed as absent, so a
+    decision made last week is still visible.
+    """
+    registry = device_registry()
+    seen = usb_devices()
+    listed = []
+    for device in seen:
+        entry = registry.get(device["id"], {})
+        listed.append({**device, "action": entry.get("action"),
+                       "role": entry.get("role", ""), "present": True})
+    here = {device["id"] for device in seen}
+    for ident, entry in sorted(registry.items()):
+        if ident not in here:
+            listed.append({"id": ident, "usb": entry.get("usb", ""),
+                           "name": entry.get("name", ident),
+                           "action": entry.get("action"),
+                           "role": entry.get("role", ""), "present": False})
+    return listed
+
+
+def seat_usb():
+    """The VID:PIDs the Local Seat should carry, newest decision wins."""
+    approved = {ident for ident, entry in device_registry().items()
+                if entry.get("action") == "seat"}
+    return [device["usb"] for device in usb_devices() if device["id"] in approved]
 
 
 def vm_config(vmid):
@@ -283,9 +380,33 @@ class Handler(BaseHTTPRequestHandler):
                                    "with the GPU attached. The saved desktop "
                                    "cannot be kept across that change.",
                         "confirm": True})
+                # Which USB devices travel with the seat is Core's registry
+                # to answer, not a list baked into the switcher.
+                extra = seat_usb() if parts[2] == "seat" else []
                 action = "switch" if parts[2] == "seat" else "release"
-                return self._reply(200, {"result": seat_cmd(action, name),
+                return self._reply(200, {"result": seat_cmd(action, name, *extra),
                                          "owner": seat_owner()})
+            if method == "GET" and parts == ["devices"]:
+                return self._reply(200, devices())
+            if (method == "POST" and len(parts) == 2 and parts[0] == "devices"):
+                action = urllib.parse.parse_qs(query).get("action", [""])[0]
+                if action not in ("seat", "never", "forget"):
+                    return self._reply(400, {"error": "action must be seat, "
+                                                      "never or forget"})
+                registry = device_registry()
+                ident = urllib.parse.unquote(parts[1])
+                if action == "forget":
+                    registry.pop(ident, None)
+                else:
+                    here = {d["id"]: d for d in usb_devices()}
+                    known = here.get(ident, registry.get(ident, {}))
+                    registry[ident] = {"action": action,
+                                       "usb": known.get("usb", ""),
+                                       "name": known.get("name", ident),
+                                       "role": known.get("role", "")}
+                save_registry(registry)
+                return self._reply(200, {"id": ident, "action":
+                                         None if action == "forget" else action})
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
                     and parts[2] == "park"):
                 name, vmid = parts[1], REALMS[parts[1]]
