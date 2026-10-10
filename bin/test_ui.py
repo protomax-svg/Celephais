@@ -36,7 +36,8 @@ hooks = {
     "take_seat": lambda name, say, confirmed=False:
         {"confirm": True, "warning": "the saved desktop cannot be kept"}
         if not confirmed else calls.append(("seat", name)),
-    "rdp_login": lambda: ("workrealm", ""),      # nothing stored: it must ask
+    # Each Realm has its own account. Nothing stored here, so it must ask.
+    "rdp_login": lambda name: ({"work": "workrealm"}.get(name, "max"), ""),
     "stop": lambda name, say, confirmed=False: calls.append(("stop", name)),
     "release": lambda name, say, confirmed=False: calls.append(("release", name)),
     "devices": lambda: DEVICES,
@@ -185,6 +186,17 @@ try:
     assert pump(app, until=lambda: ("open", "work", "workrealm", "hunter2") in calls), \
         f"it asked again: {texts(app.panes[0])}"
     pump(app, 1.0)              # let the worker's "finished" land before the next test
+
+    # Another Realm is another account. Max signed in to `work` as `workrealm`;
+    # `windows` must not inherit that, or the Realm answers LOGON_FAILURE and
+    # the screen blames the password.
+    app.show()
+    app.go("open_remote", "windows")
+    app.root.update()
+    plain = [c for c in app.panes[0].winfo_children()
+             if isinstance(c, tkinter.Entry) and not c.cget("show")]
+    assert plain and plain[0].get() == "max", \
+        f"the other Realm's sign-in leaked: {plain[0].get() if plain else None}"
     app.hide()                  # it deiconified the windows on its way out
 
     # A hook that raises SystemExit must still reach the screen. wait_ready and

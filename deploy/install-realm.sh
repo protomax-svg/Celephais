@@ -53,6 +53,10 @@ as_user grdctl --headless rdp set-tls-cert "$GRD_DIR/rdp.crt"
 as_user grdctl --headless rdp set-tls-key  "$GRD_DIR/rdp.key"
 as_user grdctl --headless rdp set-credentials "$USER_NAME" "$RDP_PASSWORD"
 as_user grdctl --headless rdp enable
+# The running daemon keeps the credentials it started with, so a password
+# changed under a live service is written to disk and ignored on the wire.
+# Re-running this script to change the password must restart it.
+as_user systemctl --user restart gnome-remote-desktop-headless.service 2>/dev/null || true
 
 # GNOME refuses to start a remote session while the screen is locked, and
 # there is no screen here to unlock it on: the lock would make the Realm

@@ -81,6 +81,19 @@ finally:
     subprocess.run = real_run
     gate.CFG.clear()
 
+# Each Realm has its own account: `work` is served by `workrealm`, `personal`
+# by `max`. A shared RDP_USER would be wrong for one of them, and the Realm
+# answers LOGON_FAILURE, which reads exactly like a bad password.
+gate.CFG.clear()
+gate.CFG.update({"RDP_USER": "shared", "RDP_PASSWORD": "shared-pw",
+                 "RDP_USER_WORK": "workrealm", "RDP_PASSWORD_WORK": "work-pw"})
+assert gate.realm_login("work") == ("workrealm", "work-pw"), gate.realm_login("work")
+assert gate.realm_login("personal") == ("shared", "shared-pw"), gate.realm_login("personal")
+gate.CFG.clear()
+import getpass  # noqa: E402
+assert gate.realm_login("work") == (getpass.getuser(), ""), "no keys: fall back to this user"
+gate.CFG.clear()
+
 # Every recipe must name a manager that could exist and a command to run.
 for tool, script in gate.PACKAGERS:
     assert script.startswith(tool), f"{tool} recipe does not run {tool}: {script}"

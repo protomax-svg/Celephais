@@ -199,6 +199,17 @@ def _last_error(text):
     return lines[-1].split("] - ", 1)[-1].strip()
 
 
+def realm_login(name):
+    """The sign-in for one Realm. Each Realm has its own account: `work` is
+    served by `workrealm`, `personal` by `max`. One shared RDP_USER is wrong
+    for one of them and the Realm then answers LOGON_FAILURE, which reads like
+    a bad password. A per-Realm key wins over the shared one.
+    """
+    tag = name.upper()
+    return (cfg(f"RDP_USER_{tag}") or cfg("RDP_USER") or getpass.getuser(),
+            cfg(f"RDP_PASSWORD_{tag}") or cfg("RDP_PASSWORD"))
+
+
 def connect(name, ip, extra, say=None, user="", password=""):
     """Open the Realm in an RDP client. Returns (exit code, what went wrong).
 
@@ -218,8 +229,9 @@ def connect(name, ip, extra, say=None, user="", password=""):
     desktop. Without one, nothing is stored and FreeRDP asks the old way.
     """
     tell = say or (lambda text: print(f"  {text}", flush=True))
-    user = user or cfg("RDP_USER") or getpass.getuser()
-    password = password or cfg("RDP_PASSWORD")
+    known_user, known_password = realm_login(name)
+    user = user or known_user
+    password = password or known_password
     # The overlay has already stepped aside by now, so the password dialog
     # this may raise is not hidden underneath it.
     client = ensure_rdp_client(tell)
@@ -370,10 +382,11 @@ def ui_session():
         core("/realms")               # fail here, while there is a place to say so
         return True
 
-    def rdp_login():
-        """What the overlay should put in its sign-in screen, and what it may
-        skip asking for. A vault with RDP_PASSWORD in it never asks at all."""
-        return (cfg("RDP_USER") or getpass.getuser(), cfg("RDP_PASSWORD"))
+    def rdp_login(name):
+        """What the overlay should put in its sign-in screen for this Realm,
+        and what it may skip asking for. A vault with RDP_PASSWORD_<REALM> in
+        it never asks at all."""
+        return realm_login(name)
 
     def open_remote(name, say, hide, user="", password=""):
         say("starting\u2026")

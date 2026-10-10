@@ -29,7 +29,7 @@ overlay never freezes.
   open_remote(name, say, hide, user, password)
                           -> starts it, waits for READY, launches RDP.
                              It calls hide() just before the RDP window opens.
-  rdp_login()             -> (user, password) already known; password may be ""
+  rdp_login(realm)        -> (user, password) already known; password may be ""
   devices()               -> [ {id, name, usb, action, present}, ... ]
   set_device(id, action)  -> "seat", "never" or "forget" for that device
   take_seat(name, say, confirmed)
@@ -123,7 +123,7 @@ class Overlay:
             self.windows.append(win)
             self.panes.append(content)
 
-        self.rdp = None            # (user, password) for the Realm, asked once
+        self.rdp = {}              # realm -> (user, password), asked once each
         self.root.bind_all("<Escape>", lambda _e: self.leave())
         self.root.after(80, self._drain)
 
@@ -387,7 +387,7 @@ class Overlay:
         whole handover inside one full-screen surface.
         """
         self.clear()
-        user, password = self.rdp or ("", "")
+        user, password = self.rdp.get(name) or ("", "")
         self.rdp_user = tk.StringVar(value=user)
         self.rdp_password = tk.StringVar(value=password)
         users, secrets, eyes, status = [], [], [], []
@@ -410,7 +410,7 @@ class Overlay:
         def submit(_event=None):
             if not self.rdp_password.get():
                 return
-            self.rdp = (self.rdp_user.get(), self.rdp_password.get())
+            self.rdp[name] = (self.rdp_user.get(), self.rdp_password.get())
             self.go("open_remote", name)
 
         for pane in self.panes:
@@ -489,9 +489,10 @@ class Overlay:
                 lambda result, error: self.go(action, name, confirmed, True)
                 if error else self.ask_devices(name, result))
         if action == "open_remote":
-            if self.rdp is None:
-                self.rdp = tuple(self.hooks.get("rdp_login", lambda: ("", ""))())
-            if not self.rdp[1]:
+            if name not in self.rdp:
+                ask = self.hooks.get("rdp_login", lambda _n: ("", ""))
+                self.rdp[name] = tuple(ask(name))
+            if not self.rdp[name][1]:
                 return self.ask_login(name)
         self.clear()
         lines = []
@@ -525,11 +526,15 @@ class Overlay:
                 # A refused password must be asked again, and only a refused
                 # one: a boot timeout is not a reason to retype anything.
                 if error and "logon" in str(error).lower():
-                    self.rdp = None
-                    return self.ask_login(name, "that password was refused")
+                    self.rdp.pop(name, None)
+                    # Name both fields: each Realm has its own account, and a
+                    # wrong username is refused exactly like a wrong password.
+                    return self.ask_login(
+                        name, "that username and password were refused")
                 done(result, error)
 
-            self.work(lambda: self.hooks[action](name, say, hide_now, *self.rdp),
+            self.work(lambda: self.hooks[action](name, say, hide_now,
+                                                *self.rdp[name]),
                       finished)
         else:
             self.work(lambda: self.hooks[action](name, say, confirmed), done)
