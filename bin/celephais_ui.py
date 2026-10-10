@@ -37,6 +37,10 @@ overlay never freezes.
                              warning dict instead when Core wants telling twice
   park(name, say, confirmed)
                           -> saves its session to disk and frees its RAM
+  stop(name, say, confirmed)
+                          -> shuts it down
+  release(name, say, confirmed)
+                          -> takes the RTX and the monitors back off it
 """
 import queue
 import re
@@ -339,17 +343,28 @@ class Overlay:
                              fg=DIM, font=(FONT, 11), anchor="w", width=22
                              ).grid(row=index, column=1, sticky="w", padx=10)
                     name = realm["realm"]
-                    self.button(rows, "open here",
-                                lambda n=name: self.go("open_remote", n),
-                                accent=True).grid(row=index, column=2, padx=6)
-                    self.button(rows, "use the monitors",
-                                lambda n=name: self.go("take_seat", n)
-                                ).grid(row=index, column=3, padx=6)
-                    # Only a running Realm has a session worth keeping.
+                    # One row shows only what makes sense for that Realm right
+                    # now: no parking what is not running, no taking monitors
+                    # back off a Realm that does not hold them.
+                    offered = {"open_remote": ("open here", True),
+                               "take_seat": ("use the monitors", False)}
                     if realm["power"] == "READY":
-                        self.button(rows, "park",
-                                    lambda n=name: self.go("park", n)
-                                    ).grid(row=index, column=4, padx=6)
+                        offered["park"] = ("park", False)
+                        offered["stop"] = ("stop", False)
+                    if realm.get("seat"):
+                        offered["release"] = ("give the monitors back", False)
+                    # A fixed column per action, so the same button sits under
+                    # the same button on every row.
+                    for column, action in enumerate(("open_remote", "take_seat",
+                                                     "park", "stop", "release"),
+                                                    start=2):
+                        if action not in offered:
+                            continue
+                        text, accent = offered[action]
+                        self.button(rows, text,
+                                    lambda n=name, a=action: self.go(a, n),
+                                    accent=accent).grid(row=index, column=column,
+                                                        padx=5, sticky="w")
 
         self.say_on(status, "reading the realms…")
         self.work(self.hooks["realms"], refresh)

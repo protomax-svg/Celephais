@@ -294,6 +294,10 @@ def run(args, extra):
         print(json.dumps(core(f"/realms/{args.realm}/stop", "POST")))
         return 0
 
+    if args.release:
+        print(json.dumps(core(f"/realms/{args.realm}/release", "POST")))
+        return 0
+
     if args.park:
         print(json.dumps(core(f"/realms/{args.realm}/park", "POST")))
         return 0
@@ -375,6 +379,17 @@ def ui_session():
             raise RuntimeError(why or f"the RDP client exited with code {code}")
         return True
 
+    def stop(name, say, confirmed=False):
+        say("shutting it down\u2026")
+        core(f"/realms/{name}/stop", "POST")
+        return True
+
+    def release(name, say, confirmed=False):
+        say("taking the monitors back\u2026")
+        reply = core(f"/realms/{name}/release", "POST", allow=(409,))
+        say(f"local seat: {reply.get('owner') or 'nobody'}")
+        return True
+
     def park(name, say, confirmed=False):
         say("saving the session\u2026")
         reply = core(f"/realms/{name}/park", "POST")
@@ -396,7 +411,8 @@ def ui_session():
 
     return stack, {"unlock": unlock, "realms": lambda: core("/realms"),
                    "open_remote": open_remote, "take_seat": take_seat,
-                   "park": park, "rdp_login": rdp_login,
+                   "park": park, "stop": stop, "release": release,
+                   "rdp_login": rdp_login,
                    "devices": lambda: core("/devices"),
                    "set_device": set_device}
 
@@ -406,6 +422,8 @@ def main():
     ap.add_argument("realm", nargs="?", help="realm name, e.g. work")
     ap.add_argument("--status", action="store_true", help="list realms and exit")
     ap.add_argument("--stop", action="store_true", help="shut the realm down")
+    ap.add_argument("--release", action="store_true",
+                    help="take the RTX and the monitors back off a stopped realm")
     ap.add_argument("--park", action="store_true",
                     help="save the realm's session to disk and free its RAM")
     ap.add_argument("--devices", action="store_true",

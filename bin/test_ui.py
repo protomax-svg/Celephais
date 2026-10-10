@@ -37,6 +37,8 @@ hooks = {
         {"confirm": True, "warning": "the saved desktop cannot be kept"}
         if not confirmed else calls.append(("seat", name)),
     "rdp_login": lambda: ("workrealm", ""),      # nothing stored: it must ask
+    "stop": lambda name, say, confirmed=False: calls.append(("stop", name)),
+    "release": lambda name, say, confirmed=False: calls.append(("release", name)),
     "devices": lambda: DEVICES,
     "set_device": lambda ident, action: (calls.append(("device", ident, action))
                                          or DEVICES[0].update(action=action)),
@@ -139,6 +141,10 @@ try:
         f"the realms never appeared: {texts(app.panes[0])}"
 
     shown = texts(app.panes[0])
+    # Both clients are this same screen, so every action lives here, and only
+    # the ones that make sense for a Realm in that state are offered.
+    assert "stop" in shown and "park" in shown, f"nothing to do with work: {shown}"
+    assert "give the monitors back" in shown, f"windows holds the seat: {shown}"
     assert "windows" in shown, shown
     assert any("on the monitors" in t for t in shown), f"seat not shown: {shown}"
     assert any("ready" in t for t in shown), f"power not shown: {shown}"
