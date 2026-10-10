@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check Core against a fake Proxmox. No Proxmox needed. Run: python3 bin/test_core.py"""
+import os
 import pathlib
 import sys
 
@@ -275,8 +276,13 @@ assert status_of("/realms/work/egress?mode=sideways", method="POST") == 400
 
 # Asking for an exit node when none is configured must say so, not go quiet.
 c.EXIT_NODE = ""
+os.environ.pop("EXIT_NODE_WORK", None)
 assert status_of("/realms/work/egress?mode=exit-node", method="POST") == 400
-c.EXIT_NODE = "server-yo"
+
+# Realms do not share one exit node, so each may name its own.
+os.environ["EXIT_NODE_WORK"] = "server-yo"
+c.EXIT_NODE = "hostadmin"
+assert c.exit_node("work") == "server-yo" and c.exit_node("personal") == "hostadmin"
 fake.exec_out = '{"ExitNodeID": "abc", "ExitNodeIP": "100.124.90.77"}'
 fake.exec_cmds = []
 code, body = call("/realms/work/egress?mode=exit-node", method="POST")

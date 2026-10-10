@@ -99,8 +99,12 @@ CORE_TOKEN=$CORE_TOKEN
 PVE_VERIFY_TLS=0
 CORE_BIND=$TS_IP:8080
 # The Tailscale node a Realm goes out through when asked for exit-node egress.
-# A name or an address from `tailscale exit-node list`. Empty: nobody chose one.
+# A name or an address from `tailscale exit-node list`. Per Realm, because
+# they do not share one: EXIT_NODE_WORK is work's, EXIT_NODE is the fallback
+# for the rest. Empty: nobody has chosen, and asking is refused, not guessed.
 EXIT_NODE=${EXIT_NODE:-}
+EXIT_NODE_WORK=${EXIT_NODE_WORK:-}
+EXIT_NODE_PERSONAL=${EXIT_NODE_PERSONAL:-}
 EOF
 chown root:celephais /etc/celephais/core.env
 chmod 640 /etc/celephais/core.env

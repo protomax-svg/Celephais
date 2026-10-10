@@ -82,9 +82,15 @@ DEVICES_FILE = pathlib.Path(os.environ.get("CELEPHAIS_DEVICES",
 REALMS = {"work": 201, "personal": 202, "windows": 100}
 RDP_PORT = 3389
 # Which Tailscale node a Realm goes out through when it is not going out
-# directly. One name for the household; a Realm that should go out directly
-# is simply never switched. Empty means nobody has chosen one yet.
+# directly. Per Realm, because they do not share one: EXIT_NODE_WORK names
+# work's, and EXIT_NODE is the one the rest fall back to. Empty means nobody
+# has chosen one, and asking for exit-node egress then is refused rather than
+# guessed at.
 EXIT_NODE = os.environ.get("EXIT_NODE", "")
+
+
+def exit_node(name):
+    return os.environ.get(f"EXIT_NODE_{name.upper()}") or EXIT_NODE
 SEAT_CMD = os.environ.get("SEAT_CMD", "sudo -n /usr/local/bin/celephais-seat").split()
 
 PVE_HOST = os.environ.get("PVE_HOST", "")
@@ -180,11 +186,11 @@ def egress(vmid):
     return {"mode": "exit-node" if node else "direct", "node": node}
 
 
-def set_egress(vmid, mode):
-    if mode == "exit-node" and not EXIT_NODE:
-        raise ValueError("no exit node is configured; set EXIT_NODE in "
-                         "/etc/celephais/core.env")
-    target = EXIT_NODE if mode == "exit-node" else ""
+def set_egress(name, vmid, mode):
+    target = exit_node(name) if mode == "exit-node" else ""
+    if mode == "exit-node" and not target:
+        raise ValueError(f"no exit node for {name}; set EXIT_NODE_{name.upper()} "
+                         "or EXIT_NODE in /etc/celephais/core.env")
     code, out = guest_exec(vmid, "/bin/sh", "-c",
                            f"tailscale set --exit-node={shlex.quote(target)}")
     if code != 0:
@@ -484,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._reply(400, {"error": "mode must be exit-node "
                                                       "or direct"})
                 try:
-                    result = set_egress(vmid, mode)
+                    result = set_egress(parts[1], vmid, mode)
                 except ValueError as exc:
                     return self._reply(400, {"error": str(exc)})
                 log(f"egress {parts[1]} -> {mode} ({result.get('node') or 'none'})")
