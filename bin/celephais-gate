@@ -42,7 +42,10 @@ if getattr(sys, "frozen", False):
     HERE = pathlib.Path(sys.executable).resolve().parent
 else:
     HERE = pathlib.Path(__file__).resolve().parent.parent
-VAULT = HERE / "celephais.vault"
+# Beside the executable is right for a USB stick. Installed on a laptop by
+# deploy/install-gate.sh the binary lives in ~/.local/bin, where the vault has
+# no business being, so that install names it instead.
+VAULT = pathlib.Path(os.environ.get("CELEPHAIS_VAULT") or HERE / "celephais.vault")
 ENV_FILE = HERE / ".env"
 
 # FreeRDP first wherever it is installed: multimon, dynamic resolution and
