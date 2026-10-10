@@ -88,7 +88,10 @@ def opener():
     return urllib.request.build_opener()
 
 
-def core(path, method="GET"):
+def core(path, method="GET", allow=()):
+    """One call to Core. Codes in `allow` come back as data instead of dying:
+    Core answers 409 when it wants to be told twice, and that is a question,
+    not a failure."""
     url = cfg("CORE_URL", "http://127.0.0.1:8080").rstrip("/") + path
     req = urllib.request.Request(
         url, method=method,
@@ -98,6 +101,11 @@ def core(path, method="GET"):
             return json.load(r)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")
+        if exc.code in allow:
+            try:
+                return json.loads(body)
+            except ValueError:
+                pass
         raise SystemExit(f"gate: core said {exc.code}: {body}")
     except OSError as exc:
         raise SystemExit(f"gate: cannot reach Core at {cfg('CORE_URL')}: {exc}")
@@ -292,7 +300,12 @@ def run(args, extra):
                 raise SystemExit("gate: cancelled")
         # The Realm takes over the physical desktop, so there is nothing for
         # this machine to connect to.
-        reply = core(f"/realms/{args.realm}/seat", "POST")
+        reply = core(f"/realms/{args.realm}/seat", "POST", allow=(409,))
+        if reply.get("confirm"):
+            print(f"  {reply['warning']}")
+            if input("  type yes to go on: ") != "yes":
+                raise SystemExit("gate: cancelled")
+            reply = core(f"/realms/{args.realm}/seat?confirm=1", "POST")
         print(f"  local seat -> {reply['owner']}")
         return 0
 
@@ -334,15 +347,18 @@ def ui_session():
             raise RuntimeError(why or f"the RDP client exited with code {code}")
         return True
 
-    def park(name, say):
+    def park(name, say, confirmed=False):
         say("saving the session\u2026")
         reply = core(f"/realms/{name}/park", "POST")
         say(reply.get("power", "").lower() or "parked")
         return True
 
-    def take_seat(name, say):
+    def take_seat(name, say, confirmed=False):
         say("handing over the monitors\u2026")
-        reply = core(f"/realms/{name}/seat", "POST")
+        query = "?confirm=1" if confirmed else ""
+        reply = core(f"/realms/{name}/seat{query}", "POST", allow=(409,))
+        if reply.get("confirm"):
+            return reply                  # the overlay asks, then calls again
         say(f"local seat: {reply['owner']}")
         return True
 

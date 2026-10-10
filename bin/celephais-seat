@@ -18,9 +18,40 @@ vm_status() { qm status "$1" | awk '{print $2}'; }
 
 holds_seat() { qm config "$1" | grep -q '^hostpci0:'; }
 
+# A parked Realm is stopped, but a live session is waiting in a state file.
+is_parked() { qm config "$1" | grep -q '^vmstate:'; }
+
+# Every topology change routes through these two, so the guard lives here and
+# not in each caller. Proxmox restores a saved session into whatever hardware
+# the config names at the time, and the session was saved against different
+# hardware. Wake it first; wake_and_stop does that.
+refuse_if_parked() {
+  is_parked "$1" && die "VM $1 has a saved session. Changing its hardware now \
+would restore that session into hardware it never had. Wake it first."
+  return 0
+}
+
+# Put a parked Realm back on its feet and then down properly, so its hardware
+# can be changed. The saved desktop is lost; that is the price of the change,
+# and Core warns about it before asking for this.
+wake_and_stop() {
+  local vmid=$1 i
+  is_parked "$vmid" || return 0
+  echo "realm $vmid has a saved session; waking it to shut it down properly" >&2
+  qm start "$vmid"
+  for i in $(seq 60); do
+    [ "$(vm_status "$vmid")" = running ] && break
+    sleep 1
+  done
+  [ "$(vm_status "$vmid")" = running ] || die "VM $vmid did not resume; nothing was changed"
+  sleep 10                      # let the desktop finish coming back before ACPI
+  stop_realm "$vmid"
+}
+
 # Drop every passthrough key the VM actually has. VM must be stopped.
 detach_seat() {
   local keys
+  refuse_if_parked "$1"
   keys=$(qm config "$1" | grep -oE '^(hostpci|usb)[0-9]+' | paste -sd, - || true)
   [ -n "$keys" ] || return 0
   qm set "$1" -delete "$keys"
@@ -28,6 +59,7 @@ detach_seat() {
 
 attach_seat() {
   local vmid=$1 i
+  refuse_if_parked "$vmid"
   for i in "${!SEAT_PCI[@]}"; do qm set "$vmid" "-hostpci$i" "${SEAT_PCI[$i]},pcie=1"; done
   for i in "${!SEAT_USB[@]}"; do qm set "$vmid" "-usb$i"     "host=${SEAT_USB[$i]}"; done
 }
@@ -70,7 +102,7 @@ cmd_switch() {
   for name in "${!REALMS[@]}"; do
     [ "$name" = "$target" ] && continue
     other=${REALMS[$name]}
-    if holds_seat "$other"; then stop_realm "$other"; detach_seat "$other"; fi
+    if holds_seat "$other"; then stop_realm "$other"; wake_and_stop "$other"; detach_seat "$other"; fi
   done
 
   if [ "$(vm_status "$vmid")" = running ]; then
@@ -78,6 +110,7 @@ cmd_switch() {
     stop_realm "$vmid"   # PCI passthrough cannot be added to a running VM
   fi
 
+  wake_and_stop "$vmid"
   detach_seat "$vmid"
   attach_seat "$vmid"
   qm start "$vmid"

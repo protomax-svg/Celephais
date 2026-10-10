@@ -191,6 +191,15 @@ fake.status, fake.seat, fake.vmstate, fake.suspended = "running", True, None, []
 assert status_of("/realms/work/park", method="POST") == 409
 assert fake.suspended == [], "it suspended a Realm holding the GPU"
 
+# A parked Realm must not be handed the Local Seat without being told twice:
+# Proxmox would restore its saved session into hardware it never had.
+fake.status, fake.seat, fake.vmstate, fake.seat_calls = "stopped", False, "store:state", []
+assert status_of("/realms/work/seat", method="POST") == 409
+assert fake.seat_calls == [], "it changed the hardware anyway"
+code, body = call("/realms/work/seat?confirm=1", method="POST")
+assert code == 200 and fake.seat_calls == [("switch", "work")], fake.seat_calls
+fake.vmstate = None
+
 # Nothing running, nothing to save.
 fake.status, fake.seat, fake.suspended = "stopped", False, []
 code, body = call("/realms/work/park", method="POST")

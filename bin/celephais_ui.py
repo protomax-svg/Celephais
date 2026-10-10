@@ -30,8 +30,11 @@ overlay never freezes.
                           -> starts it, waits for READY, launches RDP.
                              It calls hide() just before the RDP window opens.
   rdp_login()             -> (user, password) already known; password may be ""
-  take_seat(name, say)    -> hands it the physical monitors
-  park(name, say)         -> saves its session to disk and frees its RAM
+  take_seat(name, say, confirmed)
+                          -> hands it the physical monitors. Returns the
+                             warning dict instead when Core wants telling twice
+  park(name, say, confirmed)
+                          -> saves its session to disk and frees its RAM
 """
 import queue
 import re
@@ -391,7 +394,20 @@ class Overlay:
         self.focus_widgets = secrets
         self.claim_focus()
 
-    def go(self, action, name):
+    def ask_confirm(self, name, warning, proceed):
+        """Core answered that going on throws something away. Say what, and
+        make it a second, deliberate press rather than a surprise."""
+        self.clear()
+        for pane in self.panes:
+            self.label(pane, name, 26, FG, pady=(0, 10))
+            tk.Label(pane, text=warning, bg=BG, fg=BAD, font=(FONT, 12),
+                     wraplength=560, justify="center").pack(pady=(0, 20))
+            self.button(pane, "go on", proceed, accent=True).pack(pady=(0, 8))
+            self.button(pane, "back", self.show_realms).pack()
+        self.focus_widgets = ()
+        self.claim_focus()
+
+    def go(self, action, name, confirmed=False):
         if action == "open_remote":
             if self.rdp is None:
                 self.rdp = tuple(self.hooks.get("rdp_login", lambda: ("", ""))())
@@ -407,7 +423,11 @@ class Overlay:
         def say(text):
             self.post(lambda: self.say_on(lines, text))
 
-        def done(_result, error):
+        def done(result, error):
+            if isinstance(result, dict) and result.get("confirm"):
+                return self.ask_confirm(
+                    name, result.get("warning", "this cannot be undone"),
+                    lambda: self.go(action, name, confirmed=True))
             self.show_realms(str(error) if error else "")
 
         if action == "open_remote":
@@ -432,7 +452,7 @@ class Overlay:
             self.work(lambda: self.hooks[action](name, say, hide_now, *self.rdp),
                       finished)
         else:
-            self.work(lambda: self.hooks[action](name, say), done)
+            self.work(lambda: self.hooks[action](name, say, confirmed), done)
 
     def run(self):
         self.ask_password()

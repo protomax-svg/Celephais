@@ -33,7 +33,9 @@ hooks = {
     "realms": lambda: REALMS,
     "open_remote": lambda name, say, hide, user, password:
         calls.append(("open", name, user, password)),
-    "take_seat": lambda name, say: calls.append(("seat", name)),
+    "take_seat": lambda name, say, confirmed=False:
+        {"confirm": True, "warning": "the saved desktop cannot be kept"}
+        if not confirmed else calls.append(("seat", name)),
     "rdp_login": lambda: ("workrealm", ""),      # nothing stored: it must ask
 }
 
@@ -156,7 +158,22 @@ try:
     # A hook that raises SystemExit must still reach the screen. wait_ready and
     # rdp_client both raise it, and `except Exception` used to let it past: the
     # worker thread died without a word and the overlay waited for ever.
-    def explode(name, say):
+    # Core refuses to throw a saved session away without being told twice, so
+    # the overlay must say what is lost and wait for a second, deliberate press.
+    calls.clear()
+    app.go("take_seat", "work")
+    assert pump(app, until=lambda: any("cannot be kept" in t
+                                       for t in texts(app.panes[0]))), \
+        f"no warning shown: {texts(app.panes[0])}"
+    assert ("seat", "work") not in calls, "it went ahead without asking"
+    goon = [c for c in app.panes[0].winfo_children()
+            if isinstance(c, tkinter.Button) and c.cget("text") == "go on"][0]
+    goon.invoke()
+    assert pump(app, until=lambda: ("seat", "work") in calls), \
+        f"the second press did nothing: {calls}"
+    pump(app, 1.0)
+
+    def explode(name, say, confirmed=False):
         raise SystemExit("the boot timed out")
 
     hooks["take_seat"] = explode

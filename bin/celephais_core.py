@@ -24,6 +24,8 @@ API:
   POST /realms/<name>/start -> 202, started headless, never with the seat
   POST /realms/<name>/stop  -> 202
   POST /realms/<name>/seat    -> 200, give that Realm the Local Seat
+                                 409 + confirm:true if a saved session would be
+                                 lost; repeat with ?confirm=1 to accept that
   POST /realms/<name>/release -> 200, strip the seat from a stopped Realm
   POST /realms/<name>/logout  -> 200, log out the Realm's desktop session
   POST /realms/<name>/park    -> 202, save the live session to disk and stop
@@ -164,6 +166,11 @@ def has_seat(vmid):
     return "hostpci0" in vm_config(vmid)
 
 
+def is_parked(vmid):
+    """True if a live session is waiting in a state file on disk."""
+    return bool(vm_config(vmid).get("vmstate"))
+
+
 def park(vmid):
     """Save the live session to disk and stop the VM, freeing its RAM and CPU.
 
@@ -247,7 +254,9 @@ class Handler(BaseHTTPRequestHandler):
     def _route(self, method):
         if not self._authed():
             return
-        parts = self.path.strip("/").split("/")
+        raw, _, query = self.path.partition("?")
+        parts = raw.strip("/").split("/")
+        confirmed = urllib.parse.parse_qs(query).get("confirm", [""])[0] == "1"
         try:
             if method == "GET" and parts == ["realms"]:
                 return self._reply(200, [realm_state(n) for n in REALMS])
@@ -261,6 +270,19 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[2] == "release" and not has_seat(vmid):
                     return self._reply(200, {"result": "already headless",
                                              "owner": seat_owner()})
+                # Giving a parked Realm the Local Seat changes the hardware its
+                # saved session was taken on, and Proxmox would restore that
+                # session into hardware it never had. The switcher wakes it and
+                # shuts it down first, which throws the saved desktop away. Say
+                # so and wait to be told twice.
+                if parts[2] == "seat" and not confirmed and is_parked(vmid):
+                    return self._reply(409, {
+                        "error": f"{name} has a saved session on disk",
+                        "warning": f"Giving {name} the Local Seat means waking "
+                                   "it, shutting it down and starting it again "
+                                   "with the GPU attached. The saved desktop "
+                                   "cannot be kept across that change.",
+                        "confirm": True})
                 action = "switch" if parts[2] == "seat" else "release"
                 return self._reply(200, {"result": seat_cmd(action, name),
                                          "owner": seat_owner()})
