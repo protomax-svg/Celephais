@@ -187,7 +187,7 @@ def _last_error(text):
     return lines[-1].split("] - ", 1)[-1].strip()
 
 
-def connect(name, ip, extra, say=None):
+def connect(name, ip, extra, say=None, user="", password=""):
     """Open the Realm in an RDP client. Returns (exit code, what went wrong).
 
     `say` reports to the overlay. Without it the messages go to print, which
@@ -198,9 +198,16 @@ def connect(name, ip, extra, say=None):
     it to land in and a bare number says nothing. Without `say` it is left
     alone: on the command line FreeRDP's own output, and its password prompt,
     belong to the user's terminal.
+
+    A password given here goes down the client's stdin, never on the command
+    line where `ps` would show it, and FreeRDP then raises no dialog of its
+    own. The Gate asks for it in its own screen instead, so the overlay never
+    has to step aside for a small window in the middle of someone else's
+    desktop. Without one, nothing is stored and FreeRDP asks the old way.
     """
     tell = say or (lambda text: print(f"  {text}", flush=True))
-    user = cfg("RDP_USER") or getpass.getuser()
+    user = user or cfg("RDP_USER") or getpass.getuser()
+    password = password or cfg("RDP_PASSWORD")
     # The overlay has already stepped aside by now, so the password dialog
     # this may raise is not hidden underneath it.
     client = ensure_rdp_client(tell)
@@ -214,22 +221,34 @@ def connect(name, ip, extra, say=None):
         if client.lower().endswith("mstsc.exe"):
             # Fallback only. mstsc asks for the user and password itself and
             # takes far fewer options than FreeRDP.
-            cmd = [client, f"/v:{target}", "/f"] + extra
+            # /multimon it does understand. The credentials it does not: it
+            # asks for them in a window of its own, which is exactly what the
+            # Gate's own sign-in screen exists to avoid. Install FreeRDP on a
+            # Windows host that should behave like the others.
+            cmd = [client, f"/v:{target}", "/f", "/multimon"] + extra
         else:
-            # No password here. FreeRDP asks for it, so the Gate stores no
-            # guest secret.
             # ponytail: /cert:ignore is the LAN prototype. Pin the Realm cert for WAN.
+            # No /dynamic-resolution. With /multimon FreeRDP then sends a
+            # monitor layout GNOME reads as overlapping, and the Realm drops
+            # the session the moment it connects. The client is fullscreen on
+            # fixed monitors anyway, so there is nothing to resize.
             cmd = [client, f"/v:{target}", f"/u:{user}", "/f", "/multimon",
-                   "/dynamic-resolution", "/clipboard", "/sound",
-                   "/cert:ignore"] + extra
+                   "/gfx", "/clipboard", "/sound", "/cert:ignore"] + extra
+            if password:
+                # :force silences the graphical prompt as well, so a wrong
+                # password fails and says so instead of opening a dialog
+                # behind the overlay.
+                cmd.append("/from-stdin:force")
         tell(f"connecting to {name} at {ip} as {user}")
+        feed = password + "\n" if password else ""
         if say is None:
-            return subprocess.call(cmd), ""
-        # No stdin either. From the overlay there is no terminal to answer a
-        # password prompt on, so let the client fail and say so rather than
-        # block for ever on a question nobody can see.
-        done = subprocess.run(cmd, stderr=subprocess.PIPE, text=True,
-                              stdin=subprocess.DEVNULL)
+            if not feed:
+                return subprocess.call(cmd), ""     # its prompt is the terminal's
+            return subprocess.run(cmd, input=feed, text=True).returncode, ""
+        # An empty stdin, closed at once, when there is no password: from the
+        # overlay there is no terminal to answer a prompt on, so let the client
+        # fail and say so rather than block for ever on a question nobody sees.
+        done = subprocess.run(cmd, input=feed, stderr=subprocess.PIPE, text=True)
         return done.returncode, _last_error(done.stderr)
     finally:
         if listener:
@@ -247,6 +266,17 @@ def run(args, extra):
 
     if args.stop:
         print(json.dumps(core(f"/realms/{args.realm}/stop", "POST")))
+        return 0
+
+    if args.park:
+        print(json.dumps(core(f"/realms/{args.realm}/park", "POST")))
+        return 0
+
+    if args.logout:
+        # Not part of connecting: a Realm set up by deploy/install-realm.sh
+        # keeps its session between connections, which is the whole point.
+        # This is the hammer for a session that has got itself stuck.
+        print(json.dumps(core(f"/realms/{args.realm}/logout", "POST")))
         return 0
 
     if args.local:
@@ -288,15 +318,26 @@ def ui_session():
         core("/realms")               # fail here, while there is a place to say so
         return True
 
-    def open_remote(name, say, hide):
+    def rdp_login():
+        """What the overlay should put in its sign-in screen, and what it may
+        skip asking for. A vault with RDP_PASSWORD in it never asks at all."""
+        return (cfg("RDP_USER") or getpass.getuser(), cfg("RDP_PASSWORD"))
+
+    def open_remote(name, say, hide, user="", password=""):
         say("starting\u2026")
         core(f"/realms/{name}/start", "POST")
         ip = wait_ready(name, say)
         say(f"connecting to {ip}\u2026")
         hide()                        # now, and not a moment earlier
-        code, why = connect(name, ip, [], say)
+        code, why = connect(name, ip, [], say, user, password)
         if code:
             raise RuntimeError(why or f"the RDP client exited with code {code}")
+        return True
+
+    def park(name, say):
+        say("saving the session\u2026")
+        reply = core(f"/realms/{name}/park", "POST")
+        say(reply.get("power", "").lower() or "parked")
         return True
 
     def take_seat(name, say):
@@ -306,7 +347,8 @@ def ui_session():
         return True
 
     return stack, {"unlock": unlock, "realms": lambda: core("/realms"),
-                   "open_remote": open_remote, "take_seat": take_seat}
+                   "open_remote": open_remote, "take_seat": take_seat,
+                   "park": park, "rdp_login": rdp_login}
 
 
 def main():
@@ -314,6 +356,10 @@ def main():
     ap.add_argument("realm", nargs="?", help="realm name, e.g. work")
     ap.add_argument("--status", action="store_true", help="list realms and exit")
     ap.add_argument("--stop", action="store_true", help="shut the realm down")
+    ap.add_argument("--park", action="store_true",
+                    help="save the realm's session to disk and free its RAM")
+    ap.add_argument("--logout", action="store_true",
+                    help="end the realm's desktop session; its open windows are lost")
     ap.add_argument("--local", action="store_true",
                     help="give this realm the RTX, the monitors and the USB input")
     ap.add_argument("--yes", action="store_true", help="do not ask before a restart")

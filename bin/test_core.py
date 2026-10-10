@@ -7,15 +7,30 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import celephais_core as c  # noqa: E402
 
 fake = type("fake", (), {"status": "stopped", "agent": False, "rdp": False,
-                         "seat": False, "seat_calls": [], "seat_fails": False})
+                         "seat": False, "seat_calls": [], "seat_fails": False,
+                         "vmstate": None, "suspended": [],
+                         "exec_cmd": None, "exec_exit": 0, "exec_fails": False})
 
 
 def fake_pve(method, path, **form):
     if path.endswith("/status/current"):
         return {"status": fake.status}
     if path.endswith("/config"):
-        return ({"hostpci0": "0000:01:00.0,pcie=1", "usb0": "host=1532:02a2"}
-                if fake.seat else {"name": "vm"})
+        config = ({"hostpci0": "0000:01:00.0,pcie=1", "usb0": "host=1532:02a2"}
+                  if fake.seat else {"name": "vm"})
+        if fake.vmstate:
+            config["vmstate"] = fake.vmstate
+        return config
+    if path.endswith("/status/suspend"):
+        fake.suspended.append(form)
+        return "UPID:pve:task"
+    if path.endswith("/agent/exec"):
+        if fake.exec_fails:
+            raise OSError("QEMU guest agent is not running")
+        fake.exec_cmd = form["command"]
+        return {"pid": 7}
+    if "/agent/exec-status" in path:
+        return {"exited": 1, "exitcode": fake.exec_exit, "out-data": ""}
     if path.endswith("/network-get-interfaces"):
         if not fake.agent:
             raise OSError("QEMU guest agent is not running")
@@ -106,7 +121,8 @@ assert status_of("/realms/nope") == 404, "unknown realm not rejected"
 assert status_of("/nonsense") == 404
 
 code, body = call("/realms")
-assert code == 200 and {r["realm"] for r in body} == {"work", "windows"}, body
+assert code == 200 and {r["realm"] for r in body} == {"work", "personal",
+                                                      "windows"}, body
 
 # A start of a seatless Realm must not touch the switcher at all.
 fake.status, fake.seat, fake.seat_calls = "stopped", False, []
@@ -144,6 +160,41 @@ assert body["owner"] is None, body
 fake.seat, fake.seat_calls = False, []
 code, body = call("/realms/work/release", method="POST")
 assert code == 200 and fake.seat_calls == [], fake.seat_calls
+
+# logout runs one command in the guest and never raises, whatever the agent says
+fake.exec_exit, fake.exec_fails = 0, False
+code, body = call("/realms/work/logout", method="POST")
+assert code == 200 and body["ok"] is True, body
+assert fake.exec_cmd[:2] == ["/bin/sh", "-c"] and "terminate-user" in fake.exec_cmd[2], \
+    fake.exec_cmd
+fake.exec_exit = 1
+assert call("/realms/work/logout", method="POST")[1]["ok"] is False
+fake.exec_fails = True
+code, body = call("/realms/work/logout", method="POST")
+assert code == 200 and body["ok"] is False, body     # a dead agent must not 502
+fake.exec_fails = False
+assert status_of("/realms/nope/logout", method="POST") == 404
+
+# --- parking: the live session goes to disk, the RAM comes back ---
+fake.status, fake.seat, fake.vmstate, fake.suspended = "running", False, None, []
+code, body = call("/realms/work/park", method="POST")
+assert code == 202 and body["power"] == "PARKING", body
+assert fake.suspended == [{"todisk": 1}], fake.suspended
+
+# A saved session is not OFF: starting it restores the desktop, so say so.
+fake.status, fake.vmstate = "stopped", "local-lvm:vm-201-state-suspend"
+assert c.realm_state("work")["power"] == "PARKED", c.realm_state("work")
+
+# Parking a Realm that holds the Local Seat must be refused, not attempted: a
+# consumer RTX on plain vfio-pci cannot have its state saved.
+fake.status, fake.seat, fake.vmstate, fake.suspended = "running", True, None, []
+assert status_of("/realms/work/park", method="POST") == 409
+assert fake.suspended == [], "it suspended a Realm holding the GPU"
+
+# Nothing running, nothing to save.
+fake.status, fake.seat, fake.suspended = "stopped", False, []
+code, body = call("/realms/work/park", method="POST")
+assert code == 200 and fake.suspended == [], body
 
 fake.status = "running"
 code, body = call("/realms/work/stop", method="POST")

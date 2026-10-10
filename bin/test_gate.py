@@ -48,6 +48,39 @@ try:
 finally:
     subprocess.call = real_call
 
+# The Realm password goes down the client's stdin, never on the command line
+# where `ps` would show it to anyone on this machine.
+class FakeDone:
+    returncode, stderr = 0, ""
+
+
+seen = {}
+# Connecting must never touch the Realm's session. The headless remote desktop
+# that deploy/install-realm.sh sets up serves the session already running, so
+# anything that logged it out first would throw away the open windows.
+gate.core = lambda path, method="GET": seen.update(called=path) or {"seat": False}
+real_run = subprocess.run
+subprocess.run = lambda cmd, **kw: seen.update(cmd=cmd, kw=kw) or FakeDone
+gate.CFG.clear()
+gate.CFG.update({"RDP_USER": "workrealm"})
+try:
+    if gate.rdp_client():
+        gate.connect("work", "10.0.0.1", [], lambda _t: None, password="hunter2")
+        assert "/from-stdin:force" in seen["cmd"], seen["cmd"]
+        assert not any("hunter2" in part for part in seen["cmd"]), "password on argv"
+        assert seen["kw"]["input"] == "hunter2\n", seen["kw"]
+        assert "/u:workrealm" in seen["cmd"], seen["cmd"]
+
+        # Without one, nothing is fed and FreeRDP is left to ask the old way.
+        seen.clear()
+        gate.connect("work", "10.0.0.1", [], lambda _t: None)
+        assert "/from-stdin:force" not in seen["cmd"], seen["cmd"]
+        assert seen["kw"]["input"] == "", seen["kw"]
+        assert "called" not in seen, f"connect() called Core: {seen.get('called')}"
+finally:
+    subprocess.run = real_run
+    gate.CFG.clear()
+
 # Every recipe must name a manager that could exist and a command to run.
 for tool, script in gate.PACKAGERS:
     assert script.startswith(tool), f"{tool} recipe does not run {tool}: {script}"

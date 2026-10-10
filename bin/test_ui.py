@@ -31,8 +31,10 @@ hooks = {
     "unlock": lambda password: (calls.append(("unlock", password)) or True
                                 if password == "right" else _wrong()),
     "realms": lambda: REALMS,
-    "open_remote": lambda name, say, hide: calls.append(("open", name)),
+    "open_remote": lambda name, say, hide, user, password:
+        calls.append(("open", name, user, password)),
     "take_seat": lambda name, say: calls.append(("seat", name)),
+    "rdp_login": lambda: ("workrealm", ""),      # nothing stored: it must ask
 }
 
 
@@ -123,6 +125,33 @@ try:
     assert any("on the monitors" in t for t in shown), f"seat not shown: {shown}"
     assert any("ready" in t for t in shown), f"power not shown: {shown}"
     assert ("unlock", "right") in calls, calls
+
+    # Signing in to the Realm happens in our own screen. FreeRDP would
+    # otherwise raise its own small window after the overlay had stepped
+    # aside, which is the thing this screen exists to prevent.
+    app.go("open_remote", "work")
+    app.root.update()
+    shown = texts(app.panes[0])
+    assert "sign in" in shown and "work" in shown, shown
+    assert ("open", "work", "workrealm", "hunter2") not in calls, "asked nothing"
+    secrets = [c for c in app.panes[0].winfo_children()
+               if isinstance(c, tkinter.Entry) and c.cget("show")]
+    assert len(secrets) == 1, "exactly one hidden field"
+    plain = [c for c in app.panes[0].winfo_children()
+             if isinstance(c, tkinter.Entry) and not c.cget("show")]
+    assert len(plain) == 1 and plain[0].get() == "workrealm", "user prefilled"
+    app.rdp_password.set("hunter2")
+    app.submit_login()
+    assert pump(app, until=lambda: ("open", "work", "workrealm", "hunter2") in calls), \
+        f"the credentials never reached the Gate: {calls}"
+
+    # Asked once, not once per connection.
+    calls.clear()
+    app.go("open_remote", "work")
+    assert pump(app, until=lambda: ("open", "work", "workrealm", "hunter2") in calls), \
+        f"it asked again: {texts(app.panes[0])}"
+    pump(app, 1.0)              # let the worker's "finished" land before the next test
+    app.hide()                  # it deiconified the windows on its way out
 
     # A hook that raises SystemExit must still reach the screen. wait_ready and
     # rdp_client both raise it, and `except Exception` used to let it past: the

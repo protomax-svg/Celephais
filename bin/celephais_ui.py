@@ -17,17 +17,21 @@ Controls are drawn once per monitor, so nothing lands on the seam between two
 screens. The copies share one password variable, so typing into whichever copy
 holds the keyboard fills them all.
 
-Two screens: a password, then the Realms. Slow work (the tailnet coming up, a
+Three screens: the vault key, the Realms, then a sign-in for the Realm itself.
+The last one exists so the RDP client never raises its own small dialog in the
+middle of the desktop the overlay is covering. Slow work (the tailnet coming up, a
 Realm booting) runs in a worker thread and reports back through `after`, so the
 overlay never freezes.
 
 `hooks` is supplied by the Gate:
   unlock(password)        -> opens the vault and brings the tailnet up
   realms()                -> list of {realm, vmid, power, seat, ip}
-  open_remote(name, say, hide)
+  open_remote(name, say, hide, user, password)
                           -> starts it, waits for READY, launches RDP.
                              It calls hide() just before the RDP window opens.
+  rdp_login()             -> (user, password) already known; password may be ""
   take_seat(name, say)    -> hands it the physical monitors
+  park(name, say)         -> saves its session to disk and frees its RAM
 """
 import queue
 import re
@@ -110,6 +114,7 @@ class Overlay:
             self.windows.append(win)
             self.panes.append(content)
 
+        self.rdp = None            # (user, password) for the Realm, asked once
         self.root.bind_all("<Escape>", lambda _e: self.leave())
         self.root.after(80, self._drain)
 
@@ -168,13 +173,23 @@ class Overlay:
             pass
 
     def _drain(self):
-        """Apply whatever the worker thread sent us. Tk is not thread safe."""
+        """Apply whatever the worker thread sent us. Tk is not thread safe.
+
+        One callback must never stop the loop. A worker that finishes after
+        its screen has been replaced writes into widgets that no longer exist,
+        and the TclError used to escape here and take the drain with it: from
+        then on nothing the workers sent ever arrived, and the overlay sat on
+        a dead screen with no word of why.
+        """
         while True:
             try:
                 fn = self.events.get_nowait()
             except queue.Empty:
                 break
-            fn()
+            try:
+                fn()
+            except Exception as exc:      # a stale screen, usually
+                print(f"overlay: {exc}", file=sys.stderr, flush=True)
         self.root.after(80, self._drain)
 
     def post(self, fn):
@@ -227,39 +242,45 @@ class Overlay:
             except tk.TclError:
                 pass
 
+    def secret_field(self, pane, variable, entries, eyes, on_return):
+        """A hidden entry plus the button that reveals it.
+
+        Revealing matters: three keyboard layouts on one machine is normal
+        here, and a password typed under the wrong one looks exactly like a
+        password typed wrong. Every monitor's copies share one list, so the
+        eye works whichever copy you click.
+        """
+        entry = tk.Entry(pane, show="•", width=26, justify="center",
+                         textvariable=variable, bg="#101317", fg=FG,
+                         insertbackground=FG, relief="flat", font=(FONT, 16))
+        entry.pack(ipady=8, pady=6)
+        entry.bind("<Return>", on_return)
+        entry.bind("<Button-1>", lambda e: e.widget.focus_set())
+        entries.append(entry)
+
+        def reveal():
+            hidden = bool(entries[0].cget("show"))
+            for widget in entries:
+                widget.config(show="" if hidden else "\u2022")
+            for widget in eyes:
+                widget.config(text="hide the key" if hidden else "show the key")
+
+        eye = self.button(pane, "show the key", reveal)
+        eye.pack(pady=(8, 0))
+        eyes.append(eye)
+        return entry
+
     # --- screens --------------------------------------------------------
     def ask_password(self, message=None):
         self.clear()
         self.password = tk.StringVar()            # shared by every copy
         entries, status, eyes = [], [], []
-        shown = tk.BooleanVar(value=False)
-
-        def reveal():
-            """Show the key. A wrong keyboard layout is invisible otherwise.
-
-            Three layouts on one machine is normal here, and a password typed
-            under the wrong one looks exactly like a password typed wrong.
-            """
-            shown.set(not shown.get())
-            for widget in entries:
-                widget.config(show="" if shown.get() else "\u2022")
-            for widget in eyes:
-                widget.config(text="hide the key" if shown.get() else "show the key")
 
         for pane in self.panes:
             self.label(pane, "CELEPHAIS", 30, FG, pady=0)
             self.label(pane, "insert the key", 12, DIM, pady=(2, 18))
-            entry = tk.Entry(pane, show="•", width=26, justify="center",
-                             textvariable=self.password,
-                             bg="#101317", fg=FG, insertbackground=FG,
-                             relief="flat", font=(FONT, 16))
-            entry.pack(ipady=8, pady=6)
-            entry.bind("<Return>", lambda _e: submit())
-            entry.bind("<Button-1>", lambda e: e.widget.focus_set())
-            entries.append(entry)
-            eye = self.button(pane, "show the key", reveal)
-            eye.pack(pady=(8, 0))
-            eyes.append(eye)
+            self.secret_field(pane, self.password, entries, eyes,
+                              lambda _e: submit())
             status.append(self.label(pane, message or "", 11,
                                      BAD if message else DIM))
 
@@ -319,11 +340,63 @@ class Overlay:
                     self.button(rows, "use the monitors",
                                 lambda n=name: self.go("take_seat", n)
                                 ).grid(row=index, column=3, padx=6)
+                    # Only a running Realm has a session worth keeping.
+                    if realm["power"] == "READY":
+                        self.button(rows, "park",
+                                    lambda n=name: self.go("park", n)
+                                    ).grid(row=index, column=4, padx=6)
 
         self.say_on(status, "reading the realms…")
         self.work(self.hooks["realms"], refresh)
 
+    def ask_login(self, name, message=None):
+        """Sign in to the Realm, in our own screen.
+
+        FreeRDP would ask for this itself, in a small window of its own, after
+        the overlay had already stepped aside for it. Asking here keeps the
+        whole handover inside one full-screen surface.
+        """
+        self.clear()
+        user, password = self.rdp or ("", "")
+        self.rdp_user = tk.StringVar(value=user)
+        self.rdp_password = tk.StringVar(value=password)
+        users, secrets, eyes, status = [], [], [], []
+
+        for pane in self.panes:
+            self.label(pane, name, 26, FG, pady=(0, 2))
+            self.label(pane, "sign in", 12, DIM, pady=(0, 16))
+            entry = tk.Entry(pane, width=26, justify="center",
+                             textvariable=self.rdp_user, bg="#101317", fg=FG,
+                             insertbackground=FG, relief="flat", font=(FONT, 16))
+            entry.pack(ipady=8, pady=6)
+            entry.bind("<Return>", lambda _e: submit())
+            entry.bind("<Button-1>", lambda e: e.widget.focus_set())
+            users.append(entry)
+            self.secret_field(pane, self.rdp_password, secrets, eyes,
+                              lambda _e: submit())
+            status.append(self.label(pane, message or "", 11,
+                                     BAD if message else DIM))
+
+        def submit(_event=None):
+            if not self.rdp_password.get():
+                return
+            self.rdp = (self.rdp_user.get(), self.rdp_password.get())
+            self.go("open_remote", name)
+
+        for pane in self.panes:
+            self.button(pane, "open", submit, accent=True).pack(pady=14)
+            self.button(pane, "back", self.show_realms).pack()
+
+        self.submit_login = submit      # the headless self-check calls this
+        self.focus_widgets = secrets
+        self.claim_focus()
+
     def go(self, action, name):
+        if action == "open_remote":
+            if self.rdp is None:
+                self.rdp = tuple(self.hooks.get("rdp_login", lambda: ("", ""))())
+            if not self.rdp[1]:
+                return self.ask_login(name)
         self.clear()
         lines = []
         for pane in self.panes:
@@ -349,9 +422,15 @@ class Overlay:
 
             def finished(result, error):
                 self.show()
+                # A refused password must be asked again, and only a refused
+                # one: a boot timeout is not a reason to retype anything.
+                if error and "logon" in str(error).lower():
+                    self.rdp = None
+                    return self.ask_login(name, "that password was refused")
                 done(result, error)
 
-            self.work(lambda: self.hooks[action](name, say, hide_now), finished)
+            self.work(lambda: self.hooks[action](name, say, hide_now, *self.rdp),
+                      finished)
         else:
             self.work(lambda: self.hooks[action](name, say), done)
 

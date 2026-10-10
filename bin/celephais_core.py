@@ -25,9 +25,13 @@ API:
   POST /realms/<name>/stop  -> 202
   POST /realms/<name>/seat    -> 200, give that Realm the Local Seat
   POST /realms/<name>/release -> 200, strip the seat from a stopped Realm
+  POST /realms/<name>/logout  -> 200, log out the Realm's desktop session
+  POST /realms/<name>/park    -> 202, save the live session to disk and stop
 
-power: OFF -> BOOTING -> READY, plus STOPPING after a stop and ERROR if
-Proxmox cannot answer for that Realm. seat is a separate boolean. CONNECTING
+power: OFF -> BOOTING -> READY, plus PARKED for a Realm whose live session is
+saved on disk, STOPPING after a stop, PARKING after a park, and ERROR if
+Proxmox cannot answer for that Realm. A parked Realm wakes with an ordinary
+start: Proxmox restores the saved state instead of booting. seat is a separate boolean. CONNECTING
 and ONLINE belong to the Gate; it polls until READY and then launches RDP.
 
 Changing passthrough is restricted to root@pam by Proxmox, so the seat
@@ -41,6 +45,7 @@ import socket
 import subprocess
 import sys
 import ssl
+import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,8 +60,8 @@ if _ENV_FILE.exists():
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
 
-# Add a Realm here once its VM exists. "personal" (202) is planned, not built.
-REALMS = {"work": 201, "windows": 100}
+# Add a Realm here once its VM exists.
+REALMS = {"work": 201, "personal": 202, "windows": 100}
 RDP_PORT = 3389
 SEAT_CMD = os.environ.get("SEAT_CMD", "sudo -n /usr/local/bin/celephais-seat").split()
 
@@ -73,7 +78,7 @@ if os.environ.get("PVE_VERIFY_TLS", "1") == "0":
 
 def pve(method, path, **form):
     """One Proxmox API call. Returns the `data` field."""
-    data = urllib.parse.urlencode(form).encode() if form else None
+    data = urllib.parse.urlencode(form, doseq=True).encode() if form else None
     req = urllib.request.Request(
         f"https://{PVE_HOST}/api2/json{path}", data=data, method=method,
         headers={"Authorization": PVE_TOKEN})
@@ -100,6 +105,47 @@ def realm_ip(vmid):
     return None
 
 
+# GNOME Remote Login can only hand a client over to a *fresh* login. A session
+# left behind by the last connection, or by whoever sat at the Local Seat,
+# refuses the next one, and the Gate's user has to log out on the Realm's own
+# screen before they can get back in. So log them out from here instead. Only
+# real people (uid 1000..59999); system users keep their sessions.
+LOGOUT_SH = (
+    "loginctl --no-legend list-users | awk '$1>=1000 && $1<60000 {print $2}' "
+    "| xargs -r -n1 loginctl terminate-user; "
+    # terminate-user returns before the session is gone, and logging in during
+    # the teardown is exactly the race we are trying to avoid.
+    "for i in $(seq 15); do loginctl --no-legend list-users "
+    "| awk '$1>=1000 && $1<60000' | grep -q . || break; sleep 1; done")
+
+
+def guest_exec(vmid, *cmd, timeout=30):
+    """Run one command inside the guest through the QEMU agent -> (exitcode, output).
+
+    Needs VM.GuestAgent.Unrestricted on the API token; install-core.sh grants it.
+    """
+    pid = pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/agent/exec",
+              command=list(cmd))["pid"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        st = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/agent/exec-status?pid={pid}")
+        if st.get("exited"):
+            return st.get("exitcode", 0), (st.get("out-data", "")
+                                           + st.get("err-data", "")).strip()
+        time.sleep(0.5)
+    raise TimeoutError(f"the guest agent did not finish in {timeout}s")
+
+
+def logout_realm(vmid):
+    """Empty the Realm's desktop session. Never raises: a Realm that cannot be
+    logged out is still worth trying to connect to, and the Gate says why."""
+    try:
+        code, out = guest_exec(vmid, "/bin/sh", "-c", LOGOUT_SH)
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+    return {"ok": code == 0, "detail": out or f"exit {code}"}
+
+
 def port_open(ip, port, timeout=1.0):
     try:
         with socket.create_connection((ip, port), timeout):
@@ -108,10 +154,30 @@ def port_open(ip, port, timeout=1.0):
         return False
 
 
+def vm_config(vmid):
+    """The VM's Proxmox configuration. Readable with VM.Audit."""
+    return pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/config")
+
+
 def has_seat(vmid):
-    """True if this VM's config claims the GPU. Readable with VM.Audit."""
-    config = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/config")
-    return "hostpci0" in config
+    """True if this VM's config claims the GPU."""
+    return "hostpci0" in vm_config(vmid)
+
+
+def park(vmid):
+    """Save the live session to disk and stop the VM, freeing its RAM and CPU.
+
+    Refused while the Realm holds the Local Seat. QEMU can only save a
+    passed-through PCI device's state when the device itself supports
+    migration, and a consumer RTX 2060 on plain vfio-pci does not. Suspending
+    it anyway would write a state file that cannot be restored. Release the
+    seat and shut the Realm down instead.
+    """
+    config = vm_config(vmid)
+    if "hostpci0" in config:
+        raise SeatError("it holds the Local Seat, and the RTX 2060 cannot have "
+                        "its state saved. Release the seat first.")
+    pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/suspend", todisk=1)
 
 
 def seat_cmd(*args):
@@ -131,14 +197,19 @@ def realm_state(name):
     vmid = REALMS[name]
     try:
         status = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current")["status"]
-        seat = has_seat(vmid)
+        config = vm_config(vmid)
+        seat = "hostpci0" in config
     except KeyError:
         raise
     except Exception as exc:
         return {"realm": name, "vmid": vmid, "power": "ERROR", "seat": None,
                 "ip": None, "error": str(exc)}
     if status != "running":
-        return {"realm": name, "vmid": vmid, "power": "OFF", "seat": seat, "ip": None}
+        # A Realm suspended to disk is stopped, but its live session is kept in
+        # a state file named by the config. Starting it restores that session,
+        # so it is not OFF and must not be reported as if nothing were saved.
+        power = "PARKED" if config.get("vmstate") else "OFF"
+        return {"realm": name, "vmid": vmid, "power": power, "seat": seat, "ip": None}
     ip = realm_ip(vmid)
     # READY means the desktop can actually be connected to, not just that the VM runs.
     power = "READY" if ip and port_open(ip, RDP_PORT) else "BOOTING"
@@ -193,6 +264,21 @@ class Handler(BaseHTTPRequestHandler):
                 action = "switch" if parts[2] == "seat" else "release"
                 return self._reply(200, {"result": seat_cmd(action, name),
                                          "owner": seat_owner()})
+            if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
+                    and parts[2] == "park"):
+                name, vmid = parts[1], REALMS[parts[1]]
+                if pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current"
+                       )["status"] != "running":
+                    return self._reply(200, realm_state(name))   # nothing to save
+                park(vmid)
+                # Saving the memory takes a while and Proxmox answers at once,
+                # so report what was asked for rather than a half-written state.
+                return self._reply(202, {"realm": name, "vmid": vmid,
+                                         "power": "PARKING", "seat": False,
+                                         "ip": None})
+            if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
+                    and parts[2] == "logout"):
+                return self._reply(200, logout_realm(REALMS[parts[1]]))
             if (method == "POST" and len(parts) == 3 and parts[0] == "realms"
                     and parts[2] in ("start", "stop")):
                 name, vmid = parts[1], REALMS[parts[1]]

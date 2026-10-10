@@ -57,6 +57,33 @@ if command -v visudo >/dev/null; then
   visudo -cf /etc/sudoers.d/celephais >/dev/null
 fi
 
+# Two operations need a privilege beyond powering VMs on and off: logging a
+# Realm out runs one command inside the guest, and parking one writes its live
+# session to a new state volume. Grant exactly those two, on VMs only.
+TOKENID=${PVE_TOKEN#PVEAPIToken=}; TOKENID=${TOKENID%%=*}
+if [ -n "$TOKENID" ] && command -v pveum >/dev/null; then
+  pveum role add CelephaisGuest -privs VM.GuestAgent.Unrestricted 2>/dev/null ||
+    pveum role modify CelephaisGuest -privs VM.GuestAgent.Unrestricted
+  # qm suspend --todisk allocates the state volume: a disk change on the VM,
+  # and space taken on the storage that holds it. Its own role, so the power
+  # role keeps its narrow meaning.
+  PARK_PRIVS=VM.Config.Disk,Datastore.AllocateSpace
+  pveum role add CelephaisPark -privs "$PARK_PRIVS" 2>/dev/null ||
+    pveum role modify CelephaisPark -privs "$PARK_PRIVS"
+  pveum acl modify /storage --tokens "$TOKENID" --roles CelephaisPark
+  pveum acl modify /storage --users "${TOKENID%%!*}" --roles CelephaisPark
+  # Two Proxmox rules bite here. Tokens are privilege-separated: what a token
+  # may do is the intersection of its own rights and its user's, so grant both.
+  # And an ACL on /vms/<id> overrides the one inherited from /vms, so a Realm
+  # that already has its own entry needs the role named on that entry too.
+  for _path in /vms $(grep '^REALMS *=' "$SRC/bin/celephais_core.py" |
+                      grep -oE '[0-9]+' | sed 's|^|/vms/|'); do
+    pveum acl modify "$_path" --tokens "$TOKENID" --roles CelephaisGuest,CelephaisPark &&
+    pveum acl modify "$_path" --users "${TOKENID%%!*}" --roles CelephaisGuest,CelephaisPark ||
+      echo "could not grant the extra privileges on $_path; logout and park will fail" >&2
+  done
+fi
+
 install -d -m 750 -o root -g celephais /etc/celephais
 umask 027
 cat > /etc/celephais/core.env <<EOF

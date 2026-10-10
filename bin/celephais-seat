@@ -8,7 +8,7 @@ SEAT_PCI=(0000:01:00.0 0000:01:00.1)   # GPU + HDMI/DP audio
 SEAT_USB=(1532:02a2 046d:c52b)         # Razer Ornata V3 X, Logitech Unifying
 # ponytail: VID:PID identity only. Add serial if two identical devices appear.
 
-declare -A REALMS=( [work]=201 [windows]=100 )
+declare -A REALMS=( [work]=201 [personal]=202 [windows]=100 )
 
 SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-120}
 

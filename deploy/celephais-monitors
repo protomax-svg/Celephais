@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Keep a Realm's desktop on the monitors the remote client actually has.
+
+A headless Realm still owns one screen: the VM's own QEMU display, which
+nobody ever looks at. GNOME makes it the primary monitor, so the top bar and
+the dock live there and every remote monitor shows a bare desktop.
+
+GNOME Remote Desktop adds one virtual monitor per client monitor whenever
+somebody connects. This watches for that and rebuilds the layout out of those
+virtual monitors alone, left to right, the first one primary. The QEMU display
+is left out, which disables it. When the client disconnects the virtual
+monitors vanish and GNOME brings the QEMU display back by itself.
+
+Saving the layout is not an option: mutter keys a saved layout on the monitors
+it was made for, and virtual ones are new every time. So this applies it again
+on every change instead. Runs as the Realm's own user, inside its session.
+"""
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib    # noqa: E402
+
+BUS = "org.gnome.Mutter.DisplayConfig"
+PATH = "/org/gnome/Mutter/DisplayConfig"
+VIRTUAL = "Meta-"          # mutter's name for a monitor it invented
+
+
+def current_mode(modes):
+    for mode in modes:
+        if mode[6].get("is-current"):
+            return mode
+    for mode in modes:
+        if mode[6].get("is-preferred"):
+            return mode
+    return modes[0]
+
+
+def wanted_layout(monitors):
+    """Left to right, one logical monitor per virtual one, the first primary."""
+    virtual = sorted(m for m in monitors if m[0][0].startswith(VIRTUAL))
+    layout, x = [], 0
+    for index, ((connector, _v, _p, _s), modes, _props) in enumerate(virtual):
+        mode = current_mode(modes)
+        layout.append((x, 0, 1.0, 0, index == 0, [(connector, mode[0], {})]))
+        x += mode[1]
+    return layout
+
+
+def already_right(layout, logical):
+    """What mutter has now, in the same shape as what we would ask for."""
+    have = [(x, y, primary, [m[0] for m in mons])
+            for x, y, _scale, _tr, primary, mons, _props in logical]
+    want = [(x, y, primary, [m[0] for m in mons])
+            for x, y, _scale, _tr, primary, mons in layout]
+    return have == want
+
+
+def reconcile(proxy):
+    serial, monitors, logical, _props = proxy.call_sync(
+        "GetCurrentState", None, Gio.DBusCallFlags.NONE, -1, None).unpack()
+    layout = wanted_layout(monitors)
+    # No client connected: leave the Realm's own screen alone, it is all there is.
+    if not layout or already_right(layout, logical):
+        return
+    proxy.call_sync(
+        "ApplyMonitorsConfig",
+        GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})", (serial, 1, layout, {})),
+        Gio.DBusCallFlags.NONE, -1, None)
+
+
+def main():
+    proxy = Gio.DBusProxy.new_for_bus_sync(
+        Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None, BUS, PATH, BUS, None)
+    proxy.connect("g-signal", lambda *_a: reconcile(proxy))
+    reconcile(proxy)                   # a client may already be connected
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()
