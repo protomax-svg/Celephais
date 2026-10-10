@@ -4,11 +4,15 @@
 This is NOT a unit test. It starts, stops and restarts real VMs and moves the
 RTX 2060 between them, so the physical monitors will switch during it.
 
-    python3 bin/test_scenarios.py --yes
-    python3 bin/test_scenarios.py --yes --only 1,2
+    python3 bin/test_scenarios.py --yes              # the ones that do not
+    python3 bin/test_scenarios.py --yes --seat       # all of them
+    python3 bin/test_scenarios.py --yes --only 5,6
 
-Scenarios 2, 3 and 4 change passthrough, which only root can do, so Core must
-be installed on the Proxmox host (deploy/install-core.sh). Run from anywhere.
+Some of them move the Local Seat: the physical monitors switch, and whatever
+is on them is restarted. Those are left out unless --seat is given, so the
+rest can be run from a laptop without touching the machine in the other room.
+Changing passthrough needs root, so Core must be installed on the Proxmox host
+(deploy/install-core.sh). Run from anywhere.
 """
 import argparse
 import json
@@ -17,6 +21,7 @@ import pathlib
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
@@ -64,6 +69,17 @@ def off(name):
     if state(name)["power"] != "OFF":
         core(f"/realms/{name}/stop", "POST")
         wait_power(name, "OFF")
+
+
+def refused(path, method="POST"):
+    """Core said no, and said why. Anything else is a failure."""
+    try:
+        core(path, method)
+    except RuntimeError as exc:
+        if "409" in str(exc):
+            return str(exc)
+        raise
+    raise RuntimeError(f"{path} was allowed; it should have been refused")
 
 
 def check(label, got, want):
@@ -122,22 +138,109 @@ def scenario_4():
     check("windows is still running", windows["power"] in ("BOOTING", "READY"), True)
 
 
-SCENARIOS = {1: scenario_1, 2: scenario_2, 3: scenario_3, 4: scenario_4}
+def scenario_5():
+    """work parks its session to disk and comes back to it."""
+    if state("work")["power"] != "READY":
+        core("/realms/work/start", "POST")
+        wait_power("work", "READY")
+    core("/realms/work/park", "POST")
+    wait_power("work", "PARKED")
+    check("parked is not off", state("work")["power"], "PARKED")
+    core("/realms/work/start", "POST")
+    now = wait_power("work", "READY")
+    check("it came back", bool(now["ip"]), True)
+    check("the saved state was used up", state("work")["power"], "READY")
+
+
+def scenario_6():
+    """a parked Realm will not be handed the monitors without being told twice."""
+    if state("work")["power"] != "READY":
+        core("/realms/work/start", "POST")
+        wait_power("work", "READY")
+    core("/realms/work/park", "POST")
+    wait_power("work", "PARKED")
+    why = refused("/realms/work/seat")
+    check("it said what would be lost", "saved session" in why, True)
+    check("and changed nothing", state("work")["seat"], False)
+    check("the session is still parked", state("work")["power"], "PARKED")
+    core("/realms/work/start", "POST")       # leave it as we found it
+    wait_power("work", "READY")
+
+
+def scenario_7():
+    """personal comes up headless and takes RDP, same as work."""
+    off("personal")
+    core("/realms/personal/start", "POST")
+    now = wait_power("personal", "READY")
+    check("personal is reachable", bool(now["ip"]), True)
+    check("personal took no seat", now["seat"], False)
+
+
+def scenario_8():
+    """a decision about a device outlives the asking."""
+    plugged = [d for d in core("/devices") if d["present"]]
+    if not plugged:
+        print("      nothing plugged into the host; nothing to decide about")
+        return
+    device = plugged[0]
+    ident = urllib.parse.quote(device["id"], safe="")
+    print(f"      using {device['name']} ({device['id']})")
+    try:
+        core(f"/devices/{ident}?action=never", "POST")
+        after = {d["id"]: d for d in core("/devices")}[device["id"]]
+        check("it remembered", after["action"], "never")
+        check("and it is not offered to the seat", device["usb"] in
+              [d["usb"] for d in core("/devices") if d["action"] == "seat"], False)
+    finally:
+        if device["action"]:
+            core(f"/devices/{ident}?action={device['action']}", "POST")
+        else:
+            core(f"/devices/{ident}?action=forget", "POST")
+    check("put back as it was", {d["id"]: d for d in core("/devices")}
+          [device["id"]]["action"], device["action"])
+
+
+def scenario_9():
+    """every Realm can say how it reaches the internet. Nothing is changed."""
+    for name in ("work", "personal"):
+        if state(name)["power"] != "READY":
+            print(f"      {name} is not running; skipped")
+            continue
+        answer = core(f"/realms/{name}/egress")
+        check(f"{name} egress", answer["mode"] in
+              ("exit-node", "direct", "unknown"), True)
+        print(f"      {name}: {answer['mode']} {answer.get('node') or answer.get('detail', '')}")
+
+
+# True where the physical monitors move and whatever is on them is restarted.
+SCENARIOS = {1: (scenario_1, False), 2: (scenario_2, True), 3: (scenario_3, True),
+             4: (scenario_4, True), 5: (scenario_5, False), 6: (scenario_6, False),
+             7: (scenario_7, False), 8: (scenario_8, False), 9: (scenario_9, False)}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--yes", action="store_true", required=True,
                     help="confirm that real VMs may be started, stopped and restarted")
-    ap.add_argument("--only", default="1,2,3,4")
+    ap.add_argument("--seat", action="store_true",
+                    help="also run the ones that move the physical monitors")
+    ap.add_argument("--only", help="comma separated scenario numbers")
     args = ap.parse_args()
 
-    wanted = [int(n) for n in args.only.split(",")]
+    if args.only:
+        wanted = [int(n) for n in args.only.split(",")]
+    else:
+        wanted = [n for n, (_fn, moves) in sorted(SCENARIOS.items())
+                  if args.seat or not moves]
+        if not args.seat:
+            print("leaving out the ones that move the monitors; --seat runs those too")
     failed = []
     for number in wanted:
-        print(f"\n--- scenario {number}: {SCENARIOS[number].__doc__}")
+        run, moves = SCENARIOS[number]
+        print(f"\n--- scenario {number}: {run.__doc__}"
+              + ("\n    (the monitors will switch)" if moves else ""))
         try:
-            SCENARIOS[number]()
+            run()
             print(f"    PASS scenario {number}")
         except Exception as exc:
             print(f"    FAIL scenario {number}: {exc}")
