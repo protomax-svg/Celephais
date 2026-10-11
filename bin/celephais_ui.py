@@ -29,6 +29,7 @@ overlay never freezes.
   open_remote(name, say, hide, user, password)
                           -> starts it, waits for READY, launches RDP.
                              It calls hide() just before the RDP window opens.
+  stored_password()       -> the vault password this machine keeps, or ""
   rdp_login(realm)        -> (user, password) already known; password may be ""
   devices()               -> [ {id, name, usb, action, present}, ... ]
   set_device(id, action)  -> "seat", "never" or "forget" for that device
@@ -541,6 +542,14 @@ class Overlay:
 
     def run(self):
         self.ask_password()
+        # A machine that keeps the key opens the vault by itself, and the
+        # screen is only there to say so while it does. A stored key that no
+        # longer fits lands back on this same screen with the reason on it,
+        # so trying costs nothing.
+        stored = self.hooks.get("stored_password", lambda: "")()
+        if stored:
+            self.password.set(stored)
+            self.post(self.submit)
         self.root.mainloop()
 
 

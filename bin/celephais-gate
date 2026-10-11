@@ -47,6 +47,21 @@ else:
 # no business being, so that install names it instead.
 VAULT = pathlib.Path(os.environ.get("CELEPHAIS_VAULT") or HERE / "celephais.vault")
 ENV_FILE = HERE / ".env"
+# A machine that is already trusted may keep the vault key beside the Gate and
+# skip the screen: on this laptop the Proxmox web interface is one click away
+# anyway, so a second password guards nothing. The USB stick must never have
+# one, because there the password is the whole point.
+# deploy/install-gate.sh --no-password writes it.
+KEY_FILE = (pathlib.Path(os.environ["CELEPHAIS_KEY_FILE"])
+            if os.environ.get("CELEPHAIS_KEY_FILE") else None)
+
+
+def stored_password():
+    """The vault password this machine keeps, or "" to ask for it."""
+    try:
+        return KEY_FILE.read_text().strip() if KEY_FILE else ""
+    except OSError:
+        return ""
 
 # FreeRDP first wherever it is installed: multimon, dynamic resolution and
 # sound all work there. Windows' own mstsc is the fallback, so a Windows host
@@ -60,7 +75,8 @@ def secrets():
     """Open the vault if there is one, else fall back to .env for development."""
     if VAULT.exists():
         try:
-            return celephais_vault.load(VAULT, getpass.getpass("Vault password: "))
+            return celephais_vault.load(
+                VAULT, stored_password() or getpass.getpass("Vault password: "))
         except celephais_vault.VaultError as exc:
             raise SystemExit(f"gate: {exc}")
     values = {}
@@ -432,6 +448,7 @@ def ui_session():
     return stack, {"unlock": unlock, "realms": lambda: core("/realms"),
                    "open_remote": open_remote, "take_seat": take_seat,
                    "park": park, "stop": stop, "release": release,
+                   "stored_password": stored_password,
                    "rdp_login": rdp_login,
                    "devices": lambda: core("/devices"),
                    "set_device": set_device}

@@ -263,4 +263,33 @@ try:
 finally:
     ui.screens = real_screens
 
+# A trusted machine keeps the vault key, and the Gate must open the vault with
+# it instead of asking. The screen still appears, so there is somewhere to
+# report a key that no longer fits.
+kept = dict(hooks, stored_password=lambda: "right")
+app = ui.Overlay(kept)
+app.hide()
+try:
+    calls.clear()
+    app.ask_password()
+    stored = kept["stored_password"]()
+    app.password.set(stored)
+    app.post(app.submit)
+    assert pump(app, until=lambda: ("unlock", "right") in calls), \
+        f"the kept key was never used: {calls}"
+    assert pump(app, until=lambda: "work" in texts(app.panes[0])), \
+        f"it stopped at the password screen: {texts(app.panes[0])}"
+
+    # A kept key that no longer fits must land on the screen with the reason,
+    # not lock the machine out in silence.
+    calls.clear()
+    app.ask_password()
+    app.password.set("stale")
+    app.post(app.submit)
+    assert pump(app, until=lambda: any("tampered" in t
+                                       for t in texts(app.panes[0]))), \
+        f"a stale key said nothing: {texts(app.panes[0])}"
+finally:
+    app.leave()
+
 print("PASS")

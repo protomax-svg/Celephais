@@ -94,6 +94,20 @@ import getpass  # noqa: E402
 assert gate.realm_login("work") == (getpass.getuser(), ""), "no keys: fall back to this user"
 gate.CFG.clear()
 
+# A trusted machine may keep the vault key in a file. No file named, or a
+# file that is not there, means ask: the USB stick must never skip the screen.
+import tempfile  # noqa: E402
+
+assert gate.KEY_FILE is None, "no key file unless one is named"
+assert gate.stored_password() == ""
+with tempfile.TemporaryDirectory() as tmp:
+    kept = pathlib.Path(tmp) / "key"
+    gate.KEY_FILE = kept
+    assert gate.stored_password() == "", "a missing file must not raise"
+    kept.write_text("open sesame\n")
+    assert gate.stored_password() == "open sesame", gate.stored_password()
+gate.KEY_FILE = None
+
 # Every recipe must name a manager that could exist and a command to run.
 for tool, script in gate.PACKAGERS:
     assert script.startswith(tool), f"{tool} recipe does not run {tool}: {script}"
