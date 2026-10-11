@@ -144,4 +144,24 @@ with tempfile.TemporaryDirectory() as packed:
             else:
                 setattr(sys, name, value)
 
+# Windows refuses a pipe of our own unless tailscaled is told it is being run
+# by hand. Without this the Gate died on the password screen with the refusal
+# printed across it.
+import os  # noqa: E402
+
+real_name = os.name
+try:
+    os.name = "nt"
+    win = n.daemon_argv("tailscaled.exe", r"\\.\pipe\celephais-1", 1080, 1081)
+    assert "--windows-mode=dev" in win, win
+    assert win.index("--windows-mode=dev") == 1, f"it must come first: {win}"
+    os.name = "posix"
+    nix = n.daemon_argv("tailscaled", "/tmp/sock", 1080, 1081)
+    assert "--windows-mode=dev" not in nix, nix
+    # The rest of the command line is the same on both.
+    assert win[2:] == [a.replace("/tmp/sock", r"\\.\pipe\celephais-1")
+                       for a in nix[1:]], (win, nix)
+finally:
+    os.name = real_name
+
 print("PASS")

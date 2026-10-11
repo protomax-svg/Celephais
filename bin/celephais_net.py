@@ -185,6 +185,23 @@ def forward(proxy, host, port):
     return listener.getsockname()[1], listener
 
 
+def daemon_argv(exe, sock, socks_port, http_port):
+    r"""How tailscaled is started. Kept apart so the Windows branch is testable.
+
+    tailscaled refuses any --socket outside
+    \\.\pipe\ProtectedPrefix\Administrators\, the prefix only an
+    administrator may create pipes in. "dev" is the mode for a daemon run by
+    hand under a plain account, and it accepts a pipe of our own.
+    """
+    return ([exe]
+            + (["--windows-mode=dev"] if os.name == "nt" else [])
+            + ["--tun=userspace-networking",
+               "--state=mem:",                  # ephemeral node, nothing on disk
+               f"--socket={sock}",
+               f"--socks5-server=127.0.0.1:{socks_port}",
+               f"--outbound-http-proxy-listen=127.0.0.1:{http_port}"])
+
+
 @contextlib.contextmanager
 def tailnet(credential, hostname="celephais-gate", tags=""):
     """Bring up userspace Tailscale. Yields {'http_proxy': ..., 'socks5': ...}."""
@@ -201,12 +218,7 @@ def tailnet(credential, hostname="celephais-gate", tags=""):
     daemon = None
     try:
         daemon = subprocess.Popen(
-            [bundled("tailscaled"),
-             "--tun=userspace-networking",
-             "--state=mem:",                      # ephemeral node, nothing on disk
-             f"--socket={sock}",
-             f"--socks5-server=127.0.0.1:{socks_port}",
-             f"--outbound-http-proxy-listen=127.0.0.1:{http_port}"],
+            daemon_argv(bundled("tailscaled"), sock, socks_port, http_port),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
         deadline = time.monotonic() + READY_TIMEOUT

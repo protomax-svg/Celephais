@@ -43,6 +43,7 @@ overlay never freezes.
   release(name, say, confirmed)
                           -> takes the RTX and the monitors back off it
 """
+import os
 import queue
 import re
 import subprocess
@@ -93,13 +94,39 @@ def screens(root):
     return rects
 
 
+def _crisp():
+    """Ask Windows for real pixels before any window exists.
+
+    A window that has not said it understands display scaling is drawn small
+    and then stretched by the compositor, which turns every letter soft. Tk
+    has no setting for this; it has to be declared on the process, and before
+    the first window. Nothing to do anywhere else: X11 hands out real pixels
+    already.
+    """
+    if os.name != "nt":
+        return
+    import ctypes
+    for call in (lambda: ctypes.windll.shcore.SetProcessDpiAwareness(1),
+                 lambda: ctypes.windll.user32.SetProcessDPIAware()):
+        try:
+            call()
+            return
+        except Exception:                 # old Windows, or already set
+            continue
+
+
 class Overlay:
     focus_widgets = ()
 
     def __init__(self, hooks):
         self.hooks = hooks
         self.events = queue.Queue()
+        _crisp()
         self.root = tk.Tk()
+        # Real pixels mean a point is no longer 1/72 of an inch to Tk, so the
+        # text would come out tiny. Scaling puts the sizes back.
+        self.root.tk.call("tk", "scaling",
+                          self.root.winfo_fpixels("1i") / 72.0)
         self.root.title("Celephais")
         # None means "wherever you are": one window, no placing, which is the
         # fallback on a host that will not report its monitors.
