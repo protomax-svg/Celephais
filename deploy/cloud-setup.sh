@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs inside the cloud container. install-cloud.sh pushes it in and calls it.
 #
-#   cloud-setup.sh <password> <tailscale-auth-key> [tags]
+#   cloud-setup.sh <password> <tailscale-auth-key> [tags] [uid]
 #
 # Two doors onto /srv/cloud and nothing else:
 #   samba      so a Realm can mount it as an ordinary folder
@@ -12,6 +12,7 @@ set -euo pipefail
 PASSWORD=${1:-}
 AUTHKEY=${2:-}
 TAGS=${3:-}
+CLOUD_UID=${4:-1000}
 [ -n "$PASSWORD" ] && [ -n "$AUTHKEY" ] || {
   echo "usage: cloud-setup.sh <password> <tailscale-auth-key> [tags]" >&2; exit 1; }
 
@@ -30,12 +31,16 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq samba python3 curl ca-certificates >/dev/null
 
-# One account owns the files, and both doors sign in as it. The folder is a
-# loan from the host, so the ownership set here is what the host sees too,
-# shifted by the offset an unprivileged container runs under.
-id cloud >/dev/null 2>&1 || useradd --create-home --shell /usr/sbin/nologin cloud
-chown -R cloud:cloud "$SHARE"
-chmod 755 "$SHARE"
+# One account owns the files, and both doors sign in as it. Its id is fixed
+# because the folder is a loan from the host: this container is unprivileged,
+# so it cannot chown the loan, and install-cloud.sh has already handed it to
+# this exact id on the host side.
+id cloud >/dev/null 2>&1 || useradd --create-home --shell /usr/sbin/nologin \
+  --uid "$CLOUD_UID" --user-group cloud
+runuser -u cloud -- test -w "$SHARE" || {
+  echo "$SHARE is not writable by cloud (uid $CLOUD_UID)." >&2
+  echo "On the host: chown $((100000 + CLOUD_UID)):$((100000 + CLOUD_UID)) the folder behind it." >&2
+  exit 1; }
 
 # --- door one: the folder a Realm mounts ----------------------------------
 cat > /etc/samba/smb.conf <<EOF

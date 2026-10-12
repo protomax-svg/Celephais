@@ -35,6 +35,12 @@ NAMESERVER=${NAMESERVER:-${CT_GW%%/*} 1.1.1.1}
 TEMPLATE=${TEMPLATE:-local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst}
 ROOTFS=${ROOTFS:-realms-ssd:8}
 SHARE=${SHARE:-/mnt/hdd/cloud}
+# An unprivileged container runs with every user id shifted up by 100000, so
+# its root is the host's 100000 and it owns nothing outside its own disk. It
+# therefore cannot chown the borrowed folder itself. The host does it here,
+# to the shifted id of the account that serves the files.
+CLOUD_UID=${CLOUD_UID:-1000}
+UID_OFFSET=${UID_OFFSET:-100000}
 MEMORY=${MEMORY:-1024}
 CORES=${CORES:-2}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -65,6 +71,7 @@ PASSWORD=$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 20)
 # it. Ownership is set from inside later, where the user ids are the ones that
 # matter.
 install -d -m 755 "$SHARE"
+chown "$((UID_OFFSET + CLOUD_UID)):$((UID_OFFSET + CLOUD_UID))" "$SHARE"
 
 echo "creating container $CTID…"
 pct create "$CTID" "$TEMPLATE" \
@@ -94,7 +101,8 @@ pct exec "$CTID" -- test -e /run/systemd/system || die "container $CTID never fi
 
 echo "setting it up inside…"
 pct push "$CTID" "$HERE/cloud-setup.sh" /root/cloud-setup.sh --perms 755
-pct exec "$CTID" -- /root/cloud-setup.sh "$PASSWORD" "$AUTHKEY" "${TS_TAGS:-}"
+pct exec "$CTID" -- /root/cloud-setup.sh \
+  "$PASSWORD" "$AUTHKEY" "${TS_TAGS:-}" "$CLOUD_UID"
 pct exec "$CTID" -- rm -f /root/cloud-setup.sh
 
 ADDR=${CT_IP%%/*}
