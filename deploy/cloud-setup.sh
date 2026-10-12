@@ -84,7 +84,10 @@ chmod 755 /opt/copyparty/copyparty-sfx.py
 
 # The password lives in a file only root can read, not on the command line
 # where every process on the box could read it out of /proc.
-install -d -m 700 /etc/copyparty
+# The directory, not only the file: copyparty runs as cloud, and a directory
+# it cannot walk into makes the config look like it is simply not there. It
+# then falls back to serving nothing, and every page answers 500.
+install -d -m 750 -o root -g cloud /etc/copyparty
 cat > /etc/copyparty/server.conf <<EOF
 [global]
   i: 0.0.0.0

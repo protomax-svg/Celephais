@@ -71,4 +71,11 @@ assert "-c /etc/copyparty/server.conf" in unit.group(1), unit.group(1)
 assert "chmod 640 /etc/copyparty/server.conf" in SETUP, SETUP
 assert "chown root:cloud /etc/copyparty/server.conf" in SETUP, SETUP
 
+# The directory around it has to be walkable by the account the service runs
+# as, or the config reads as missing and copyparty quietly serves nothing.
+d = re.search(r"install -d -m (\d+)(.*) /etc/copyparty", SETUP)
+assert d, SETUP
+assert d.group(1) == "750", f"/etc/copyparty is {d.group(1)}; cloud cannot enter it"
+assert "-g cloud" in d.group(2), d.group(0)
+
 print("PASS")
