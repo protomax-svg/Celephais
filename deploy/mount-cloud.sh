@@ -25,8 +25,13 @@ MOUNT=${MOUNT:-/mnt/cloud}
 CRED=/etc/celephais-cloud.cred
 
 export DEBIAN_FRONTEND=noninteractive
-command -v mount.cifs >/dev/null || { apt-get update -qq
-                                      apt-get install -y -qq cifs-utils >/dev/null; }
+# An unrelated third-party repository with a missing key fails the whole
+# `apt-get update`, which used to stop this script before it did anything.
+# The package lists on hand are usually enough, so try them first and only
+# refresh if they are not, without letting a broken repository be fatal.
+command -v mount.cifs >/dev/null || apt-get install -y -qq cifs-utils >/dev/null 2>&1 || {
+  apt-get update -qq || true
+  apt-get install -y -qq cifs-utils >/dev/null; }
 
 # The password goes in a file only root can read. On the mount line it would
 # be visible in /proc/mounts to every user on the machine.
