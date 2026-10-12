@@ -92,6 +92,12 @@ EXIT_NODE = os.environ.get("EXIT_NODE", "")
 def exit_node(name):
     return os.environ.get(f"EXIT_NODE_{name.upper()}") or EXIT_NODE
 SEAT_CMD = os.environ.get("SEAT_CMD", "sudo -n /usr/local/bin/celephais-seat").split()
+# The keyboard and mouse that make the Local Seat a seat. They travel with it
+# unless they have been refused by name: a screen with the GPU on it and
+# nothing to type with is not a working machine, and approving some new device
+# must never be the thing that takes them away.
+SEAT_DEFAULT_USB = [d for d in os.environ.get(
+    "SEAT_DEFAULT_USB", "1532:02a2 046d:c52b").split() if d]
 
 PVE_HOST = os.environ.get("PVE_HOST", "")
 PVE_NODE = os.environ.get("PVE_NODE", "pve")
@@ -318,10 +324,41 @@ def devices():
 
 
 def seat_usb():
-    """The VID:PIDs the Local Seat should carry, newest decision wins."""
-    approved = {ident for ident, entry in device_registry().items()
-                if entry.get("action") == "seat"}
-    return [device["usb"] for device in usb_devices() if device["id"] in approved]
+    """The VID:PIDs the Local Seat should carry.
+
+    Approved devices, plus the keyboard and mouse the seat cannot work
+    without, minus anything refused by name. Max approved a gamepad once and
+    lost the keyboard and mouse with it, because a list built only from
+    approvals silently replaced the ones nobody had ever been asked about.
+    """
+    registry = device_registry()
+    approved = {i for i, e in registry.items() if e.get("action") == "seat"}
+    refused = {i for i, e in registry.items() if e.get("action") == "never"}
+    carried = [device["usb"] for device in usb_devices()
+               if device["id"] in approved
+               or (device["usb"] in SEAT_DEFAULT_USB
+                   and device["id"] not in refused)]
+    return list(dict.fromkeys(carried))        # no duplicates, order kept
+
+
+def ask_to_shut_down(vmid):
+    """Tell the guest to power off, and say which way it was told.
+
+    Not with the ACPI power button. GNOME takes a block inhibitor on the power
+    key, so logind never sees the press and `qm shutdown` waits for a guest
+    that was never asked; Max pressed stop and the Realm sat there until
+    Proxmox gave up with "VM quit/powerdown failed - got timeout".
+
+    The guest agent runs the shutdown inside, where no desktop is in the way.
+    A Realm whose agent is missing or wedged still gets the button, because a
+    stop that does nothing at all is worse than a slow one.
+    """
+    try:
+        pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/agent/shutdown")
+        return "the guest agent is shutting it down"
+    except Exception as exc:
+        pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/shutdown")
+        return f"no agent ({exc}); pressed the power button instead"
 
 
 def vm_config(vmid):
@@ -526,8 +563,7 @@ class Handler(BaseHTTPRequestHandler):
                     log(f"start {name} (vm {vmid}) headless")
                     pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/start")
                 elif parts[2] == "stop" and running:
-                    log(f"stop {name} (vm {vmid}): asking the guest to shut down")
-                    pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/shutdown")
+                    log(f"stop {name} (vm {vmid}): {ask_to_shut_down(vmid)}")
                     # The guest is still "running" to Proxmox for a few seconds
                     # more, and its agent is already gone, so realm_state would
                     # read that as BOOTING. Say what was actually asked for.

@@ -11,7 +11,8 @@ fake = type("fake", (), {"status": "stopped", "agent": False, "rdp": False,
                          "seat": False, "seat_calls": [], "seat_fails": False,
                          "vmstate": None, "suspended": [],
                          "exec_cmd": None, "exec_exit": 0, "exec_fails": False,
-                         "exec_out": "", "exec_cmds": []})
+                         "exec_out": "", "exec_cmds": [], "stops": [],
+                         "agent_shutdown_fails": False})
 
 
 def fake_pve(method, path, **form):
@@ -23,6 +24,14 @@ def fake_pve(method, path, **form):
         if fake.vmstate:
             config["vmstate"] = fake.vmstate
         return config
+    if path.endswith("/agent/shutdown"):
+        if fake.agent_shutdown_fails:
+            raise OSError("QEMU guest agent is not running")
+        fake.stops.append("agent")
+        return {}
+    if path.endswith("/status/shutdown"):
+        fake.stops.append("acpi")
+        return "UPID:pve:task"
     if path.endswith("/status/suspend"):
         fake.suspended.append(form)
         return "UPID:pve:task"
@@ -199,7 +208,10 @@ fake.seat_fails = False
 fake.status, fake.seat, fake.seat_calls = "running", False, []
 code, body = call("/realms/work/seat", method="POST")
 assert code == 200 and body["owner"] == "work", body
-assert fake.seat_calls == [("switch", "work")], fake.seat_calls
+# The keyboard and mouse travel with the seat before anybody has decided
+# anything: a screen with no way to type on it is not a working machine.
+assert fake.seat_calls == [("switch", "work", "1532:02a2", "046d:c52b")], \
+    fake.seat_calls
 assert status_of("/realms/nope/seat", method="POST") == 404
 
 code, body = call("/seat")
@@ -252,7 +264,8 @@ fake.status, fake.seat, fake.vmstate, fake.seat_calls = "stopped", False, "store
 assert status_of("/realms/work/seat", method="POST") == 409
 assert fake.seat_calls == [], "it changed the hardware anyway"
 code, body = call("/realms/work/seat?confirm=1", method="POST")
-assert code == 200 and fake.seat_calls == [("switch", "work")], fake.seat_calls
+assert code == 200 and fake.seat_calls == [("switch", "work", "1532:02a2",
+                                           "046d:c52b")], fake.seat_calls
 fake.vmstate = None
 
 # Nothing running, nothing to save.
@@ -322,12 +335,37 @@ assert absent["1532:02a2"] == {"id": "1532:02a2", "usb": "1532:02a2",
                                "role": "", "kind": "", "present": False}, absent
 assert c.seat_usb() == [], "it offered a device that is not plugged in"
 c.USB_ROOT = usb_root
+# Forgetting the keyboard does not take it off the seat; it only takes back
+# the decision. Refusing it by name is how it is taken off, and the mouse is
+# refused here, which is why it stays out.
 call("/devices/1532%3A02a2?action=forget", method="POST")
-assert c.seat_usb() == [], c.seat_usb()
+assert c.seat_usb() == ["1532:02a2"], c.seat_usb()
+call("/devices/1532%3A02a2?action=never", method="POST")
+assert c.seat_usb() == [], "a refusal must beat the default"
+call("/devices/1532%3A02a2?action=forget", method="POST")
+call("/devices/046d%3Ac52b%3AA17F9C?action=forget", method="POST")
 
-fake.status = "running"
+# The bug Max hit: he plugged in a gamepad, approved it, refused the headset,
+# and lost the keyboard and mouse with them. A list built only from approvals
+# replaced the two devices nobody had ever been asked about.
+call("/devices/0b0e%3A0309?action=seat", method="POST")
+assert c.seat_usb() == ["1532:02a2", "046d:c52b", "0b0e:0309"], c.seat_usb()
+call("/devices/0b0e%3A0309?action=forget", method="POST")
+
+# A stop goes through the guest agent. The ACPI button is swallowed by GNOME,
+# which holds a block inhibitor on the power key, and Proxmox then waits until
+# it gives up with "VM quit/powerdown failed - got timeout".
+fake.status, fake.stops = "running", []
 code, body = call("/realms/work/stop", method="POST")
 assert body["power"] == "STOPPING", body   # not BOOTING: the agent is already gone
+assert fake.stops == ["agent"], fake.stops
+
+# A Realm whose agent is missing still gets the button: a stop that does
+# nothing at all is worse than a slow one.
+fake.stops, fake.agent_shutdown_fails = [], True
+call("/realms/work/stop", method="POST")
+assert fake.stops == ["acpi"], fake.stops
+fake.agent_shutdown_fails = False
 
 srv.shutdown()
 print("PASS")

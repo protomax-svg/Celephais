@@ -108,6 +108,19 @@ def opener():
     return urllib.request.build_opener()
 
 
+def _core_error(code, body):
+    """Core's own sentence if it sent one, else whatever came back.
+
+    The overlay prints this straight on the screen, where a line of JSON is
+    noise in the middle of a sentence.
+    """
+    try:
+        said = json.loads(body)
+    except ValueError:
+        said = {}
+    return said.get("error") or f"core said {code}: {body}"
+
+
 def core(path, method="GET", allow=()):
     """One call to Core. Codes in `allow` come back as data instead of dying:
     Core answers 409 when it wants to be told twice, and that is a question,
@@ -126,7 +139,7 @@ def core(path, method="GET", allow=()):
                 return json.loads(body)
             except ValueError:
                 pass
-        raise SystemExit(f"gate: core said {exc.code}: {body}")
+        raise SystemExit(f"gate: {_core_error(exc.code, body)}")
     except OSError as exc:
         raise SystemExit(f"gate: cannot reach Core at {cfg('CORE_URL')}: {exc}")
 

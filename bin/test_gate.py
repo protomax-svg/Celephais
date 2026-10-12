@@ -108,6 +108,14 @@ with tempfile.TemporaryDirectory() as tmp:
     assert gate.stored_password() == "open sesame", gate.stored_password()
 gate.KEY_FILE = None
 
+# Core's refusals land on the overlay as a sentence, not as a line of JSON.
+# Max pressed park while work held the seat and read
+# `core said 409: {"error": "local seat: ..."}` across the screen.
+assert gate._core_error(409, '{"error": "it holds the Local Seat"}') \
+    == "it holds the Local Seat"
+assert gate._core_error(500, "upstream died") == "core said 500: upstream died"
+assert gate._core_error(500, "{}") == "core said 500: {}"
+
 # Every recipe must name a manager that could exist and a command to run.
 for tool, script in gate.PACKAGERS:
     assert script.startswith(tool), f"{tool} recipe does not run {tool}: {script}"

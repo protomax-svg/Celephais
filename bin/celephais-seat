@@ -69,9 +69,21 @@ attach_seat() {
   for i in "${!usb[@]}";      do qm set "$vmid" "-usb$i"     "host=${usb[$i]}"; done
 }
 
+# Not the ACPI power button first: GNOME takes a block inhibitor on the power
+# key, so logind never sees the press and `qm shutdown` waits for a guest that
+# was never asked. The agent runs the shutdown inside, with no desktop in the
+# way. A Realm without a working agent still gets the button.
 stop_realm() {
+  local i
   [ "$(vm_status "$1")" = running ] || return 0
-  qm shutdown "$1" --timeout "$SHUTDOWN_TIMEOUT" || true
+  if qm guest cmd "$1" shutdown >/dev/null 2>&1; then
+    for i in $(seq "$SHUTDOWN_TIMEOUT"); do
+      [ "$(vm_status "$1")" = stopped ] && break
+      sleep 1
+    done
+  else
+    qm shutdown "$1" --timeout "$SHUTDOWN_TIMEOUT" || true
+  fi
   [ "$(vm_status "$1")" = stopped ] || die "VM $1 did not stop in ${SHUTDOWN_TIMEOUT}s. Stop it by hand."
 }
 
