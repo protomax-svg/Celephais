@@ -18,10 +18,20 @@
 # lent to it, so wiping the container never touches the data.
 set -euo pipefail
 
+# pct is a perl program and the host's locale is half German, which buries the
+# real output under a page of warnings. Nothing here reads translated text.
+export LC_ALL=C LANG=C
+
 CTID=${CTID:-210}
 CT_IP=${CT_IP:-192.168.2.120/24}
 CT_GW=${CT_GW:-192.168.2.1}
 BRIDGE=${BRIDGE:-vmbr0}
+# The host resolves names through Tailscale (100.100.100.100). A fresh
+# container is not on the tailnet yet, so inheriting that leaves it unable to
+# look up anything at all, and the first apt-get dies. It gets the router
+# instead, with a public resolver behind it in case the router does not serve
+# DNS.
+NAMESERVER=${NAMESERVER:-${CT_GW%%/*} 1.1.1.1}
 TEMPLATE=${TEMPLATE:-local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst}
 ROOTFS=${ROOTFS:-realms-ssd:8}
 SHARE=${SHARE:-/mnt/hdd/cloud}
@@ -62,6 +72,7 @@ pct create "$CTID" "$TEMPLATE" \
   --cores "$CORES" --memory "$MEMORY" --swap 512 \
   --rootfs "$ROOTFS" \
   --net0 "name=eth0,bridge=$BRIDGE,ip=$CT_IP,gw=$CT_GW,firewall=1" \
+  --nameserver "$NAMESERVER" \
   --mp0 "$SHARE,mp=/srv/cloud" \
   --unprivileged 1 --features nesting=1 \
   --onboot 1 --start 0 >/dev/null
