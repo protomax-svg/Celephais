@@ -12,6 +12,18 @@ SEAT_USB=(1532:02a2 046d:c52b)         # Razer Ornata V3 X, Logitech Unifying
 
 declare -A REALMS=( [work]=201 [personal]=202 [windows]=100 )
 
+# The display a Linux Realm needs when it has no GPU of its own, and must not
+# have while it has the RTX. A Realm's remote desktop lives inside its GNOME
+# session, and GDM's autologin only starts that session on a display. With
+# the RTX the display is the RTX. Without it, `work` was left with vga: none -
+# no /dev/dri at all - so GDM logged nobody in, the remote desktop never
+# started, and a headless start sat at BOOTING for ever with port 3389 shut.
+# Every boot it had been reached remotely in, it had held the seat. A virtual
+# display while it holds the RTX is the other mistake: GNOME puts the top bar
+# on the screen nobody looks at. So it follows the seat. Windows is not
+# listed and is never touched.
+declare -A HEADLESS_VGA=( [work]=std [personal]=std )
+
 SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-120}
 
 die() { echo "celephais-seat: $*" >&2; exit 1; }
@@ -50,10 +62,29 @@ wake_and_stop() {
   stop_realm "$vmid"
 }
 
+realm_of() {
+  local name
+  for name in "${!REALMS[@]}"; do [ "${REALMS[$name]}" = "$1" ] && echo "$name"; done
+  return 0
+}
+
+# seated: no display of its own. headless: the virtual one. See HEADLESS_VGA.
+set_display() {
+  local name vga
+  name=$(realm_of "$1")
+  [ -n "$name" ] || return 0
+  vga=${HEADLESS_VGA[$name]:-}
+  [ -n "$vga" ] || return 0
+  if [ "$2" = seated ]; then qm set "$1" -vga none; else qm set "$1" -vga "$vga"; fi
+}
+
 # Drop every passthrough key the VM actually has. VM must be stopped.
 detach_seat() {
   local keys
   refuse_if_parked "$1"
+  # Before the early return below: a Realm with no passthrough left can still
+  # be the one with no display, which is exactly how `work` was found.
+  set_display "$1" headless
   keys=$(qm config "$1" | grep -oE '^(hostpci|usb)[0-9]+' | paste -sd, - || true)
   [ -n "$keys" ] || return 0
   qm set "$1" -delete "$keys"
@@ -65,6 +96,7 @@ attach_seat() {
   local usb=("$@")
   [ ${#usb[@]} -gt 0 ] || usb=("${SEAT_USB[@]}")
   refuse_if_parked "$vmid"
+  set_display "$vmid" seated
   for i in "${!SEAT_PCI[@]}"; do qm set "$vmid" "-hostpci$i" "${SEAT_PCI[$i]},pcie=1"; done
   for i in "${!usb[@]}";      do qm set "$vmid" "-usb$i"     "host=${usb[$i]}"; done
 }
