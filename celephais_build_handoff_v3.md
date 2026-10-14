@@ -1095,3 +1095,878 @@ git clone <this repo>; cd Cloud_infrastructure
 
 Then copy `Gate.exe` and a `celephais.vault` into one folder and double-click
 it: no arguments means the overlay.
+
+## The subprocesses are silent — `bin/celephais_net.py` (2026-10-13)
+
+Max ran `Gate.exe`, the overlay covered every monitor, and Tailscale's own
+command line and output were legible on top of it. An auth key is on that
+command line. This was three bugs wearing one coat.
+
+### 1. The exe had a console and the overlay did not cover it
+`make-gate.ps1` built a single console exe, on the reasoning that the overlay
+is topmost and would hide it. It does not: a console the Gate still owns keeps
+drawing, and what tailscaled writes into it shows through. The Windows build
+is now two executables out of the same script:
+
+```text
+Gate.exe              windowed (--noconsole). The double-click. No console
+                      exists, so nothing can be written to one.
+celephais-gate.exe    console. The command line, where output is the point.
+```
+
+`build/make-gate-wine.sh` builds the same pair. The Linux build is unchanged:
+there is no console to inherit there.
+
+### 2. The children were launched as if a terminal were watching
+Every `tailscaled` and `tailscale` now goes through `_quiet()`: `shell=False`
+so no argument is ever handed to a command interpreter, `stdin=DEVNULL` so
+nothing waits for an answer nobody will type, output on a pipe rather than
+inherited, and on Windows `CREATE_NO_WINDOW` plus `STARTUPINFO`/`SW_HIDE` so
+no console window is created either — a windowed build without those flags
+flashes one console per child across the screen, which is the same bug seen
+from the other side.
+
+`tailscaled`'s stderr is a pipe now, so something has to read it: a pipe
+nobody drains holds about 64K and then the daemon blocks on its own logging.
+`_Tail` reads it in a thread, redacts it and keeps the last ten lines, saying
+nothing until the daemon dies — then those lines are its explanation.
+
+### 3. The error messages were the subprocess's, not the Gate's
+`NetError` carried `result.stderr` verbatim, and the overlay rendered it.
+Tailscale, like most Go programs, quotes the command line back when it is
+unhappy, so the key came with it. Now:
+
+- `redact()` takes out `tskey-...` and anything after `--auth-key=` /
+  `--client-secret=`. It runs on everything coming back from either binary.
+- `_explain()` picks one sentence of the Gate's own, chosen by what Tailscale
+  said but never quoting it — "the Tailscale key was refused. It may have
+  expired or been revoked." and so on, with a plain fallback.
+- `_note()` is the one way any of that output reaches a terminal, and only
+  after something has failed. The overlay sets `SHOW_DETAIL = False`, because
+  behind a fullscreen screen there is no terminal to read it in.
+- `subprocess.TimeoutExpired` from `tailscale up` is caught and replaced:
+  its own message prints the whole command it was given, key and all.
+- `celephais_ui.reason()` is the last stop before any failure becomes text on
+  the screen, and it redacts too. The hooks reach down to Core, Tailscale and
+  an RDP client; one of them quoting a command line back should not be able to
+  put a key on the monitors no matter which one it is.
+
+Covered by `bin/test_forward.py`: the redaction, the sentences, the launch
+flags, and a whole `tailnet()` run against a fake `tailscale up` that fails by
+printing its own command line — the key must not be anywhere in what comes
+out. `bin/test_ui.py` checks the overlay's own last stop.
+
+## The seat carried a gamepad and left the keyboard — `bin/celephais_core.py` (2026-10-13)
+
+Max: "don't forget to move not only GPU with monitors but host=1532:02a2 and
+host=046d:c52b too." Core was written to do exactly that, and against the live
+host it would not have.
+
+`GET /devices` on pve answers with two devices: the Intel wireless card,
+refused, and an Xbox controller, approved for the seat. The Razer keyboard and
+the Logitech receiver are not in that list at all, because right now they are
+enumerated on `acnit1` — they hang off a USB switch and the switch points at
+the desktop. `seat_usb()` built its answer by walking the host's own USB tree,
+so the two defaults were filtered out for not being there, while the one
+approved device that happened to be plugged in came through on its own. Core
+would have handed `celephais-seat` a single argument, `045e:028e`, and the
+switcher falls back to its own `SEAT_USB` only when it is given nothing at all.
+The Realm would have come up holding the RTX, both monitors and a gamepad, with
+no keyboard or mouse to tell it anything.
+
+The switch pointing the other way is not an edge case. It is the normal state
+at the moment the seat is asked for, because that is where Max is sitting when
+he asks. So the two defaults now travel whether or not Core can see them:
+
+- `SEAT_DEFAULT_USB` goes in first and unconditionally, minus anything refused
+  by name;
+- an approved extra still has to be plugged in to come along — nothing is lost
+  by waiting for a gamepad to arrive;
+- a refusal is matched on the VID:PID that would go into the VM config, not on
+  the registry key, because the key carries a serial number when the maker
+  wrote one and a default never does.
+
+`host=vid:pid` in a VM config is a standing claim and not a snapshot: QEMU
+attaches the device when it appears, which is the mechanism behind the USB
+switch toggle recorded under "USB hotplug observations" above. Writing the
+claim for a device nobody can see costs nothing, and it is what makes the
+toggle work.
+
+`bin/test_core.py` covers it. Nothing plugged in and nothing decided: the seat
+claims both defaults. The mouse refused by name: it claims the keyboard alone.
+A refusal still beats the default.
+
+**Not live until it is deployed.** Core on pve runs
+`/opt/celephais/celephais_core.py`; the file has to be replaced and
+`celephais-core.service` restarted.
+
+## A permanent Gate on the Omarchy desktop — `deploy/install-gate.sh` (2026-10-13)
+
+The Gate was built for a USB stick carried to a strange machine. Max wants it
+as an ordinary application on `acnit1`, the Omarchy desktop, asked for the
+vault password once and never again, so every Realm can be started from there.
+`deploy/install-gate.sh --no-password` was already most of that. Four things
+were in the way.
+
+### 1. The built Linux Gate has no tkinter in it
+`build/dist/celephais-gate --ui` dies with `ModuleNotFoundError: No module
+named 'tkinter'`. Arch does not install `tk` with python, so `import tkinter`
+raises `libtk8.6.so: cannot open shared object file` on this machine —
+PyInstaller saw the same failure at build time, quietly left the module out,
+and produced a 35 MB binary whose only interesting mode cannot start. The
+command line still worked, which is why it went unnoticed. `pacman -S tk`, then
+rebuild; there is nothing to fix in the spec.
+
+### 2. The build virtualenv cannot live in the repository
+This checkout is on the CIFS share, and `python3 -m venv build/.venv` there
+fails with `[Errno 95] Operation not supported: 'lib' -> '.../lib64'`: the
+share will not take the symlink. `build/make-gate.sh` now puts the virtualenv
+in `$XDG_CACHE_HOME/celephais/venv`, overridable with `CELEPHAIS_VENV`, which
+is local on every machine. That also explains the missing `build/.venv` that
+`install-gate.sh` went looking for.
+
+### 3. "That password does not open the vault" was a lie
+`install-gate.sh --no-password` checks the password against the vault before
+keeping it, so a typo is caught at install time rather than at the next login
+with no screen to report on. The check ran under whatever python it found, and
+a bare Arch python3 cannot import `cryptography`, so a perfectly good password
+came back as wrong. It now picks the first interpreter that can actually open
+the vault and, finding none, says so.
+
+### 4. The Gate brought up a second tailnet on a machine already on the tailnet
+`acnit1` runs tailscaled and reaches Core at `100.112.229.100:8080` directly.
+The overlay path ignored `--no-tailnet` — only the command line honoured it —
+so unlocking the vault started a userspace tailscaled of its own and registered
+a duplicate node. `ui_session(no_tailnet=True)` skips it, `install-gate.sh
+--no-tailnet` writes the flag into the `.desktop` entry, and the Gate uses the
+network the machine already has.
+
+### The vault does not live on the share either
+`/mnt/cloud` is a CIFS automount with a ten-minute idle timeout. An application
+whose vault sits there stops working the first time the share is asleep at
+login, so the installed Gate is pointed at `~/.config/celephais/celephais.vault`
+through `CELEPHAIS_VAULT`.
+
+### Install it
+```bash
+sudo pacman -S --needed tk freerdp        # tkinter for the overlay, FreeRDP to connect
+bash build/make-gate.sh                   # -> build/dist/celephais-gate, tkinter inside
+bash deploy/install-gate.sh --no-password --no-tailnet
+```
+The password is asked once, checked against the vault and kept in
+`~/.config/celephais/key`, mode 600. Add `--autostart` to open it at login.
+
+### Left to see on the machine itself
+Whether the one-window-per-monitor overlay lands correctly under Hyprland. A
+Wayland client cannot place its own windows, and Hyprland puts new XWayland
+windows on the active workspace, so both fullscreen windows may end up on the
+same monitor with the second screen untouched. `screens()` already has the
+fallback — returning no rectangles gives one window for the window manager to
+fullscreen where it is — and the compositor can be detected if that is what the
+real behaviour calls for. Not changed on a guess.
+
+## Windows answered the open question: no private tailnet without administrator rights — `bin/celephais-gate` (2026-10-14)
+
+Max, from the Legion laptop: "can't even log in on windows", with a photograph
+of the key screen. Under the password box, eight lines of tailscaled's own log,
+ending:
+
+```text
+safesocket.Listen: namedpipe.Listen: open \\.\pipe\celephais-22740: Access is denied.
+```
+
+That settles what "Left to find out on the machine itself" asked under the
+2026-10-09 Windows build notes. `tailscaled --tun=userspace-networking` does
+**not** run on Windows under a plain account. Userspace mode does away with the
+TUN driver, which was the hoped-for reason admin would not be needed, but the
+daemon still creates its control pipe with a security descriptor a process
+without administrator rights may not apply, and Windows refuses it.
+`--windows-mode=dev` buys the right to name a pipe of our own; it does not
+change who is allowed to own one.
+
+### The Gate was building a network it did not need
+The laptop has Tailscale installed and is a node on the tailnet. Core was
+reachable from it the whole time. The Gate never asked: it brought up its
+private tailnet on every unlock because the vault had a key in it, and died
+when that failed, holding Max at his own key screen with a working route to
+Core sitting right there.
+
+`core_reachable()` now runs first, on both paths. Core listens on nothing but
+the Proxmox host's Tailscale address, so an answer from it is proof this
+machine is already on the tailnet, and the Gate goes straight on. A four second
+timeout, because on a machine that really is a stranger this has to fail fast
+and get out of the way; a 401 counts as an answer, since a token Core dislikes
+is not a reason to build a network, and `core()` will say what is wrong with it.
+The private tailnet is still what makes the USB stick work on a borrowed
+laptop — it is just no longer the only way in.
+
+When it is needed and still cannot start, `_HINTS` now has a sentence for the
+refused pipe: *Tailscale cannot start here without administrator rights.
+Install Tailscale on this machine, or start the Gate as administrator.* It
+names what will work, which is all the Gate can usefully say about a right it
+does not have.
+
+### The wall of log text on the screen is already fixed
+The photograph is of the 2026-10-12 exe, which still raised
+`NetError(f"tailscaled exited: {tail.text()}")`. Yesterday's work replaced that
+with `_explain()` and `_Tail`. Nothing more to do there except build a new
+`Gate.exe`: wine is not installed on acnit1 yet, `pacman -Q wine` finds
+nothing, so `build/make-gate-wine.sh` has never run and `build/dist-win/Gate.exe`
+is still the old one.
+
+### Until that exe exists
+Right-click `Gate.exe` → Run as administrator. The pipe is then created by an
+account allowed to own it, and the old build gets through its own unlock.
+
+Covered by `bin/test_gate.py`: Core answering 200 or 401 is reachable and a
+dead port is not; the overlay's unlock builds no tailnet when Core answers and
+still builds one when it does not. `bin/test_forward.py` checks that the
+refused pipe produces the administrator sentence and that neither the pipe name
+nor the rest of the daemon's output travels with it.
+
+## The Windows build has never actually run — `build/make-gate-wine.sh` (2026-10-14)
+
+Max hit the login failure again, from the stick this time, and plugged it in
+here. The stick's `Gate.exe` is dated 2026-10-12 00:58 — older than the one in
+`build/dist-win`, and older than every fix since: no redaction, no
+windowed/console split, no `core_reachable()`. Its Linux neighbour was the
+35 MB build with no tkinter in it. The vault on the stick is byte-identical to
+the repo's, so nothing had drifted there.
+
+So the wine build was finally tried, and it had never worked. wine creates the
+prefix directory itself but not the path above it: with
+`~/.local/share/wineprefixes` missing, every call died with `wine: chdir to
+.../celephais-build : No such file or directory`. The script sent `wineboot`'s
+output to `/dev/null`, and the Python installer line runs under `set -e`, so
+the script died right there without ever reaching its own "python.exe did not
+appear" message. The build log held exactly one line. Two changes: `mkdir -p
+"$(dirname "$WINEPREFIX")"`, and `wineboot.log` and `python-install.log` are
+kept in `build/win-tools` instead of discarded, because a silent install that
+does nothing looks exactly like one that worked.
+
+### Verified rather than assumed
+`celephais-gate.exe` — the console half of the pair — run under wine on acnit1
+against the live Core:
+
+```text
+no Tailscale credential in reach:
+  work       vm 201   READY     seat  192.168.2.114
+  personal   vm 202   OFF
+  windows    vm 100   OFF
+
+with a credential present:
+    tailnet: not needed, this machine is on it already
+  work       vm 201   READY     seat  192.168.2.114
+```
+
+The second run is the photograph's failure, short-circuited: the probe answers
+before tailscaled is ever launched, so the named pipe is never asked for. (The
+credential in that test is a fake, which is safe precisely because the probe
+returns first and nothing ever uses it.)
+
+Note that a Windows Gate reads only what the vault gives it. The repo `.env`
+has an empty `TS_AUTHKEY` and an empty `TS_AUTH_CLIENT_SECRET` — only the OAuth
+client *id* and the tags are set there — so the first run above took the
+no-credential path by accident rather than by arrangement.
+
+### On the stick now
+`Gate.exe` and `celephais-gate.exe` from today's build, the 45 MB Linux binary
+with tkinter in it, the unchanged vault, and the README that explains the two
+executables. All three binaries checksum-matched after the copy.
+
+## Waiting for a pipe that was already there — `bin/celephais_net.py` (2026-10-14)
+
+The new exe got further and stopped differently: *"the Gate's private network
+did not start in time."* That sentence comes from one place, the wait for
+tailscaled's control socket, and it is only reached while the daemon is still
+alive — `daemon.poll()` returns None every time round the loop. So tailscaled
+ran for the full sixty seconds and the Gate never saw it come up.
+
+The wait was `os.path.exists(sock)`. On Windows that socket is a named pipe,
+`\\.\pipe\celephais-<pid>`, and a name under `\\.\pipe\` is not a file
+`os.stat` can be asked about. Most likely the pipe was there within a second
+and the Gate watched an unanswerable question for a minute.
+
+`_control_ready()` asks the question that has the same answer on both systems:
+does anything accept there. `open()` on Windows, `connect()` on POSIX. Access
+denied is reported as *ready* on purpose — the pipe exists and this account may
+not open it, which is a different failure, and the CLI that runs next gives it
+a sentence of its own instead of this timing out again. On POSIX it also closes
+a real race that nobody had hit yet: the socket file appears before anything
+listens on it, and the CLI call that came next could land in the gap.
+
+Two more, found while reading that function:
+
+- The `BackendState == "Running"` wait reused `deadline` from the socket wait,
+  and `tailscale up` between them is allowed to spend that whole budget. If it
+  did, the loop ran zero iterations and a network that had not come up was
+  reported as one that timed out. It has its own deadline now.
+- `core_reachable()` waits eight seconds instead of four. A Tailscale that has
+  been idle can need several seconds to put a route together, and four was
+  tight enough to send a laptop that could reach Core off to build a second
+  network — which is how this code path was reached at all. A machine with no
+  Tailscale has no route to a 100.x address and is refused at once, so the
+  longer wait costs it nothing.
+
+`bin/test_forward.py` covers `_control_ready` on both branches: a socket with
+no listener is not ready and the same socket listening is, which is exactly the
+POSIX race; and on the Windows branch, missing is not ready while busy (231)
+and access-denied are. Its end-to-end fake daemon now listens on the control
+socket for real instead of touching the file — the honest fake, and the test
+went from two sixty-second timeouts to 0.13s.
+
+### wine cannot check this one
+Running the fresh `celephais-gate.exe` under wine against a dead Core forces
+the tailnet path, and the bundled daemon dies in six seconds:
+
+```text
+TPM: error opening: TBS Error 0x8028400F: A compatible Trusted Platform
+Module (TPM) Security Device cannot be found on this computer.
+```
+
+wine has no TPM; Max's Windows 11 machine does, and its log read "TPM:
+successfully read all properties". So wine builds the exe and proves the Core
+path, but the tailnet path can only be tested on the machine itself.
+
+## The daemon was refused, and said so to nobody — `bin/celephais_net.py` (2026-10-14)
+
+Same sentence again from the rebuilt exe: *"the Gate's private network did not
+start in time."* The readiness fix was right and it changed nothing, because
+the answer it now gives correctly is "nothing accepts there" — tailscaled is
+refused its control socket, carries on running anyway, and never opens one.
+The whole minute of waiting is spent on a daemon that has already failed.
+
+It had said so, in the first second, into `_Tail`. The timeout branch threw
+that away and reported the clock instead: the diagnosis was sitting in memory
+for sixty seconds while the Gate blamed time. Now the wait reads what the
+daemon has said on every pass, and a refusal of its own control socket ends it
+there and then with the sentence that names the ways through. The timeout
+branch, when it is genuinely a timeout, explains itself with whatever was said
+rather than only naming the symptom.
+
+### The hint added this morning was too broad
+`("access is denied", ...)` had to go. tailscaled says `syspolicy: GP lock not
+acquired (Access denied.); reading policy settings without it` as a matter of
+routine — it is in the photograph, and in every run under wine — and it has
+nothing to do with the pipe. That matters much more now that the list is
+consulted *while the daemon is still running*: a false positive there kills a
+network that was about to come up. So the needles are split.
+
+`_FATAL` holds only what nothing can recover from, which today means the
+refusal of the control socket itself: `namedpipe.listen`, `safesocket.listen`.
+`_HINTS` keeps those and adds the rest, and is used only to explain a daemon
+that has already died or a `tailscale up` that has already failed. `dial tcp
+... i/o timeout` is the other line that must never count as fatal: tailscaled
+says it on the way to a network that works.
+
+`_Tail.snapshot()` reads the lines without joining the reader thread. `text()`
+waits two seconds for it to finish, which is right when the child is gone and
+two seconds of nothing on every pass of a loop when it is not.
+
+### What this does and does not fix
+It does not get a plain Windows account onto the tailnet. Nothing in the Gate
+can: the pipe tailscaled asks for belongs to the Administrators group and
+Windows will not hand it over. What it does is replace a minute of silence
+followed by a misleading sentence with one accurate sentence, straight away.
+
+The two ways through a Windows machine remain what they were — be on the
+tailnet already, or run with administrator rights — so the stick now carries
+`Gate-admin.bat`, which is Gate.exe started through `Start-Process -Verb
+RunAs`. `deploy/stick-README.txt` says when to reach for it and that a machine
+already on the tailnet never needs it.
+
+Covered in `bin/test_forward.py`: the routine lines are not fatal and the
+refusal is; and a fake daemon that stays up, never listens and logs the
+refusal gets the administrator sentence in under ten seconds instead of
+waiting out `READY_TIMEOUT`.
+
+## The remote desktop on one screen — `bin/celephais-gate`, `bin/celephais_ui.py` (2026-10-14)
+
+Asked for: a way to keep the Realm's desktop on a single monitor, and it must
+not break on a machine that only has one.
+
+Both of those are answered by the same decision — the option is the *absence*
+of `/multimon`, not a monitor named by number. FreeRDP then fills the screen
+it opens on, which cannot be wrong on a laptop on its own, on this desk with
+three, or on an arrangement nobody anticipated. `/monitors:1` would have had to
+be checked against what is actually plugged in first, and would fail on the
+laptop, which is exactly the thing that was asked not to happen.
+
+Three ways to ask for it, and they agree:
+
+```text
+celephais-gate work --one-monitor      the command line
+ONE_MONITOR=1                          in the vault: the default on a machine
+remote desktop: one monitor            the overlay's own switch
+```
+
+The switch sits under the realm list, is mirrored on every screen like every
+other control, and only changes the text on itself: nothing is reread and
+nothing is sent, so a Realm that is already open is not disturbed. Its starting
+position comes from the vault through a `prefer_one_monitor` hook, asked once
+the vault is open. `flag()` reads the setting the way a person writes one -
+"1", "true", "yes", "on" all mean yes, an empty value does not.
+
+### The overlay was landing wrong on Hyprland, and now it is known
+`bin/test_ui.py` could not run on acnit1 until today - there was no tkinter on
+this machine - and the first run answered the question left open when the Gate
+was installed here:
+
+```text
+window not fullscreen: [(False, '626x335+4482+740'), (True, '2560x1440+2560+0')]
+```
+
+One window floating at 626x335 on the laptop screen, one fullscreen on the
+second monitor, the third untouched. A Wayland client may not place its own
+windows and Hyprland puts each new XWayland window on the active workspace, so
+one window per monitor cannot work there. `screens()` now returns nothing under
+Wayland, which is already the signal for "ask for one window and let the window
+manager fullscreen it where it is" - the fallback was written for a host that
+would not name its monitors, and this is one. The per-monitor assertions in the
+test only apply where the platform does name them.
+
+Still noisy, not chased: three `overlay: bad window path name` lines during the
+test run. A `realms` worker that returns after its screen has been replaced
+builds labels into a frame that no longer exists; the drain catches it, says so
+on a stderr the windowed build does not have, and carries on. Harmless, and
+`refresh()` could check `winfo_exists()` before it builds.
+
+## The client that could not read the monitors, and the line that hid it — `bin/celephais-gate` (2026-10-14)
+`personal` would not open from the overlay on acnit1. What the overlay said:
+
+```text
+[set_termianl_nonblock]: tcsetattr(TCSANOW) failed with Inappropriate ioctl for device
+```
+
+Which is FreeRDP's typo, not ours, and says nothing. It is written *last*, while
+the client puts back a terminal it was never given - the Gate feeds the Realm
+password down its stdin, so there is no terminal there to put back - and
+`_last_error()` reported the last `[ERROR]` line in the log. For a password fed
+on stdin that is always this one. Every failure of every kind has been reading
+the same sentence.
+
+The real reason was six lines above it:
+
+```text
+[freerdp_settings_client_monitors_check_primary_and_origin]: Monitor configuration virtual desktop width must be 200 <= 160 <= 32766
+[log_monitor]: [0] [primary] {0x0-80x80} [3] {80x80, desktopScale: 125}
+[log_monitor]: [1] [       ] {-80x0-80x80} [4] {80x80, desktopScale: 125}
+[freerdp_connect_begin]: ERRCONNECT_PRE_CONNECT_FAILED [0x00020001]
+```
+
+### sdl-freerdp3 cannot use this desktop
+FreeRDP 3.31.1's SDL client reads every monitor on this Hyprland session as
+80x80, builds a 160x80 virtual desktop out of them, and then refuses its own
+layout as too small. It is not `/multimon`: the same thing happens with one
+screen asked for, and with `SDL_VIDEODRIVER=x11` it reads them as 0x0 instead.
+The client's own enumeration is right - `sdl-freerdp3 /list:monitor` prints
+2048x1152 and 2560x1440 - so nothing can be checked in advance; only running it
+shows this. `xfreerdp3`, two names further down the same list, passes
+pre-connect on the same machine with the same arguments.
+
+```text
+sdl_f_multimon: PRECONNECT FAIL | Update size to 160x80
+sdl_multimon:   PRECONNECT FAIL | Update size to 160x80
+sdl_f:          PRECONNECT FAIL | Update size to 80x80
+x11_f_multimon: preconnect ok
+x11_f:          preconnect ok
+```
+
+So the Gate no longer picks one client and lives with it. `rdp_clients()`
+returns every client on the machine in preference order, and `connect()` walks
+the list - but only while a client failed *before it had reached the Realm at
+all*, which is `ERRCONNECT_PRE_CONNECT_FAILED` or a monitor configuration it
+would not accept. A refused password or a Realm that is not listening is the
+same answer from every client on the machine, and trying them all would only
+ask the Realm to refuse three times. On the overlay it reads:
+
+```text
+say: sdl-freerdp3 cannot use this machine's monitors; trying xfreerdp3
+```
+
+### What the one line says now
+`_last_error()` takes the *first* real error, not the last: FreeRDP names the
+cause and then follows it with the consequences, the advice, and finally the
+terminal. `_NOISE` drops the advice lines, the monitor dump and the terminal
+one. Two codes are said in words - `ERRCONNECT_CONNECT_FAILED` and
+`ERRCONNECT_PRE_CONNECT_FAILED`. `ERRCONNECT_LOGON_FAILURE` is deliberately
+left as FreeRDP writes it: the overlay reads the word "logon" in it and asks
+for the password again, which is better than any sentence here.
+
+And when one line is not enough, the whole log is kept in
+`~/.cache/celephais/rdp-<realm>.log` on any failure. From the overlay there is
+no terminal for it to land in; from the command line it is now written back out
+after the client exits, so nothing is swallowed there either. A client given no
+password still keeps the terminal to itself - its prompt is the terminal's -
+and is then also the only client tried.
+
+### The second wall: the exit node holds the LAN
+With the client sorted, `xfreerdp3` got as far as the Realm and found nothing
+there. acnit1 is at 192.168.2.102 on the same wire as pve at 192.168.2.103, and
+nothing on that subnet answers:
+
+```text
+ip route get 192.168.2.115   ->  dev tailscale0 table 52
+192.168.2.115 3389  TimeoutError      192.168.2.103 22  TimeoutError
+ping -I enp43s0 192.168.2.115  ->  1 received, 1.366 ms
+tailscale debug prefs: "ExitNodeID": "nAbHviE6N521CNTRL",
+                       "ExitNodeAllowLANAccess": false,
+```
+
+An exit node is in use (`hostadmin`), and without `ExitNodeAllowLANAccess` it
+captures the machine's own LAN along with everything else. Core answers because
+it is addressed by its tailnet name, 100.112.229.100; the Realms are addressed
+by the LAN addresses Core reports, and those go into the tunnel and out in
+another country. Forced out of the wire with `-I enp43s0` the Realm answers in
+a millisecond. The fix is one command on the machine, and it is Max's to run:
+
+```bash
+sudo tailscale set --exit-node-allow-lan-access=true
+```
+
+The Gate does not try to detect this - a routing table, a local address and a
+Tailscale preference to read, on three platforms, for one hint - but it now
+says what it saw, which is enough to find it:
+
+```text
+why: nothing answered on port 3389: the Realm is up, but this machine cannot
+     reach its network
+```
+
+### Verified
+All six tests pass. `bin/test_gate.py` covers the noise filter against the real
+log, the two plain sentences, the word "logon" surviving, `_client_cannot_cope`
+telling a bad client from a refused password, and the walk down the client list
+stopping after the first client when the Realm itself said no. The walk was
+also run for real against 127.0.0.1 and against `personal` at 192.168.2.115:
+sdl-freerdp3 refused, xfreerdp3 was tried, the log was kept, and the sentence
+above came back. Rebuilt and reinstalled: `~/.local/bin/celephais-gate` and the
+stick's Linux binary are both `ae9c74fa` now.
+
+Not verified: that `personal` actually opens. That needs the exit node command
+above, and it is a session on Max's own screens.
+
+## The Gate was being sent to an address only the house can reach — `bin/celephais_core.py` (2026-10-14)
+Max, testing from the Windows laptop: *why don't you use tailscale IP?* He is
+right, and this is the reason the stick has never worked away from home.
+
+`realm_ip()` returned the **first** non-loopback IPv4 the guest agent reported.
+The agent lists the wire first, so `work` came back as 192.168.2.114 - even
+though that same Realm is on the tailnet as `workrealm-1`, 100.99.187.90, and
+answers there from anywhere in the world:
+
+```text
+tailscale status:  100.99.187.90  workrealm-1
+100.99.187.90:3389  open
+```
+
+A Gate on a hotel network cannot reach 192.168.2.114 at all. That is the whole
+point of the tailnet the Gate carries inside itself, and it was being handed an
+address the tunnel cannot deliver. Core now prefers an address in
+100.64.0.0/10 - the range Tailscale hands out, and nothing else in a Realm has
+one - and falls back to the wire for a Realm with no Tailscale of its own.
+Nothing is lost on the LAN: two machines on one wire peer directly, and the
+tailnet address is also the one a Tailscale exit node does not swallow, which
+is the wall acnit1 hit this afternoon.
+
+`bin/test_core.py` now has a `tailnet` flag on the fake agent: with it the
+Realm is dialled at 100.99.187.90 although the agent still lists the LAN
+address first, without it at 192.168.2.50, and `_on_tailnet()` is checked at
+both ends of the range (100.63 and 100.128 are ordinary addresses).
+
+### This has to be deployed, and it only fixes half of it
+Core runs on pve, so nothing changes until it is replaced there:
+
+```bash
+install -m755 bin/celephais_core.py /opt/celephais/celephais_core.py
+systemctl restart celephais-core
+```
+
+And `personal` (202) has no Tailscale inside it - there is no node for it in
+the tailnet at all - so it stays unreachable from outside the house whatever
+Core reports. Two ways out, neither taken yet: install Tailscale in the Realm
+the way `work` has it, or make pve advertise 192.168.2.0/24 as a subnet route.
+No peer advertises any route today, which is also why nothing but the Realms'
+own tailnet addresses can be reached remotely.
+
+### The stick, rewritten (16:37)
+Everything but the vault was replaced and checksum-matched against the build:
+`Gate.exe` `015ef281`, `celephais-gate.exe` `2a93f9b6`, `celephais-gate`
+`fdcdf03d`, plus `Gate-admin.bat` and a `README.txt` that now says where the
+client's log is kept, what "nothing answered on port 3389" means, and that away
+from home only a Realm on the tailnet - today only `work` - can be reached.
+The log goes where each platform keeps such things: `%LOCALAPPDATA%\celephais`
+on Windows, `~/.cache/celephais` on Linux.
+
+A deploy key for pve was made on acnit1 as `~/.ssh/celephais-pve`, so Core can
+be replaced and its journal read from here instead of asking for every command
+to be typed by hand. It is useless until its public half is on pve.
+
+## On the tailnet, and never once in Core's log — `bin/celephais_net.py`, `bin/celephais-gate` (2026-10-14)
+The laptop kept failing "the same way", and for most of the afternoon nobody
+here knew which way that was. pve's journal settled it once there was a key to
+read it with. Requests to Core, by source, since the 12th:
+
+```text
+2026-10-13T15  100.86.155.0    24     <- a Gate on another machine, working
+2026-10-13T16  100.74.208.79    9
+2026-10-14T11..19  100.76.200.49 only  <- acnit1; nothing else all day
+```
+
+Meanwhile the laptop's Gate *had* joined the tailnet - `celephais-gate`,
+`-2`, `-3`, a new address each run, the last one four minutes before the
+journal was read. On the network, and its first request to Core never arrived.
+
+Reproduced on acnit1 by running the Gate's own private tailnet here, and timing
+what came back:
+
+```text
+15.0s  tailnet up                     (BackendState: Running)
+25.5s  first request to Core -> 200   took 10.5 s
+25.5s  every request after it         instant
+       (an earlier run: the first request timed out at 20 s)
+```
+
+"Running" means the node is on the network, not that it has a way to every
+peer. The first packet to a peer waits while tailscaled finds the path, and on
+the same wire as pve that took 10.5 seconds, once over 20. `core()` gives a
+request 20 seconds and the overlay's `unlock` made exactly one. From a laptop on
+somebody else's network the path takes longer than that, so the Gate gave up
+just before it would have worked, every time.
+
+On the 13th it worked, most likely because the path came up in time - that
+build bundled the laptop's own installed tailscaled, today's bundles 1.104.1
+from `make-gate-wine.sh`, and the network was not the same one. Not proven
+which; it does not matter, because nothing should depend on it.
+
+### The fix: wait for the path, in short tries
+`celephais_net.reach(proxy, host, port)` keeps making SOCKS5 CONNECTs of five
+seconds each until one gets through, for up to `TS_REACH_TIMEOUT` (90 s). An
+abandoned try still moves the path along inside tailscaled, and a fresh one
+goes out the moment the path is there instead of sitting out a long TCP
+retransmit. The Gate calls it twice:
+
+- `reach_core()` right after its own tailnet comes up, in the overlay's
+  `unlock` and on the command line, which now prints
+  `finding the way to Core…` and `core: reached in Ns`.
+- in `connect()`, before any RDP client is launched: the Realm is a different
+  peer with a path of its own, and an RDP client gives a connection far less
+  time than that. `finding the way to work…` on the overlay; a Realm that
+  never answers comes back as one sentence naming it and its address.
+
+Neither changes anything on a machine that is on the tailnet already: there is
+no private network then, and nothing to wait for.
+
+### And one that would have bitten next
+`_socks_connect()` set a 10-second timeout for the handshake and left it on the
+socket. That socket is one side of every spliced RDP connection, so a session
+would have been cut the first time the Realm said nothing for ten seconds - a
+still desktop is a quiet one. The timeout now ends with the handshake, and the
+forwarder gives a first connection 30 seconds rather than 10.
+
+### Verified
+`bin/test_forward.py`: a fake SOCKS proxy that leaves CONNECTs hanging for 2.5 s
+is reached in more than one try and well under the deadline, one that never
+answers ends in a `NetError` at its deadline and not after, and the handshake
+timeout is gone from a socket that has finished its handshake. (The test's own
+fake servers are rude on purpose and their leftover threads now complain into
+a filtered `threading.excepthook`; the forwarder's threads still report.)
+`bin/test_gate.py`: an unreachable Realm is said in words and no client is
+launched at it; an unreachable Core is one sentence. All six suites pass.
+
+For real: the command line, made to believe it was a stranger
+(`core_reachable` patched to False), brought up its own tailnet on acnit1,
+found Core and listed the Realms. The Windows exe was rebuilt and its
+`--status` runs under wine; its tailnet path still cannot be tested there.
+
+### Registered, never Running — and now it says why (20:15)
+With AVG off the laptop finally gave a sentence: *the Gate's private network did
+not come up in time.* That is the `BackendState` wait after `tailscale up`.
+`up` returns as soon as the node is registered ("Starting"); "Running" waits for
+a live connection to a relay or a peer. pve's tailscaled logged no
+`magicsock: new contact` from either laptop node, where acnit1's probe at 19:43
+showed `new contact … via=derp` at once. So the laptop's tailscaled reaches the
+control server - it registers, it even reports `nue` as its home relay - and
+never holds a relay connection. Not yet known why. The Oct 13 build that worked
+bundled the laptop's own tailscaled; today's bundles 1.104.1.
+
+Until now the Gate threw away everything Tailscale knew at exactly this point.
+`_diagnosis()` now takes `tailscale status --json` - BackendState, home relay
+and the `Health` warnings - plus tailscaled's last lines, redacted, writes them
+to `tailnet.log` in `log_dir()` (`%LOCALAPPDATA%\celephais` on Windows), says
+them on a terminal, and puts the first health warning after the sentence:
+`… did not come up in time. Tailscale says: <warning>`. Health warnings are
+written for people, so this is the one piece of Tailscale's output that is
+allowed in front of the user. The wait is now `TS_RUNNING_TIMEOUT`, 120 s.
+`log_dir()` is shared with the Gate's RDP log. Covered in `bin/test_forward.py`.
+
+## Windows switched the network off behind every login — `bin/celephais_net.py` (2026-10-14)
+The diagnosis earned its keep on its first run. The console exe on the laptop,
+unelevated, AVG off, printed what tailscaled had been saying all along:
+
+```text
+BackendState: NoState
+home relay: waw
+health: Tailscale is starting. Please wait.
+tailscaled: [RATELIMIT] format("control: doLogin(regen=%v, hasUrl=%v)") (16 dropped)
+tailscaled: control: doLogin(regen=false, hasUrl=false)
+tailscaled: health(warnable=wantrunning-false): error: Tailscale is stopped.
+tailscaled: control: authRoutine: exiting
+tailscaled: control: Client.Shutdown done.
+```
+
+Not a relay that could not be reached. Seventeen logins, each one followed at
+once by "Tailscale is stopped". Windows tailscaled ties the network to whoever
+asked for it, and when the last program talking to it disconnects it sets
+WantRunning false and shuts the control client down. The program that asks is
+`tailscale up`, which exits the moment it is done; every `tailscale status`
+the Gate then polled with logged in again and was dropped again. The node
+registered each time - that is the stream of `celephais-gate-N` nodes on the
+tailnet, each "offline" within a minute - and never once stayed up.
+
+`tailscale up --unattended` is the Windows-only flag that keeps it running
+regardless. `up_argv()` builds the command now, kept apart like
+`daemon_argv()` so `bin/test_forward.py` can check it under a pretend
+`os.name`: `--unattended` on Windows, absent elsewhere (the flag does not exist
+there), the rest identical. Linux has no such rule, which is why nothing on
+acnit1 ever reproduced it. Why the Oct 13 build got through without it is not
+known; it never had the flag either.
+
+Two smaller things from the same photograph:
+
+- The run was **not elevated** (no "Administrator:" in the console's title)
+  and tailscaled still made its pipe. This morning's "Access is denied" may
+  have been AVG's sandbox all along, not Windows. Gate-admin.bat stays as the
+  fallback until a clean unelevated run proves otherwise.
+- The Running wait now checks `daemon.poll()` each pass, so a tailscaled that
+  dies says so at once with its last words instead of being asked for its
+  status for two minutes.
+
+## A headless `work` had nothing to log in on — `bin/celephais-seat` (2026-10-14)
+With the tailnet fixed, the laptop got all the way to Core for the first time
+today - `tailnet: up`, `core: reached in 0s` - and then:
+
+```text
+work: OFF
+work: BOOTING
+gate: work was still BOOTING after 180s
+```
+
+Core was right. Inside the Realm the guest agent and Tailscale were up and
+nothing listened on 3389. `gnome-remote-desktop-headless.service` is wanted by
+`gnome-session.target`, so it only runs inside a GNOME session, and there was
+none: `/dev/dri` did not exist. `work` had `vga: none` and, started headless as
+Core always starts it, no RTX either. GDM, configured to log `workrealm` in
+automatically, said "your system does not have a primary GPU" and logged
+nobody in.
+
+Every boot it had been reached remotely in had the RTX. Boot -3 (Oct 13, the
+laptop's working day) and boot -1 (this morning) both show `[HWAccel.CUDA]
+Initialization of CUDA was successful`, then `RDP server started`. So `work`
+was only ever remotely reachable while it held the seat, and the first truly
+headless start - the one the power/seat model was built for - found the gap.
+`personal` has `vga: std`, which is why its RDP answered this afternoon.
+
+`vga: none` was right with the RTX attached, where a virtual screen gets
+GNOME's top bar and nobody looks at it. So the display now follows the seat:
+`HEADLESS_VGA=( [work]=std [personal]=std )`, and `set_display()` sets
+`vga: none` in `attach_seat` and the Realm's own value in `detach_seat` -
+before its early return, because a Realm with no passthrough left can still be
+the one with no display, which is exactly how `work` was found. Windows is not
+listed and its display is never touched.
+
+`bin/test_seat.py` is new: it runs the real switcher against a fake `qm` on
+PATH, keeping each VM's config in a file. Release of a Realm with nothing to
+release still restores its display; switch takes it away and adds the RTX and
+the keyboard; moving the seat on gives it back; Windows keeps `virtio`
+throughout. Run against the switcher from HEAD it fails on the first assertion
+with `{'name': 'work', 'vga': 'none'}` - the state `work` was found in.
+
+Deployed to pve (`/usr/local/bin/celephais-seat`, identical to the repo),
+`work` stopped through its agent, released (`update VM 201: -vga std`), and
+started through Core the way the laptop does: OFF → BOOTING → READY at
+100.99.187.90. Inside: `*:3389` listening, a GDM autologin session on `seat0`,
+`/dev/dri/card1`. An X.224 request to 100.99.187.90:3389 got
+`030000130ed0…` back. Seven suites pass.
+
+## Windows' Remote Desktop asked for the password again — `bin/celephais-gate` (2026-10-14)
+It works from the laptop now. What was left: after the Gate's own sign-in
+screen, Windows raised a Windows Security dialog of its own, with the laptop
+owner's account filled in, and the Realm's account had to be found under "more
+choices" and typed a second time. The laptop has no FreeRDP, so the Gate falls
+back to `mstsc`, which takes no password on its command line and none on stdin.
+(No official FreeRDP build for Windows could be found to point Max at instead.)
+
+mstsc looks for a saved credential named `TERMSRV/<target>` before it asks.
+`windows_credential()` lends it the sign-in the Gate already has, for as long
+as the client runs: `CredWriteW` through ctypes, so the password is on nobody's
+command line; `CRED_PERSIST_SESSION`, so it cannot outlive the Windows logon;
+deleted with `CredDeleteW` the moment the client exits, and the buffer zeroed.
+`_termsrv()` names both `TERMSRV/127.0.0.1` and `TERMSRV/127.0.0.1:<port>`,
+since through the forward the port changes every time and it is not worth
+betting the prompt on which one mstsc uses. mstsc is no longer fed the password
+on stdin either; it never read it.
+
+Windows only hands a saved credential to a server it can only check with NTLM
+if the machine is not in a domain - the default for a personal laptop. On a
+domain machine policy refuses it and mstsc asks exactly as before; nothing is
+worse.
+
+Verified: `bin/test_gate.py` checks mstsc gets the credential and the password
+is on neither its command line nor its stdin, FreeRDP gets no credential and
+keeps reading stdin, and the helper is a no-op off Windows. Against the real
+Windows API, under wine with the build prefix's Windows Python: both names
+written, read back as user `workrealm` with the exact password (non-ASCII
+included) and `Persist` 1, and both gone after the block. Not verified: mstsc
+itself skipping its dialog, which only the laptop can show.
+
+### And its certificate question (21:04)
+With both sign-ins handled, mstsc still stopped once more: *Identitu vzdáleného
+počítače nelze ověřit* - the Realm's certificate, `celephais-workrealm-1`, made
+by `install-realm.sh` and signed by nobody. FreeRDP is told `/cert:ignore` for
+the same certificate (the `ponytail:` note about pinning it for WAN stands).
+`mstsc_without_certificate_warning()` sets mstsc's own per-user
+`HKCU\Software\Microsoft\Terminal Server Client\AuthenticationLevelOverride`
+to 0 - "connect and don't warn" - only while the Gate's client runs, and puts
+back whatever was there: the old value, or no value at all. The user's other
+Remote Desktop connections keep their warning. A second mstsc opened by hand
+during a Gate session would not warn either; that is the cost.
+
+Against the real registry under wine: absent → 0 inside → absent after;
+2 → 0 inside → 2 after. `bin/test_gate.py` checks only mstsc gets it.
+
+## The last two rough edges — `bin/celephais_ui.py`, `bin/celephais-gate` (2026-10-14)
+**The desktop between the Gate and the Realm.** `hide()` withdrew every
+overlay window before the RDP client was launched, so for the second or two
+until the client's window appeared the person was looking at their own
+desktop. `step_aside()` replaces it there: the overlay stays mapped, empty and
+dark, and only drops `-topmost`, so the client's window opens over it. After
+`STEP_ASIDE_MS` (6 s) it withdraws as before - everywhere, not just on
+Wayland: a new window is normally put above everything that is not topmost,
+but Hyprland opens it behind a fullscreen one by default, and a dark screen in
+front of a live session is far worse than none (Esc on it closes the Gate and
+the forward with it). A session that ended first has called `show()` and is
+not withdrawn after the fact. `claim_focus()` now returns while stepped aside:
+a grab still queued from the realm screen would otherwise take the keyboard
+back from the remote desktop. `bin/test_ui.py` checks what is *asked* of the
+window manager - Tk under Hyprland reads `-topmost` back as 0 even straight
+after setting it.
+
+**"[krb_log_context_encryption] … Client not found in Kerberos database"**
+after Max logged off `work`. The kept log
+(`~/.cache/celephais/rdp-work.log`) ended in `ERRINFO_LOGOFF_BY_USER`: a
+normal end, which FreeRDP exits from with a code that is not 0. The Gate called
+it a failure and reported the first error in the log, FreeRDP's Kerberos
+attempt, which comes before NTLM on every connection (a Realm has no Kerberos
+realm; `workrealm@ATHENA.MIT.EDU` is the library's default). Two fixes:
+`_ENDED_BY_USER` (logoff and disconnect by user) now counts as success, and
+`com.winpr.sspi.Kerberos` is in `_NOISE`. The second matters beyond the
+message: always first in the log, the Kerberos line would also have been
+reported for a wrong password, hiding the `LOGON_FAILURE` the overlay looks for
+before it asks for the password again. Both covered in `bin/test_gate.py`.
+
+Worth knowing: logging off *inside* a Linux Realm ends the session its remote
+desktop lives in. GDM's automatic login is believed to run once per boot, in
+which case the Realm then has no RDP until it is restarted - not verified on
+`work`. Until it is: close the remote desktop window to leave a Realm running,
+and log off only on the way to stopping it.
