@@ -2,13 +2,17 @@
 # Put the Gate on this machine as a normal application. No root, no system
 # directories: everything lands under the user's own home.
 #
-#   bash install-gate.sh [--autostart] [--no-password]
+#   bash install-gate.sh [--autostart] [--no-password] [--no-tailnet]
 #   bash install-gate.sh --remove
 #
 # --autostart    opens it at login
 # --no-password  keep the vault key on this machine, so the Gate never asks.
 #                Only for a machine that is already trusted: anyone who can
 #                read this home directory can then open every Realm.
+# --no-tailnet   this machine is already on the tailnet, so the Gate uses the
+#                network it finds instead of bringing up its own userspace
+#                tailscaled. On a host running tailscaled already the Gate's
+#                own cannot come up anyway, and a second node earns nothing.
 #
 # The Gate itself stays the same single file that runs from a USB stick. This
 # only gives it a menu entry, an icon and, if asked, a place in the session's
@@ -25,10 +29,12 @@ KEY=$HOME/.config/celephais/key
 
 WANT_AUTOSTART=no
 WANT_KEY=no
+GATE_ARGS=--ui
 for arg in "$@"; do
   case "$arg" in
     --autostart)   WANT_AUTOSTART=yes ;;
     --no-password) WANT_KEY=yes ;;
+    --no-tailnet)  GATE_ARGS="--ui --no-tailnet" ;;
     --remove)      ;;
     *) echo "unknown option: $arg" >&2; exit 1 ;;
   esac
@@ -60,8 +66,20 @@ VAULT=${CELEPHAIS_VAULT:-$SRC/celephais.vault}
 KEY_ENV=
 if [ "$WANT_KEY" = yes ]; then
   read -r -s -p "Vault password (stored on this machine): " pw; echo
-  PY=$SRC/build/.venv/bin/python
-  [ -x "$PY" ] || PY=python3
+  # The vault is AES-GCM, so opening it needs `cryptography`, which the build
+  # virtualenv has and a bare Arch python3 does not. Find an interpreter that
+  # can actually read it, and say so if there is none: without this check a
+  # missing module arrives as "that password does not open the vault", which
+  # sends Max looking for a typo that is not there.
+  PY=
+  for candidate in "${CELEPHAIS_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/celephais/venv}/bin/python" \
+                   "$SRC/build/.venv/bin/python" python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+       && "$candidate" -c "import cryptography" 2>/dev/null; then PY=$candidate; break; fi
+  done
+  [ -n "$PY" ] || { echo "no python here can open the vault: install the" >&2
+                    echo "cryptography module, or run build/make-gate.sh first," >&2
+                    echo "which builds a virtualenv that has it." >&2; exit 1; }
   CELEPHAIS_VAULT_PW=$pw CELEPHAIS_BIN=$SRC/bin \
   "$PY" - "$VAULT" <<'CHECK' || {
 import os, pathlib, sys
@@ -86,7 +104,7 @@ cat > "$DESKTOP" <<EOF
 Type=Application
 Name=Celephais
 Comment=Open a Realm
-Exec=env CELEPHAIS_VAULT=$VAULT ${KEY_ENV}$BIN --ui
+Exec=env CELEPHAIS_VAULT=$VAULT ${KEY_ENV}$BIN $GATE_ARGS
 Icon=celephais
 Terminal=false
 Categories=Network;RemoteAccess;
@@ -108,4 +126,4 @@ esac
 
 echo "installed: $BIN"
 echo "vault:     $VAULT"
-echo "Look for Celephais in the application menu, or run: $BIN --ui"
+echo "Look for Celephais in the application menu, or run: $BIN $GATE_ARGS"

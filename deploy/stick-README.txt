@@ -11,7 +11,15 @@ celephais.vault from the folder they sit in.
 HOW TO USE IT
 -------------
 Windows: double-click Gate.exe. A black screen covers every monitor and asks
-for the key. Type the vault password.
+for the key. Type the vault password. Gate.exe has no console on purpose, so
+it prints nothing: the command line lives in celephais-gate.exe, built beside
+it, and takes the same arguments as the Linux one.
+
+If it says Tailscale needs administrator rights, this machine is not on the
+tailnet and the Gate cannot build its own network without them. Use
+Gate-admin.bat, which is the same program started with administrator rights.
+A machine that is already on the tailnet never sees that message: the Gate
+notices Core answers and starts no network of its own.
 
 Linux: run ./celephais-gate from a terminal. Add --ui for the same black
 screen, or give it a realm name to stay on the command line.
@@ -54,7 +62,22 @@ button is deliberate.
 
 IF SOMETHING GOES WRONG
 -----------------------
-A Realm the system cannot reach says why, in red, across its own row.
+A Realm the system cannot reach says why, in red, across its own row. When one
+line is not enough, the RDP client's whole log is kept after any failed
+connection:
+
+    Windows   %LOCALAPPDATA%\celephais\rdp-<realm>.log
+    Linux     ~/.cache/celephais/rdp-<realm>.log
+
+"nothing answered on port 3389" means the Realm is up but this machine has no
+way to its network. Away from home, only a Realm that is on the tailnet itself
+can be reached - today that is `work`. The others answer on the house wire
+only.
+
+If a client cannot make sense of this machine's monitors it says so and the
+next client installed here is tried. On Linux that is usually sdl-freerdp3
+handing over to xfreerdp3; nothing needs to be chosen.
+
 On Windows, install FreeRDP for several monitors and a password typed in this
 program's own screen; without it Windows' own client asks in a window of its
 own and gives you one screen.

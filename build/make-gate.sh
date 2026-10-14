@@ -5,7 +5,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VENV=build/.venv
+# Not inside the repository: this one is checked out on the CIFS share, and
+# `python3 -m venv` there dies on the lib64 symlink it wants to make -
+# "Operation not supported". The cache directory is local on every machine.
+VENV=${CELEPHAIS_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/celephais/venv}
 [ -d "$VENV" ] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet --upgrade pip
 "$VENV/bin/pip" install --quiet pyinstaller cryptography certifi

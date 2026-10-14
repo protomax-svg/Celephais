@@ -19,6 +19,11 @@ export WINEDLLOVERRIDES="mscoree,mshtml="      # no mono, no gecko, no dialogs
 
 TOOLS=build/win-tools
 mkdir -p "$TOOLS"
+# wine creates the prefix directory itself, but not the path above it: with
+# ~/.local/share/wineprefixes missing it says "chdir to ...: No such file or
+# directory" and refuses to do anything. wineboot's failure is swallowed below,
+# so the first visible sign was the build dying with no message at all.
+mkdir -p "$(dirname "$WINEPREFIX")"
 PYTAG=${PYVER%.*}; PYTAG=${PYTAG/./}          # 3.12.10 -> 312
 PY="C:\\users\\$USER\\AppData\\Local\\Programs\\Python\\Python$PYTAG\\python.exe"
 PY_UNIX="$WINEPREFIX/drive_c/users/$USER/AppData/Local/Programs/Python/Python$PYTAG/python.exe"
@@ -29,10 +34,17 @@ if [ ! -f "$PY_UNIX" ]; then
   installer="$TOOLS/python-$PYVER-amd64.exe"
   [ -f "$installer" ] || curl -sSLf -o "$installer" \
     "https://www.python.org/ftp/python/$PYVER/python-$PYVER-amd64.exe"
-  wineboot -u >/dev/null 2>&1 || true
+  # Both of these keep their output: a silent install that does nothing is
+  # indistinguishable from one that worked until the build fails later for
+  # reasons that make no sense. `|| true` so the check below is what speaks.
+  wineboot -u >"$TOOLS/wineboot.log" 2>&1 || true
   wine "$installer" /quiet InstallAllUsers=0 PrependPath=1 \
-       Include_test=0 Include_launcher=0 >/dev/null 2>&1
-  [ -f "$PY_UNIX" ] || { echo "python.exe did not appear; see $WINEPREFIX" >&2; exit 1; }
+       Include_test=0 Include_launcher=0 >"$TOOLS/python-install.log" 2>&1 || true
+  [ -f "$PY_UNIX" ] || { echo "python.exe did not appear. See:" >&2
+                         echo "  $TOOLS/wineboot.log" >&2
+                         echo "  $TOOLS/python-install.log" >&2
+                         echo "  the prefix itself: $WINEPREFIX" >&2
+                         exit 1; }
 fi
 wine "$PY" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
 wine "$PY" -m pip install --quiet pyinstaller cryptography certifi >/dev/null 2>&1
@@ -57,18 +69,26 @@ fi
 
 # --specpath makes relative data paths resolve against the spec directory, so
 # every one of these has to be absolute. Z: is wine's view of /.
+#
+# Two executables out of the same script. Gate.exe is windowed: it has no
+# console, so nothing tailscaled says can show through the overlay that is
+# supposed to be covering the screen. celephais-gate.exe keeps its console for
+# the command line. Same reasoning as build/make-gate.ps1.
 R="Z:$(pwd | tr '/' '\\')"
-wine "$PY" -m PyInstaller \
-  --onefile --clean --noconfirm --name Gate --paths bin \
-  --hidden-import celephais_vault \
-  --hidden-import celephais_net \
-  --hidden-import celephais_ui \
-  --add-binary "$R\\build\\win-tools\\tailscaled.exe;." \
-  --add-binary "$R\\build\\win-tools\\tailscale.exe;." \
-  --add-data "$R\\build\\cacert.pem;." \
-  --distpath 'build\dist-win' --workpath 'build\work-win' --specpath build \
-  'bin\celephais-gate'
+for variant in "Gate:--noconsole" "celephais-gate:--console"; do
+  wine "$PY" -m PyInstaller \
+    --onefile --clean --noconfirm --name "${variant%%:*}" "${variant#*:}" --paths bin \
+    --hidden-import celephais_vault \
+    --hidden-import celephais_net \
+    --hidden-import celephais_ui \
+    --add-binary "$R\\build\\win-tools\\tailscaled.exe;." \
+    --add-binary "$R\\build\\win-tools\\tailscale.exe;." \
+    --add-data "$R\\build\\cacert.pem;." \
+    --distpath 'build\dist-win' --workpath 'build\work-win' --specpath build \
+    'bin\celephais-gate'
+done
 
 echo
-echo "built: build/dist-win/Gate.exe"
-ls -lh build/dist-win/Gate.exe
+echo "built: build/dist-win/Gate.exe            (double-click)"
+echo "built: build/dist-win/celephais-gate.exe  (command line)"
+ls -lh build/dist-win/Gate.exe build/dist-win/celephais-gate.exe
