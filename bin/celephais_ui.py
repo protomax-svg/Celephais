@@ -51,9 +51,33 @@ import sys
 import threading
 import tkinter as tk
 
+import celephais_net                 # for redact(), below
+
 BG, FG, DIM, ACCENT = "#07080a", "#e8e6e3", "#6b7280", "#7dd3fc"
 BAD = "#f87171"
 FONT = "TkDefaultFont"
+
+
+def reason(error):
+    """What this screen may say about a failure: the message, with any secret
+    taken out of it.
+
+    The last stop before an exception becomes text across every monitor. The
+    hooks reach a long way down - Core, Tailscale, an RDP client - and one of
+    them quoting a command line back is all it takes to put an auth key on the
+    screen, so nothing is rendered that did not come through here.
+    """
+    return celephais_net.redact(str(error)).strip()
+
+
+# How long the dark screen covers the hand-over to an RDP client before it
+# withdraws from under - or, where the window manager stacked it wrong, from
+# in front of - the client's window. See Overlay.step_aside.
+STEP_ASIDE_MS = 6000
+
+
+def _wayland():
+    return bool(os.environ.get("WAYLAND_DISPLAY")) and sys.platform != "win32"
 
 
 def screens(root):
@@ -65,6 +89,15 @@ def screens(root):
     desktop with its controls sitting on the seam between two monitors.
     """
     rects = []
+    if _wayland():
+        # A Wayland client is not allowed to place its own windows, and
+        # Hyprland puts each new XWayland window on the active workspace. One
+        # window per monitor came out as a 626x335 box floating on the laptop
+        # screen and a fullscreen window on the other one, with the third
+        # monitor untouched. So ask for nothing: one window, and the
+        # compositor fullscreens it where it already is, which is the screen
+        # the person is looking at.
+        return rects
     try:
         if sys.platform == "win32":
             import ctypes
@@ -152,6 +185,11 @@ class Overlay:
             self.panes.append(content)
 
         self.rdp = {}              # realm -> (user, password), asked once each
+        self.aside = False         # stepped aside for an RDP client
+        # None until the realm screen asks the Gate what this machine prefers;
+        # the vault is not open yet when this runs.
+        self.one_monitor = None
+        self.monitor_switches = []
         self.root.bind_all("<Escape>", lambda _e: self.leave())
         self.root.after(80, self._drain)
 
@@ -170,7 +208,11 @@ class Overlay:
         starting something else can take a moment to settle.
         """
         try:
-            if self.root.state() == "withdrawn":
+            if self.root.state() == "withdrawn" or self.aside:
+                # Stepped aside, the overlay is still mapped: without this a
+                # grab still queued from the realm screen would take the
+                # keyboard back from the remote desktop a moment after it
+                # opened.
                 return
             for widget in self.focus_widgets:
                 widget.focus_set()                # per window, not per app
@@ -189,7 +231,37 @@ class Overlay:
             except tk.TclError:
                 pass
 
+    def step_aside(self):
+        """Make way for the RDP client without showing the desktop between.
+
+        hide() withdrew every window before the client was launched, and for
+        the second or two until its window appeared the person was looking at
+        their own desktop, icons and all, between the Gate and the Realm. Now
+        the overlay stays, empty and dark, and only stops being topmost: the
+        client's window opens over it, and if the client is shown on fewer
+        monitors than there are, the others stay dark rather than showing the
+        desktop.
+
+        Then, once the client has had STEP_ASIDE_MS to put its window up, the
+        overlay withdraws as before. A new window is normally put above
+        everything that is not topmost, but not everywhere - Hyprland opens it
+        behind a fullscreen one by default - and a dark screen in front of a
+        connected session is far worse than none: Esc on it would close the
+        Gate, and the session with it. By then the client's window is up and
+        covers the withdrawal; a session that has already ended has called
+        show(), and is not withdrawn after the fact.
+        """
+        self.aside = True
+        self.clear()
+        for win in self.windows:
+            try:
+                win.attributes("-topmost", False)
+            except tk.TclError:
+                pass
+        self.root.after(STEP_ASIDE_MS, lambda: self.aside and self.hide())
+
     def show(self):
+        self.aside = False
         for win in self.windows:
             try:
                 win.deiconify()
@@ -332,7 +404,7 @@ class Overlay:
 
         def after_unlock(_result, error):
             if error:
-                self.ask_password(str(error))
+                self.ask_password(reason(error))
             else:
                 self.show_realms()
 
@@ -345,20 +417,46 @@ class Overlay:
         self.focus_widgets = entries
         self.claim_focus()
 
+    def monitor_text(self):
+        return ("remote desktop: one monitor" if self.one_monitor
+                else "remote desktop: every monitor")
+
+    def flip_monitors(self):
+        """Put the remote desktop on one screen, or back on all of them.
+
+        Nothing is reread and nothing is sent: the choice is carried into the
+        next connection, so a Realm that is already open is not disturbed by
+        it. Every screen's copy of the switch is relabelled, like every other
+        control the overlay mirrors.
+        """
+        self.one_monitor = not self.one_monitor
+        for switch in self.monitor_switches:
+            try:
+                switch.config(text=self.monitor_text())
+            except tk.TclError:                   # that screen is gone already
+                pass
+
     def show_realms(self, note=""):
         self.clear()
+        if self.one_monitor is None:
+            prefers = self.hooks.get("prefer_one_monitor")
+            self.one_monitor = bool(prefers and prefers())
         tables, status = [], []
+        self.monitor_switches = []
         for pane in self.panes:
             self.label(pane, "choose an environment", 20, FG, pady=(0, 16))
             rows = tk.Frame(pane, bg=BG)
             rows.pack()
             tables.append(rows)
             status.append(self.label(pane, note, 11, DIM, pady=(18, 0)))
+            switch = self.button(pane, self.monitor_text(), self.flip_monitors)
+            switch.pack(pady=(12, 0))
+            self.monitor_switches.append(switch)
             self.button(pane, "leave", self.leave).pack(pady=(14, 0))
 
         def refresh(realms, error):
             if error:
-                self.say_on(status, str(error), BAD)
+                self.say_on(status, reason(error), BAD)
                 return
             self.say_on(status, note)
             for rows in tables:
@@ -478,7 +576,7 @@ class Overlay:
         def decide(ident, action):
             self.work(lambda: self.hooks["set_device"](ident, action),
                       lambda _r, error: self.go("take_seat", name)
-                      if not error else self.show_realms(str(error)))
+                      if not error else self.show_realms(reason(error)))
 
         for pane in self.panes:
             self.label(pane, "new devices", 24, FG, pady=(0, 4))
@@ -537,7 +635,7 @@ class Overlay:
                 return self.ask_confirm(
                     name, result.get("warning", "this cannot be undone"),
                     lambda: self.go(action, name, confirmed=True, checked=True))
-            self.show_realms(str(error) if error else "")
+            self.show_realms(reason(error) if error else "")
 
         if action == "open_remote":
             # Stay visible and keep reporting while the Realm boots. Only the
@@ -546,14 +644,14 @@ class Overlay:
             def hide_now():
                 """Called from the worker thread, so hand it to the UI one."""
                 hidden = threading.Event()
-                self.post(lambda: (self.hide(), hidden.set()))
+                self.post(lambda: (self.step_aside(), hidden.set()))
                 hidden.wait(timeout=5)
 
             def finished(result, error):
                 self.show()
                 # A refused password must be asked again, and only a refused
                 # one: a boot timeout is not a reason to retype anything.
-                if error and "logon" in str(error).lower():
+                if error and "logon" in reason(error).lower():
                     self.rdp.pop(name, None)
                     # Name both fields: each Realm has its own account, and a
                     # wrong username is refused exactly like a wrong password.
@@ -561,9 +659,9 @@ class Overlay:
                         name, "that username and password were refused")
                 done(result, error)
 
-            self.work(lambda: self.hooks[action](name, say, hide_now,
-                                                *self.rdp[name]),
-                      finished)
+            self.work(lambda: self.hooks[action](
+                name, say, hide_now, *self.rdp[name],
+                one_monitor=bool(self.one_monitor)), finished)
         else:
             self.work(lambda: self.hooks[action](name, say, confirmed), done)
 

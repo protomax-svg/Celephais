@@ -99,6 +99,16 @@ def cfg(key, default=""):
     return CFG.get(key) or default
 
 
+def flag(key):
+    """A yes/no setting out of the vault or .env, written by a person.
+
+    "1", "true", "yes" and "on" all mean the same thing to whoever typed one
+    of them into a configuration file, and anything else - including an empty
+    value - means no.
+    """
+    return str(CFG.get(key, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def opener():
     """urllib opener that goes through the embedded tailnet when there is one."""
     if NET.get("http_proxy"):
@@ -144,6 +154,62 @@ def core(path, method="GET", allow=()):
         raise SystemExit(f"gate: cannot reach Core at {cfg('CORE_URL')}: {exc}")
 
 
+def core_reachable(timeout=8):
+    """Whether Core answers over the network this machine already has.
+
+    Core listens on nothing but the Proxmox host's Tailscale address, so an
+    answer is proof that this machine is on the tailnet already - and then a
+    private tailnet of the Gate's own is a second node that buys nothing.
+
+    On Windows it is worse than nothing. tailscaled asks the operating system
+    for a named pipe owned by the Administrators group; a plain account may
+    not create one, so it dies with "namedpipe.Listen: Access is denied" and
+    takes the Gate down with it. Max was held at his own key screen on a
+    laptop that had Tailscale installed and could have reached Core all along.
+
+    A short timeout on purpose: this runs before the tailnet on every start,
+    and on a machine that really is a stranger it has to fail fast and get out
+    of the way. Not too short, though - a machine whose Tailscale has been
+    idle may need several seconds to put a route together, and four was tight
+    enough to send a laptop that could reach Core off to build a second
+    network. A machine with no Tailscale at all has no route to a 100.x
+    address and is refused at once, so the wait costs it nothing.
+    """
+    url = cfg("CORE_URL", "http://127.0.0.1:8080").rstrip("/") + "/realms"
+    req = urllib.request.Request(
+        url, headers={"Authorization": "Bearer " + cfg("CORE_TOKEN")})
+    try:
+        with urllib.request.build_opener().open(req, timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        # It answered. Whether it liked the token is core()'s business to
+        # report, and a refused token is not a reason to build a network.
+        return True
+    except OSError:
+        return False
+
+
+def reach_core(say=None):
+    """Wait for the Gate's own network to have a way to Core.
+
+    The tailnet reports itself up before it can reach anybody in particular,
+    and the first request to Core then hangs while the path is found - 10.5
+    seconds on the same wire as pve, longer from anywhere else. core() gives a
+    request 20 seconds, which a laptop away from home ran out of every time:
+    on the tailnet, and never once in Core's log. See celephais_net.reach().
+    """
+    (say or (lambda text: print(f"  {text}", flush=True)))(
+        "finding the way to Core\u2026")
+    where = urllib.parse.urlsplit(cfg("CORE_URL", "http://127.0.0.1:8080"))
+    try:
+        took = celephais_net.reach(NET["socks5"], where.hostname,
+                                   where.port or 80)
+    except celephais_net.NetError:
+        raise SystemExit(f"gate: Core did not answer at {cfg('CORE_URL')} "
+                         "through the Gate's private network.")
+    return took
+
+
 def wait_ready(name, say=None):
     """Poll until the Realm can take an RDP connection. Returns its IP."""
     deadline = time.monotonic() + int(cfg("BOOT_TIMEOUT", "180"))
@@ -162,12 +228,22 @@ def wait_ready(name, say=None):
     raise SystemExit(f"gate: {name} was still {last} after {cfg('BOOT_TIMEOUT', '180')}s")
 
 
+def rdp_clients():
+    """Every RDP client on this machine, in the order to try them.
+
+    More than one, because a client can be installed and still be unable to
+    use the machine it is installed on: FreeRDP 3's SDL client reads every
+    monitor as 80x80 on this Hyprland desktop and then refuses its own
+    layout. Nothing is wrong with the Realm when that happens, so the Gate
+    moves on to the next client rather than report it.
+    """
+    return [found for found in (shutil.which(name) for name in RDP_CLIENTS)
+            if found]
+
+
 def rdp_client():
-    for name in RDP_CLIENTS:
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
+    """The first client to try, or None."""
+    return next(iter(rdp_clients()), None)
 
 
 # The Gate carries Tailscale inside itself, but it cannot carry an RDP client:
@@ -186,16 +262,16 @@ PACKAGERS = (
 )
 
 
-def ensure_rdp_client(tell=print):
-    """The path to an RDP client, installing one first if the host has none.
+def ensure_rdp_clients(tell=print):
+    """The RDP clients to try, installing one first if the host has none.
 
     Windows always has mstsc, so this only ever does anything on Linux. The
     elevation is pkexec when there is no terminal to type a password into,
     which is the double-clicked case, and sudo when there is.
     """
-    client = rdp_client()
-    if client:
-        return client
+    clients = rdp_clients()
+    if clients:
+        return clients
     if os.name == "nt":
         raise SystemExit("gate: no RDP client found. Looked for: "
                          + ", ".join(RDP_CLIENTS))
@@ -214,18 +290,221 @@ def ensure_rdp_client(tell=print):
     if subprocess.call(elevate) != 0:
         raise SystemExit("gate: installing an RDP client was refused or failed")
 
-    client = rdp_client()
-    if not client:
+    clients = rdp_clients()
+    if not clients:
         raise SystemExit("gate: the install finished but no RDP client appeared")
-    return client
+    return clients
+
+
+def ensure_rdp_client(tell=print):
+    """The one client the command line names in its advice. See above."""
+    return ensure_rdp_clients(tell)[0]
+
+
+# Lines FreeRDP logs as advice, as an echo of something it already said, or
+# on its way out, none of which say why anything failed. The terminal one is
+# the worst of them: it is written last, while the client puts back a terminal
+# it was never given, so for a while it was the only thing the overlay ever
+# showed. Max saw "tcsetattr(TCSANOW) failed with Inappropriate ioctl for
+# device" and the real reason - a monitor layout the client would not accept -
+# was six lines above it.
+_NOISE = ("set_termianl_nonblock", "tcsetattr", "tcgetattr", "log_monitor",
+          "Check if the configuration is valid", "If you suspect a bug",
+          "Provide at least the following",
+          # FreeRDP tries Kerberos before NTLM on every connection, and a
+          # Realm has no Kerberos realm to be found in: "Client 'workrealm@
+          # ATHENA.MIT.EDU' not found in Kerberos database", three lines of
+          # it, then NTLM signs in. Always first in the log, it was the line
+          # reported for a session that ended perfectly well - and would have
+          # been for a wrong password too, hiding the LOGON_FAILURE the
+          # overlay looks for before it asks for the password again.
+          "com.winpr.sspi.Kerberos")
+
+# A session that ended because the person in it ended it. FreeRDP exits with
+# a code that is not 0 for these, and the Gate used to report them as failures
+# - after Max had logged off `work` on purpose.
+_ENDED_BY_USER = ("ERRINFO_LOGOFF_BY_USER", "DISCONNECT_BY_USER",
+                  "ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER")
+
+
+# The two FreeRDP codes a person is most likely to be shown, said in words.
+# Everything else comes back as FreeRDP wrote it: a code nobody has seen
+# before is still a search term, and inventing a sentence for it would only
+# guess. Not ERRCONNECT_LOGON_FAILURE - the overlay reads the word "logon"
+# and asks for the password again, which is better than any sentence here.
+_PLAIN = (
+    ("ERRCONNECT_CONNECT_FAILED",
+     "nothing answered on port 3389: the Realm is up, but this machine "
+     "cannot reach its network"),
+    ("ERRCONNECT_PRE_CONNECT_FAILED",
+     "no RDP client here could make sense of this machine's monitors"),
+)
 
 
 def _last_error(text):
-    """The final complaint out of a FreeRDP log, without its timestamp."""
-    lines = [line for line in (text or "").splitlines() if "[ERROR]" in line]
-    if not lines:
-        return ""
-    return lines[-1].split("] - ", 1)[-1].strip()
+    """The complaint out of a FreeRDP log that says why, without its timestamp.
+
+    The first real one, not the last: FreeRDP names the cause and then follows
+    it with the consequences, the advice, and finally a word about the
+    terminal. Everything after the cause is noise to whoever is reading one
+    line on an overlay.
+    """
+    for line in (text or "").splitlines():
+        if "[ERROR]" in line and not any(n in line for n in _NOISE):
+            for code, plainly in _PLAIN:
+                if code in line:
+                    return plainly
+            return line.split("] - ", 1)[-1].strip()
+    return ""
+
+
+# What a client says when it cannot use the machine it was installed on. It
+# has not spoken to the Realm at all at this point, so there is another client
+# worth trying. See rdp_clients().
+_BAD_CLIENT = ("PRE_CONNECT_FAILED", "unsupported monitor configuration")
+
+
+def _client_cannot_cope(text):
+    return any(needle in (text or "") for needle in _BAD_CLIENT)
+
+
+def _termsrv(target):
+    """The names mstsc looks a saved credential up under, for one target.
+
+    "TERMSRV/<host>" is the documented one. Through the Gate's forward the
+    target carries a port, which changes every time; whether mstsc keeps it
+    in the name is not something to bet a password prompt on, so both.
+    """
+    host = target.rsplit(":", 1)[0] if target.count(":") == 1 else target
+    return list(dict.fromkeys([f"TERMSRV/{host}", f"TERMSRV/{target}"]))
+
+
+@contextlib.contextmanager
+def windows_credential(targets, user, password):
+    """Lend Windows' own Remote Desktop the sign-in the Gate already has.
+
+    mstsc takes no password on its command line and none on stdin. Given
+    none, it raised its own Windows Security dialog on top of the Gate's
+    sign-in screen, with the laptop owner's account filled in, and the
+    Realm's account had to be found under "more choices" and typed again.
+    A credential saved for TERMSRV/<target> is what it looks for first.
+
+    Written through CredWriteW, so the password is never on anybody's command
+    line, with CRED_PERSIST_SESSION so it cannot outlive the Windows logon,
+    and deleted again the moment the client is gone. Windows lets a machine
+    that is not in a domain hand a saved credential to a server it can only
+    check with NTLM; one in a domain refuses by policy, and mstsc then simply
+    asks the way it always did. Off Windows, or with no password, nothing.
+    """
+    if os.name != "nt" or not password or not targets:
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class CREDENTIALW(ctypes.Structure):
+        _fields_ = [("Flags", wintypes.DWORD), ("Type", wintypes.DWORD),
+                    ("TargetName", wintypes.LPWSTR), ("Comment", wintypes.LPWSTR),
+                    ("LastWritten", wintypes.FILETIME),
+                    ("CredentialBlobSize", wintypes.DWORD),
+                    ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+                    ("Persist", wintypes.DWORD), ("AttributeCount", wintypes.DWORD),
+                    ("Attributes", ctypes.c_void_p),
+                    ("TargetAlias", wintypes.LPWSTR), ("UserName", wintypes.LPWSTR)]
+
+    CRED_TYPE_GENERIC, CRED_PERSIST_SESSION = 1, 1
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.CredWriteW.argtypes = [ctypes.POINTER(CREDENTIALW), wintypes.DWORD]
+    advapi.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+    blob = password.encode("utf-16-le")
+    buffer = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+    written = []
+    try:
+        for target in targets:
+            credential = CREDENTIALW(
+                Type=CRED_TYPE_GENERIC, TargetName=target,
+                CredentialBlobSize=len(blob), CredentialBlob=buffer,
+                Persist=CRED_PERSIST_SESSION, UserName=user)
+            if advapi.CredWriteW(ctypes.byref(credential), 0):
+                written.append(target)
+        yield written
+    finally:
+        for target in written:
+            advapi.CredDeleteW(target, CRED_TYPE_GENERIC, 0)
+        ctypes.memset(buffer, 0, len(blob))
+
+
+@contextlib.contextmanager
+def mstsc_without_certificate_warning():
+    """Keep mstsc from stopping at the Realm's certificate, while it runs.
+
+    Each Realm makes its own certificate (deploy/install-realm.sh), so mstsc
+    could never check it and asked every time - "the identity of the remote
+    computer cannot be verified", certificate `celephais-workrealm-1`, Yes or
+    No - after both sign-ins were already done. FreeRDP is told the same
+    thing with /cert:ignore, and for the same reason it is acceptable: the
+    connection is inside the tailnet, which has already checked whose machine
+    is at the other end.
+
+    AuthenticationLevelOverride = 0 is mstsc's own per-user "connect and do
+    not warn". It is set only for as long as the Gate's client runs and put
+    back to what it was afterwards - removed if it was not there - so the
+    user's other Remote Desktop connections keep their warning. HKCU, so no
+    administrator is needed. Off Windows, nothing.
+    """
+    if os.name != "nt":
+        yield
+        return
+    import winreg
+    path, name = r"Software\Microsoft\Terminal Server Client", "AuthenticationLevelOverride"
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0,
+                                 winreg.KEY_READ | winreg.KEY_WRITE)
+    except OSError:
+        yield                       # no registry to speak of: it simply asks
+        return
+    with key:
+        try:
+            before = winreg.QueryValueEx(key, name)
+        except OSError:
+            before = None
+        try:
+            try:
+                winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, 0)
+            except OSError:
+                pass
+            yield
+        finally:
+            try:
+                if before is None:
+                    winreg.DeleteValue(key, name)
+                else:
+                    winreg.SetValueEx(key, name, 0, before[1], before[0])
+            except OSError:
+                pass
+
+
+def _keep_log(name, text):
+    """Keep the client's own log where it can be read afterwards.
+
+    From the overlay there is no terminal for it to land in, and one line
+    under a Realm's name is not enough to work from when a client refuses for
+    a reason nobody has seen before. Best effort: a read-only home is a
+    reason to say nothing, not to fail the connection.
+    """
+    if not text:
+        return None
+    # Where a person on this platform would look for it, and where the README
+    # says it is: ~/.cache on Linux, AppData\Local on Windows.
+    where = celephais_net.log_dir()
+    if not where:
+        return None
+    try:
+        path = where / f"rdp-{name}.log"
+        path.write_text(text)
+        return path
+    except OSError:
+        return None
 
 
 def realm_login(name):
@@ -239,17 +518,31 @@ def realm_login(name):
             cfg(f"RDP_PASSWORD_{tag}") or cfg("RDP_PASSWORD"))
 
 
-def connect(name, ip, extra, say=None, user="", password=""):
+def connect(name, ip, extra, say=None, user="", password="",
+            one_monitor=False):
     """Open the Realm in an RDP client. Returns (exit code, what went wrong).
+
+    one_monitor keeps the Realm on a single screen. It works by not asking
+    for a monitor layout at all, rather than by naming a monitor: FreeRDP then
+    fills the screen it opens on, which is the one answer that cannot be wrong
+    on a machine with one monitor, with three, or with an arrangement nobody
+    anticipated. `/monitors:1` would have to be checked against what is
+    actually plugged in first, and would fail on a laptop on its own.
 
     `say` reports to the overlay. Without it the messages go to print, which
     nothing reads when the Gate was double-clicked from the stick.
 
-    With `say` the client's stderr is captured and the last error line comes
-    back with the exit code, because from the overlay there is no terminal for
-    it to land in and a bare number says nothing. Without `say` it is left
-    alone: on the command line FreeRDP's own output, and its password prompt,
-    belong to the user's terminal.
+    The client's stderr is captured and the line that says why comes back with
+    the exit code, because from the overlay there is no terminal for it to
+    land in and a bare number says nothing. The whole log is kept in
+    ~/.cache/celephais/rdp-<realm>.log when a connection fails, for the times
+    one line is not enough. On the command line the log is written back out
+    afterwards, so nothing is swallowed; a client that was given no password
+    keeps the terminal to itself, because its prompt is the terminal's.
+
+    If a client fails before it has reached the Realm at all - FreeRDP's SDL
+    client does, on a desktop whose monitors it cannot read - the next client
+    on the machine is tried. See rdp_clients().
 
     A password given here goes down the client's stdin, never on the command
     line where `ps` would show it, and FreeRDP then raises no dialog of its
@@ -263,14 +556,27 @@ def connect(name, ip, extra, say=None, user="", password=""):
     password = password or known_password
     # The overlay has already stepped aside by now, so the password dialog
     # this may raise is not hidden underneath it.
-    client = ensure_rdp_client(tell)
+    clients = ensure_rdp_clients(tell)
     target, listener = ip, None
     if NET.get("socks5"):
+        # The Realm is a different peer from Core, with a path of its own to
+        # find, and an RDP client gives a connection far less time than that
+        # can take. Wait it out here, where it can be said what is happening.
+        tell(f"finding the way to {name}\u2026")
+        try:
+            celephais_net.reach(NET["socks5"], ip, 3389)
+        except celephais_net.NetError:
+            return 1, (f"{name} did not answer at {ip} through the Gate's "
+                       "private network")
         # Carry the connection ourselves rather than rely on the client having
         # a proxy setting. Windows' own mstsc has none.
         port, listener = celephais_net.forward(NET["socks5"], ip, 3389)
         target = f"127.0.0.1:{port}"
-    try:
+    # The Realm is asked to cover every monitor unless told otherwise. Absent
+    # on purpose when it is: see one_monitor above.
+    span = [] if one_monitor else ["/multimon"]
+
+    def command(client):
         if client.lower().endswith("mstsc.exe"):
             # Fallback only. mstsc asks for the user and password itself and
             # takes far fewer options than FreeRDP.
@@ -278,31 +584,60 @@ def connect(name, ip, extra, say=None, user="", password=""):
             # asks for them in a window of its own, which is exactly what the
             # Gate's own sign-in screen exists to avoid. Install FreeRDP on a
             # Windows host that should behave like the others.
-            cmd = [client, f"/v:{target}", "/f", "/multimon"] + extra
+            return [client, f"/v:{target}", "/f"] + span + extra
         else:
             # ponytail: /cert:ignore is the LAN prototype. Pin the Realm cert for WAN.
             # No /dynamic-resolution. With /multimon FreeRDP then sends a
             # monitor layout GNOME reads as overlapping, and the Realm drops
             # the session the moment it connects. The client is fullscreen on
             # fixed monitors anyway, so there is nothing to resize.
-            cmd = [client, f"/v:{target}", f"/u:{user}", "/f", "/multimon",
-                   "/gfx", "/clipboard", "/sound", "/cert:ignore"] + extra
+            cmd = ([client, f"/v:{target}", f"/u:{user}", "/f"] + span
+                   + ["/gfx", "/clipboard", "/sound", "/cert:ignore"] + extra)
             if password:
                 # :force silences the graphical prompt as well, so a wrong
                 # password fails and says so instead of opening a dialog
                 # behind the overlay.
                 cmd.append("/from-stdin:force")
-        tell(f"connecting to {name} at {ip} as {user}")
-        feed = password + "\n" if password else ""
-        if say is None:
-            if not feed:
-                return subprocess.call(cmd), ""     # its prompt is the terminal's
-            return subprocess.run(cmd, input=feed, text=True).returncode, ""
-        # An empty stdin, closed at once, when there is no password: from the
-        # overlay there is no terminal to answer a prompt on, so let the client
-        # fail and say so rather than block for ever on a question nobody sees.
-        done = subprocess.run(cmd, input=feed, stderr=subprocess.PIPE, text=True)
-        return done.returncode, _last_error(done.stderr)
+            return cmd
+
+    feed = password + "\n" if password else ""
+    try:
+        # Each client in turn, but only while the one before it failed before
+        # it had spoken to the Realm: a refused password or a Realm that is
+        # not listening is the same answer from every client on the machine,
+        # and trying them all would only ask the Realm to refuse three times.
+        result = (1, "")
+        for number, client in enumerate(clients, 1):
+            tell(f"connecting to {name} at {ip} as {user}")
+            cmd = command(client)
+            if say is None and not feed:
+                # Its prompt is the terminal's, and so is its log. Nothing is
+                # read back here, so this client is also the only one tried.
+                return subprocess.call(cmd), ""
+            # An empty stdin, closed at once, when there is no password: from
+            # the overlay there is no terminal to answer a prompt on, so let
+            # the client fail and say so rather than block for ever on a
+            # question nobody sees. mstsc reads nothing from stdin at all; it
+            # gets the password as a Windows credential instead.
+            mstsc = client.lower().endswith("mstsc.exe")
+            with windows_credential(_termsrv(target) if mstsc else (),
+                                    user, password), \
+                    (mstsc_without_certificate_warning() if mstsc
+                     else contextlib.nullcontext()):
+                done = subprocess.run(cmd, input="" if mstsc else feed,
+                                      stderr=subprocess.PIPE, text=True)
+            if not done.returncode or any(
+                    end in (done.stderr or "") for end in _ENDED_BY_USER):
+                return 0, ""
+            _keep_log(name, done.stderr)
+            if say is None:                    # the log was the terminal's
+                sys.stderr.write(done.stderr or "")
+            result = (done.returncode, _last_error(done.stderr))
+            if not (_client_cannot_cope(done.stderr) and number < len(clients)):
+                break
+            tell(f"{os.path.basename(client)} cannot use this machine's "
+                 f"monitors; trying {os.path.basename(clients[number])}")
+        return result
     finally:
         if listener:
             listener.close()
@@ -394,20 +729,30 @@ def run(args, extra):
     if args.no_connect:
         print(ip)
         return 0
-    return connect(args.realm, ip, extra)[0]
+    return connect(args.realm, ip, extra,
+                   one_monitor=args.one_monitor or flag("ONE_MONITOR"))[0]
 
 
-def ui_session():
-    """Hooks for the overlay. One ExitStack keeps the tailnet up throughout."""
+def ui_session(no_tailnet=False):
+    """Hooks for the overlay. One ExitStack keeps the tailnet up throughout.
+
+    no_tailnet is for a machine that is already on the tailnet - the desktop
+    deploy/install-gate.sh installs this on, rather than a stick carried to a
+    strange laptop. Bringing up a second, userspace tailscaled there adds a
+    duplicate node for no gain, and on a host whose own tailscaled holds the
+    state directory it does not come up at all. The Gate reaches Core through
+    the network the machine already has.
+    """
     stack = contextlib.ExitStack()
 
     def unlock(password):
         CFG.clear()
         CFG.update(celephais_vault.load(VAULT, password))
         credential = cfg("TS_AUTH_CLIENT_SECRET") or cfg("TS_AUTHKEY")
-        if credential:
+        if credential and not no_tailnet and not core_reachable():
             NET.update(stack.enter_context(celephais_net.tailnet(
                 credential, cfg("TS_HOSTNAME", "celephais-gate"), cfg("TS_TAGS"))))
+            reach_core(lambda _text: None)
         core("/realms")               # fail here, while there is a place to say so
         return True
 
@@ -417,13 +762,13 @@ def ui_session():
         it never asks at all."""
         return realm_login(name)
 
-    def open_remote(name, say, hide, user="", password=""):
+    def open_remote(name, say, hide, user="", password="", one_monitor=False):
         say("starting\u2026")
         core(f"/realms/{name}/start", "POST")
         ip = wait_ready(name, say)
         say(f"connecting to {ip}\u2026")
         hide()                        # now, and not a moment earlier
-        code, why = connect(name, ip, [], say, user, password)
+        code, why = connect(name, ip, [], say, user, password, one_monitor)
         if code:
             raise RuntimeError(why or f"the RDP client exited with code {code}")
         return True
@@ -462,6 +807,9 @@ def ui_session():
                    "open_remote": open_remote, "take_seat": take_seat,
                    "park": park, "stop": stop, "release": release,
                    "stored_password": stored_password,
+                   # Which way the overlay's own switch starts out. The vault
+                   # is open by the time anything asks.
+                   "prefer_one_monitor": lambda: flag("ONE_MONITOR"),
                    "rdp_login": rdp_login,
                    "devices": lambda: core("/devices"),
                    "set_device": set_device}
@@ -491,16 +839,25 @@ def main():
                     help="give this realm the RTX, the monitors and the USB input")
     ap.add_argument("--yes", action="store_true", help="do not ask before a restart")
     ap.add_argument("--no-tailnet", action="store_true",
-                    help="use the host network instead of the Gate's own tailnet")
+                    help="use the host network instead of the Gate's own "
+                         "tailnet; right for a machine already on the tailnet")
     ap.add_argument("--ui", action="store_true",
                     help="the fullscreen overlay instead of the command line")
+    ap.add_argument("--one-monitor", action="store_true",
+                    help="put the remote desktop on one screen instead of "
+                         "every monitor; ONE_MONITOR=1 in the vault makes it "
+                         "the default on this machine")
     ap.add_argument("--no-connect", action="store_true", help="start and wait, do not launch RDP")
     args, extra = ap.parse_known_args()
 
     # Double-clicked from the USB stick, with no arguments: show the overlay.
     if args.ui or (getattr(sys, "frozen", False) and len(sys.argv) == 1):
         import celephais_ui
-        stack, hooks = ui_session()
+        # Behind a fullscreen screen there is no terminal for Tailscale to talk
+        # to, and a console it does not cover is where its output was landing.
+        # The overlay gets a sentence from the Gate instead.
+        celephais_net.SHOW_DETAIL = False
+        stack, hooks = ui_session(no_tailnet=args.no_tailnet)
         with stack:
             celephais_ui.run(hooks)
         return 0
@@ -514,12 +871,17 @@ def main():
     authkey = cfg("TS_AUTH_CLIENT_SECRET") or cfg("TS_AUTHKEY")
     if not authkey or args.no_tailnet:
         return run(args, extra)
+    if core_reachable():
+        print("  tailnet: not needed, this machine is on it already", flush=True)
+        return run(args, extra)
 
     try:
         with celephais_net.tailnet(authkey, cfg("TS_HOSTNAME", "celephais-gate"),
                                    cfg("TS_TAGS")) as net:
             NET.update(net)
             print("  tailnet: up", flush=True)
+            took = reach_core()
+            print(f"  core: reached in {took:.0f}s", flush=True)
             return run(args, extra)
     except celephais_net.NetError as exc:
         raise SystemExit(f"gate: tailnet: {exc}")

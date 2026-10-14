@@ -22,6 +22,13 @@ except Exception as exc:                      # no display, nothing to check
 
 import celephais_ui as ui  # noqa: E402
 
+# Nothing reaches the screen with a secret still in it. The hooks reach a long
+# way down, and one of them quoting a command line back is all it takes: Max
+# watched `tailscale up --auth-key=...` scroll across every monitor.
+LEAK = RuntimeError("up failed: tailscale up --auth-key=tskey-auth-kN0tAR3al")
+assert "tskey-auth-kN0tAR3al" not in ui.reason(LEAK), ui.reason(LEAK)
+assert "up failed" in ui.reason(LEAK), ui.reason(LEAK)
+
 REALMS = [{"realm": "work", "vmid": 201, "power": "READY", "seat": False,
            "ip": "192.168.2.114"},
           {"realm": "windows", "vmid": 100, "power": "OFF", "seat": True,
@@ -31,8 +38,9 @@ hooks = {
     "unlock": lambda password: (calls.append(("unlock", password)) or True
                                 if password == "right" else _wrong()),
     "realms": lambda: REALMS,
-    "open_remote": lambda name, say, hide, user, password:
-        calls.append(("open", name, user, password)),
+    "open_remote": lambda name, say, hide, user, password, one_monitor=False:
+        calls.append(("open", name, user, password, one_monitor)),
+    "prefer_one_monitor": lambda: False,
     "take_seat": lambda name, say, confirmed=False:
         {"confirm": True, "warning": "the saved desktop cannot be kept"}
         if not confirmed else calls.append(("seat", name)),
@@ -96,12 +104,19 @@ try:
     # window is refused the keyboard, which is how the overlay went deaf.
     assert not app.root.overrideredirect(), "the manager must see the window"
     rects = ui.screens(app.root)
-    assert len(app.windows) == len(rects), "one window per monitor"
-    for (full, where), (x, y, w, h) in zip(placed, rects):
-        assert full, f"window not fullscreen: {placed}"
-        assert where == f"{w}x{h}+{x}+{y}", f"wrong monitor: {where} != {w}x{h}+{x}+{y}"
-    assert rects and all(w > 0 and h > 0 for _x, _y, w, h in rects), rects
-    assert len(app.panes) == len(rects), "one set of controls per monitor"
+    if rects:
+        assert len(app.windows) == len(rects), "one window per monitor"
+        for (full, where), (x, y, w, h) in zip(placed, rects):
+            assert full, f"window not fullscreen: {placed}"
+            assert where == f"{w}x{h}+{x}+{y}", \
+                f"wrong monitor: {where} != {w}x{h}+{x}+{y}"
+        assert all(w > 0 and h > 0 for _x, _y, w, h in rects), rects
+    else:
+        # Wayland, where a client may not place its own windows: the overlay
+        # asks for one and lets the compositor put it where it likes. Running
+        # this under Hyprland is how that was found out.
+        assert len(app.windows) == 1 and app.rects == [None], app.rects
+    assert len(app.panes) == len(app.windows), "one set of controls per window"
     # Each set of controls is centred in its own window, never across the seam.
     for pane, win in zip(app.panes, app.windows):
         assert pane.master is win, "controls must live in that monitor's window"
@@ -168,7 +183,7 @@ try:
     app.root.update()
     shown = texts(app.panes[0])
     assert "sign in" in shown and "work" in shown, shown
-    assert ("open", "work", "workrealm", "hunter2") not in calls, "asked nothing"
+    assert ("open", "work", "workrealm", "hunter2", False) not in calls, "asked nothing"
     secrets = [c for c in app.panes[0].winfo_children()
                if isinstance(c, tkinter.Entry) and c.cget("show")]
     assert len(secrets) == 1, "exactly one hidden field"
@@ -177,15 +192,79 @@ try:
     assert len(plain) == 1 and plain[0].get() == "workrealm", "user prefilled"
     app.rdp_password.set("hunter2")
     app.submit_login()
-    assert pump(app, until=lambda: ("open", "work", "workrealm", "hunter2") in calls), \
+    assert pump(app, until=lambda: ("open", "work", "workrealm", "hunter2", False) in calls), \
         f"the credentials never reached the Gate: {calls}"
 
     # Asked once, not once per connection.
     calls.clear()
     app.go("open_remote", "work")
-    assert pump(app, until=lambda: ("open", "work", "workrealm", "hunter2") in calls), \
+    assert pump(app, until=lambda: ("open", "work", "workrealm", "hunter2", False) in calls), \
         f"it asked again: {texts(app.panes[0])}"
     pump(app, 1.0)              # let the worker's "finished" land before the next test
+
+    # Making way for the RDP client must not show the desktop in between. The
+    # overlay used to withdraw before the client was launched, and until the
+    # client's window appeared the person was looking at their own desktop.
+    # Now it stays up, empty and dark, and only stops being on top.
+    real_ms = ui.STEP_ASIDE_MS
+    grabbed = []
+    real_grab = app.root.focus_force
+    # What is asked of the window manager, not what it reports back: under
+    # Hyprland Tk reads -topmost as 0 even straight after setting it.
+    topmost = {}
+
+    def recording(win):
+        real = win.attributes
+
+        def attributes(*args):
+            if len(args) == 2 and args[0] == "-topmost":
+                topmost[str(win)] = bool(args[1])
+            return real(*args)
+        return attributes
+
+    for win in app.windows:
+        win.attributes = recording(win)
+    try:
+        app.show()
+        pump(app, 0.3)
+        app.step_aside()
+        pump(app, 0.5)
+        assert app.aside, "not stepped aside"
+        assert all(not pane.winfo_children() for pane in app.panes), \
+            "the dark screen still carries the last screen's text"
+        assert topmost and not any(topmost.values()), \
+            f"still on top: the client's window would open behind it {topmost}"
+        assert app.root.state() != "withdrawn", "withdrawn: the desktop shows"
+        # and a focus grab still queued from the realm screen must not take
+        # the keyboard back from the remote desktop
+        app.root.focus_force = lambda: grabbed.append(True)
+        app.claim_focus()
+        pump(app, 0.5)
+        assert not grabbed, "it took the keyboard back from the client"
+        app.root.focus_force = real_grab
+        app.show()
+        assert not app.aside and all(topmost.values()), \
+            f"show() did not put it back on top: {topmost}"
+
+        # A window manager may open the client behind a fullscreen window
+        # (Hyprland does), so once the client has had a moment the overlay
+        # gets out of the way everywhere, rather than trust the stacking.
+        ui.STEP_ASIDE_MS = 50
+        app.step_aside()
+        assert pump(app, 1.0, until=lambda: app.root.state() == "withdrawn"), \
+            "it stayed in front of the client"
+        # and a session that ended first is not withdrawn after the fact
+        app.show()
+        app.step_aside()
+        app.show()
+        pump(app, 0.3)
+        assert app.root.state() != "withdrawn", "withdrew a screen that came back"
+    finally:
+        ui.STEP_ASIDE_MS = real_ms
+        app.root.focus_force = real_grab
+        for win in app.windows:
+            del win.attributes                  # back to the class's own
+        app.hide()
 
     # Another Realm is another account. Max signed in to `work` as `workrealm`;
     # `windows` must not inherit that, or the Realm answers LOGON_FAILURE and
@@ -279,6 +358,29 @@ try:
         f"the kept key was never used: {calls}"
     assert pump(app, until=lambda: "work" in texts(app.panes[0])), \
         f"it stopped at the password screen: {texts(app.panes[0])}"
+
+    # The remote desktop can be kept to one screen. The switch is mirrored on
+    # every monitor like every other control, and the choice rides along with
+    # the next connection rather than being sent anywhere on its own.
+    app.show_realms()
+    assert pump(app, until=lambda: len(app.monitor_switches) == len(app.panes)), \
+        app.monitor_switches
+    assert all(s.cget("text") == "remote desktop: every monitor"
+               for s in app.monitor_switches), \
+        [s.cget("text") for s in app.monitor_switches]
+    app.flip_monitors()
+    app.root.update()
+    assert all(s.cget("text") == "remote desktop: one monitor"
+               for s in app.monitor_switches), \
+        "every screen's copy of the switch must say the same thing"
+    calls.clear()
+    app.rdp["work"] = ("workrealm", "hunter2")
+    app.go("open_remote", "work")
+    assert pump(app, until=lambda: ("open", "work", "workrealm", "hunter2", True)
+                in calls), f"the choice did not reach the connection: {calls}"
+    pump(app, 1.0)                  # let "finished" land before the next test
+    app.flip_monitors()             # back to every monitor for what follows
+    app.hide()
 
     # A kept key that no longer fits must land on the screen with the reason,
     # not lock the machine out in silence.
