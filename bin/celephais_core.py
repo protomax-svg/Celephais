@@ -120,8 +120,38 @@ def pve(method, path, **form):
         return json.load(r)["data"]
 
 
+# Tailscale hands out addresses from 100.64.0.0/10, the carrier-grade NAT
+# range. Nothing else in a Realm has one: the Realms sit on 192.168.2.0/24.
+TAILNET_RANGE = (64, 127)
+
+
+def _on_tailnet(ip):
+    """True for a Tailscale address, 100.64.0.0/10."""
+    parts = ip.split(".")
+    if len(parts) != 4 or parts[0] != "100":
+        return False
+    try:
+        return TAILNET_RANGE[0] <= int(parts[1]) <= TAILNET_RANGE[1]
+    except ValueError:
+        return False
+
+
 def realm_ip(vmid):
-    """First non-loopback IPv4 the guest agent reports, or None if the agent is not up."""
+    """The address a Gate should dial, out of what the guest agent reports.
+
+    A Realm that is itself on the tailnet answers on two: 192.168.2.114 on the
+    wire it shares with pve, and 100.99.187.90 from anywhere in the world. The
+    agent lists the LAN one first and it used to win, which is right for
+    nobody. A Gate on a hotel network cannot reach 192.168.2.114 at all - that
+    is the whole point of carrying a tailnet in the Gate - and even on the same
+    wire the LAN address is the one a Tailscale exit node swallows, while the
+    tailnet address keeps working because it belongs to the tunnel. Both are
+    direct between two machines on one wire, so nothing is lost by preferring
+    it. A Realm with no Tailscale of its own still answers on its LAN address,
+    and that is what comes back for it.
+
+    None if the agent is not up.
+    """
     try:
         ifaces = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/agent/network-get-interfaces")
     except Exception as exc:
@@ -131,12 +161,14 @@ def realm_ip(vmid):
         return None
     if isinstance(ifaces, dict):          # PVE wraps the agent reply in "result"
         ifaces = ifaces.get("result") or []
+    found = []
     for iface in ifaces or []:
         for addr in iface.get("ip-addresses") or []:
             ip = addr.get("ip-address", "")
             if addr.get("ip-address-type") == "ipv4" and not ip.startswith("127."):
-                return ip
-    return None
+                found.append(ip)
+    return next((ip for ip in found if _on_tailnet(ip)), None) or \
+        next(iter(found), None)
 
 
 # GNOME Remote Login can only hand a client over to a *fresh* login. A session
@@ -326,18 +358,37 @@ def devices():
 def seat_usb():
     """The VID:PIDs the Local Seat should carry.
 
-    Approved devices, plus the keyboard and mouse the seat cannot work
-    without, minus anything refused by name. Max approved a gamepad once and
-    lost the keyboard and mouse with it, because a list built only from
-    approvals silently replaced the ones nobody had ever been asked about.
+    The keyboard and mouse the seat cannot work without, plus anything
+    approved that is plugged in, minus anything refused by name.
+
+    The two defaults travel whether or not Core can see them right now. They
+    hang off a USB switch, so half the time they are enumerated on the other
+    machine and absent from this host's USB tree - which is exactly the moment
+    the seat is asked for, because that is when Max is sitting at the other
+    machine. `host=vid:pid` in the VM config is a standing claim and not a
+    snapshot: QEMU attaches the device when it appears, which is what made the
+    switch toggle work during the Windows tests. A Realm that comes up holding
+    the monitors with no keyboard or mouse cannot be told anything, so the
+    claim is written even for a device nobody can see.
+
+    An approved extra - a gamepad, a headset - is left out while it is
+    unplugged. Nothing is lost by waiting for it to arrive.
+
+    Max approved a gamepad once and lost the keyboard and mouse with it,
+    because a list built only from approvals silently replaced the ones nobody
+    had ever been asked about.
     """
     registry = device_registry()
     approved = {i for i, e in registry.items() if e.get("action") == "seat"}
-    refused = {i for i, e in registry.items() if e.get("action") == "never"}
-    carried = [device["usb"] for device in usb_devices()
-               if device["id"] in approved
-               or (device["usb"] in SEAT_DEFAULT_USB
-                   and device["id"] not in refused)]
+    # A refusal is remembered against the device's identity, which carries a
+    # serial number when the maker wrote one; the defaults are bare VID:PIDs.
+    # Match on what goes into the config, or refusing the mouse by name would
+    # not keep it off a seat it is not plugged into.
+    refused = {e.get("usb") or i for i, e in registry.items()
+               if e.get("action") == "never"}
+    carried = [usb for usb in SEAT_DEFAULT_USB if usb not in refused]
+    carried += [device["usb"] for device in usb_devices()
+                if device["id"] in approved and device["usb"] not in refused]
     return list(dict.fromkeys(carried))        # no duplicates, order kept
 
 

@@ -12,7 +12,7 @@ fake = type("fake", (), {"status": "stopped", "agent": False, "rdp": False,
                          "vmstate": None, "suspended": [],
                          "exec_cmd": None, "exec_exit": 0, "exec_fails": False,
                          "exec_out": "", "exec_cmds": [], "stops": [],
-                         "agent_shutdown_fails": False})
+                         "agent_shutdown_fails": False, "tailnet": False})
 
 
 def fake_pve(method, path, **form):
@@ -48,12 +48,17 @@ def fake_pve(method, path, **form):
         if not fake.agent:
             raise OSError("QEMU guest agent is not running")
         # the real PVE agent reply is wrapped in "result"
-        return {"result": [
+        ifaces = [
             {"name": "lo", "ip-addresses": [
                 {"ip-address-type": "ipv4", "ip-address": "127.0.0.1"}]},
             {"name": "enp6s18", "ip-addresses": [
                 {"ip-address-type": "ipv6", "ip-address": "fe80::1"},
-                {"ip-address-type": "ipv4", "ip-address": "192.168.2.50"}]}]}
+                {"ip-address-type": "ipv4", "ip-address": "192.168.2.50"}]}]
+        if fake.tailnet:
+            # the agent lists it after the wire, as the real one does
+            ifaces.append({"name": "tailscale0", "ip-addresses": [
+                {"ip-address-type": "ipv4", "ip-address": "100.99.187.90"}]})
+        return {"result": ifaces}
     return {}
 
 
@@ -131,6 +136,20 @@ fake.agent = True
 s = c.realm_state("work")
 assert s["power"] == "BOOTING", s                       # agent up, RDP not listening
 assert s["ip"] == "192.168.2.50", s                     # loopback and IPv6 skipped
+
+# A Realm that is on the tailnet itself is dialled there, even though the agent
+# lists the LAN address first. A Gate on a hotel network cannot reach
+# 192.168.2.50 at all, and on the same wire the tailnet address is no slower -
+# it is also the one a Tailscale exit node does not swallow.
+fake.tailnet = True
+assert c.realm_state("work")["ip"] == "100.99.187.90", c.realm_state("work")
+fake.tailnet = False
+assert c.realm_state("work")["ip"] == "192.168.2.50"    # no Tailscale: the wire
+
+# 100.64.0.0/10 and nothing else: 100.63 and 100.128 are ordinary addresses.
+assert c._on_tailnet("100.64.0.1") and c._on_tailnet("100.127.255.254")
+assert not c._on_tailnet("100.63.255.255") and not c._on_tailnet("100.128.0.1")
+assert not c._on_tailnet("192.168.2.50") and not c._on_tailnet("100.x.1.1")
 
 fake.rdp = True
 assert c.realm_state("work")["power"] == "READY"
@@ -333,8 +352,12 @@ absent = {d["id"]: d for d in c.devices()}
 assert absent["1532:02a2"] == {"id": "1532:02a2", "usb": "1532:02a2",
                                "name": "Razer Ornata V3 X", "action": "seat",
                                "role": "", "kind": "", "present": False}, absent
-assert c.seat_usb() == [], "it offered a device that is not plugged in"
-c.USB_ROOT = usb_root
+# The keyboard and the mouse travel even while Core cannot see them. They
+# hang off a USB switch: when it points at the other machine they are gone
+# from this host's USB tree, and that is exactly when the seat is asked for,
+# because that is where Max is sitting. The claim in the VM config waits for
+# them. The mouse is refused by name here, so it stays out regardless.
+assert c.seat_usb() == ["1532:02a2"], c.seat_usb()
 # Forgetting the keyboard does not take it off the seat; it only takes back
 # the decision. Refusing it by name is how it is taken off, and the mouse is
 # refused here, which is why it stays out.
@@ -344,6 +367,10 @@ call("/devices/1532%3A02a2?action=never", method="POST")
 assert c.seat_usb() == [], "a refusal must beat the default"
 call("/devices/1532%3A02a2?action=forget", method="POST")
 call("/devices/046d%3Ac52b%3AA17F9C?action=forget", method="POST")
+# Nothing decided and nothing plugged in: the seat still claims both, because
+# a Realm that comes up with the monitors and no input cannot be told anything.
+assert c.seat_usb() == ["1532:02a2", "046d:c52b"], c.seat_usb()
+c.USB_ROOT = usb_root
 
 # The bug Max hit: he plugged in a gamepad, approved it, refused the headset,
 # and lost the keyboard and mouse with them. A list built only from approvals
