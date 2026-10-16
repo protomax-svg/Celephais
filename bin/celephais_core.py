@@ -95,9 +95,11 @@ SEAT_CMD = os.environ.get("SEAT_CMD", "sudo -n /usr/local/bin/celephais-seat").s
 # The keyboard and mouse that make the Local Seat a seat. They travel with it
 # unless they have been refused by name: a screen with the GPU on it and
 # nothing to type with is not a working machine, and approving some new device
-# must never be the thing that takes them away.
+# must never be the thing that takes them away. The MX Vertical is one mouse
+# with two identities: through the Unifying receiver (c52b), and as itself on
+# its charging cable (c08a), so both are claimed.
 SEAT_DEFAULT_USB = [d for d in os.environ.get(
-    "SEAT_DEFAULT_USB", "1532:02a2 046d:c52b").split() if d]
+    "SEAT_DEFAULT_USB", "1532:02a2 046d:c52b 046d:c08a").split() if d]
 
 PVE_HOST = os.environ.get("PVE_HOST", "")
 PVE_NODE = os.environ.get("PVE_NODE", "pve")

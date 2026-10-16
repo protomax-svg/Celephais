@@ -229,7 +229,8 @@ code, body = call("/realms/work/seat", method="POST")
 assert code == 200 and body["owner"] == "work", body
 # The keyboard and mouse travel with the seat before anybody has decided
 # anything: a screen with no way to type on it is not a working machine.
-assert fake.seat_calls == [("switch", "work", "1532:02a2", "046d:c52b")], \
+assert fake.seat_calls == [("switch", "work", "1532:02a2", "046d:c52b",
+                          "046d:c08a")], \
     fake.seat_calls
 assert status_of("/realms/nope/seat", method="POST") == 404
 
@@ -284,7 +285,7 @@ assert status_of("/realms/work/seat", method="POST") == 409
 assert fake.seat_calls == [], "it changed the hardware anyway"
 code, body = call("/realms/work/seat?confirm=1", method="POST")
 assert code == 200 and fake.seat_calls == [("switch", "work", "1532:02a2",
-                                           "046d:c52b")], fake.seat_calls
+                                           "046d:c52b", "046d:c08a")], fake.seat_calls
 fake.vmstate = None
 
 # Nothing running, nothing to save.
@@ -333,18 +334,21 @@ call("/devices/046d%3Ac52b%3AA17F9C?action=never", method="POST")
 by_id = {d["id"]: d for d in call("/devices")[1]}
 assert by_id["1532:02a2"]["action"] == "seat", by_id
 assert by_id["046d:c52b:A17F9C"]["action"] == "never", by_id
-assert c.seat_usb() == ["1532:02a2"], c.seat_usb()
+# The receiver is refused, the mouse's own cable is not: they are two devices
+# to the host, and a refusal is of one of them.
+assert c.seat_usb() == ["1532:02a2", "046d:c08a"], c.seat_usb()
 
 # Audio is not a special case: an approved headset travels like anything else.
 call("/devices/0b0e%3A0309?action=seat", method="POST")
-assert c.seat_usb() == ["1532:02a2", "0b0e:0309"], c.seat_usb()
+assert c.seat_usb() == ["1532:02a2", "046d:c08a", "0b0e:0309"], c.seat_usb()
 assert c.device_registry()["0b0e:0309"]["role"] == "audio", c.device_registry()
 call("/devices/0b0e%3A0309?action=forget", method="POST")
 
 # Taking the seat must carry exactly what was approved, and nothing else.
 fake.status, fake.seat, fake.vmstate, fake.seat_calls = "running", False, None, []
 call("/realms/work/seat", method="POST")
-assert fake.seat_calls == [("switch", "work", "1532:02a2")], fake.seat_calls
+assert fake.seat_calls == [("switch", "work", "1532:02a2", "046d:c08a")], \
+    fake.seat_calls
 
 # A decision survives the device being unplugged, and can be taken back.
 c.USB_ROOT = usb_root.parent / "nothing-plugged-in"
@@ -356,27 +360,28 @@ assert absent["1532:02a2"] == {"id": "1532:02a2", "usb": "1532:02a2",
 # hang off a USB switch: when it points at the other machine they are gone
 # from this host's USB tree, and that is exactly when the seat is asked for,
 # because that is where Max is sitting. The claim in the VM config waits for
-# them. The mouse is refused by name here, so it stays out regardless.
-assert c.seat_usb() == ["1532:02a2"], c.seat_usb()
+# them. The receiver is refused by name here, so it stays out regardless.
+assert c.seat_usb() == ["1532:02a2", "046d:c08a"], c.seat_usb()
 # Forgetting the keyboard does not take it off the seat; it only takes back
 # the decision. Refusing it by name is how it is taken off, and the mouse is
 # refused here, which is why it stays out.
 call("/devices/1532%3A02a2?action=forget", method="POST")
-assert c.seat_usb() == ["1532:02a2"], c.seat_usb()
+assert c.seat_usb() == ["1532:02a2", "046d:c08a"], c.seat_usb()
 call("/devices/1532%3A02a2?action=never", method="POST")
-assert c.seat_usb() == [], "a refusal must beat the default"
+assert c.seat_usb() == ["046d:c08a"], "a refusal must beat the default"
 call("/devices/1532%3A02a2?action=forget", method="POST")
 call("/devices/046d%3Ac52b%3AA17F9C?action=forget", method="POST")
 # Nothing decided and nothing plugged in: the seat still claims both, because
 # a Realm that comes up with the monitors and no input cannot be told anything.
-assert c.seat_usb() == ["1532:02a2", "046d:c52b"], c.seat_usb()
+assert c.seat_usb() == ["1532:02a2", "046d:c52b", "046d:c08a"], c.seat_usb()
 c.USB_ROOT = usb_root
 
 # The bug Max hit: he plugged in a gamepad, approved it, refused the headset,
 # and lost the keyboard and mouse with them. A list built only from approvals
 # replaced the two devices nobody had ever been asked about.
 call("/devices/0b0e%3A0309?action=seat", method="POST")
-assert c.seat_usb() == ["1532:02a2", "046d:c52b", "0b0e:0309"], c.seat_usb()
+assert c.seat_usb() == ["1532:02a2", "046d:c52b", "046d:c08a",
+                        "0b0e:0309"], c.seat_usb()
 call("/devices/0b0e%3A0309?action=forget", method="POST")
 
 # A stop goes through the guest agent. The ACPI button is swallowed by GNOME,
