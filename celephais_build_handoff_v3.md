@@ -1970,3 +1970,226 @@ desktop lives in. GDM's automatic login is believed to run once per boot, in
 which case the Realm then has no RDP until it is restarted - not verified on
 `work`. Until it is: close the remote desktop window to leave a Realm running,
 and log off only on the way to stopping it.
+
+## `personal` is Fedora now — `deploy/install-realm.sh`, `deploy/mount-cloud.sh` (2026-10-15)
+Max replaced VM 202's Ubuntu with Fedora 44 Workstation (kernel 6.19, GNOME
+50), same id, same name, account `max`, 16 GB, 120 GB on `realms-ssd`. Three
+things stood between it and the rest of Celephaïs.
+
+**Core had lost it.** Destroying the old VM took its ACL with it: `user.cfg`
+still had `/vms/100` and `/vms/201` and nothing for 202, so the token could
+not power it, read its agent or park it. Put back exactly as install-core.sh
+grants it, to the token and its user both:
+
+```bash
+pveum acl modify /vms/202 --tokens 'gate@pve!core' --roles CelephaisCore,CelephaisGuest,CelephaisPark
+pveum acl modify /vms/202 --users gate@pve       --roles CelephaisCore,CelephaisGuest,CelephaisPark
+```
+
+After it Core reports `personal BOOTING 192.168.2.116`. The VM config needed
+nothing: no `vga:` line means `std`, which is what the seat restores anyway.
+
+**SELinux boxes in the guest agent.** Fedora runs qemu-ga as
+`virt_qemu_ga_t`. It answers `network-get-interfaces` and `get-osinfo` and
+may write into `/tmp`, but `rpm`, `getenforce`, firewalld, `/etc/gdm` all came
+back "permission denied". Core's egress check would have run `tailscale debug
+prefs`, been refused, and reported "tailscale is not installed here", and
+logout would have failed outright. `install-realm.sh` now makes that one
+domain permissive (`semanage permissive -a virt_qemu_ga_t`): the agent is a
+root channel from the host already, the policy stays loaded, and denials are
+still logged.
+
+**Everything the Ubuntu Realms got by hand is now in the script.**
+`install-realm.sh` installs what is missing with dnf or apt, sets GDM's
+automatic login (`/etc/gdm/custom.conf` on Fedora, `/etc/gdm3/` on Ubuntu)
+since the headless remote desktop only exists inside a session, opens 3389 in
+firewalld, names the certificate with `uname -n` because Fedora 44 has no
+`hostname` command, and runs `restorecon` on what it installs. The password
+is asked for when not given, to keep it out of the shell history. `--tailnet
+<name>` installs Tailscale, joins the tailnet under that name and sets
+`exit-node-allow-lan-access`, so `personal` stops being the Realm that only
+answers at home. `mount-cloud.sh` installs `cifs-utils` with dnf too.
+
+Neither script ran on the VM from here: the agent cannot run them, and
+`grdctl` wants the user's own session. They were copied into the guest at
+`/var/tmp/celephais/` (root-only, readable by sudo) for Max to run at the VM's
+console:
+
+```bash
+sudo bash /var/tmp/celephais/install-realm.sh max --tailnet personal
+sudo bash /var/tmp/celephais/mount-cloud.sh 100.81.170.6 cloud <password> max
+```
+
+The Gate needed no change, as it takes the Realm list from Core and asks for
+the sign-in itself. The stick's README now says `work` and `personal` are
+reachable away from home; the binaries on it and in `~/.local/bin` were
+already the current build and were rewritten from it unchanged.
+
+Not done: the RTX on Fedora. With the seat, `personal` gets nouveau, which
+drives a Turing card with its GSP firmware; the NVIDIA driver from RPM Fusion
+would need its module signed for Secure Boot (`pre-enrolled-keys=1`). And
+`/etc/celephais/core.env` on pve still has no `EXIT_NODE*` lines, so asking
+any Realm for exit-node egress is refused until one is chosen.
+
+### The mouse on its cable is a different mouse (2026-10-15)
+The MX Vertical reaches the host two ways: through the Unifying receiver,
+`046d:c52b`, and on its charging cable as itself, `046d:c08a` (Max's `lsusb`).
+Only the receiver was in the seat's defaults, so plugged in by cable it stayed
+on pve. `046d:c08a` is now a default in `SEAT_DEFAULT_USB` (Core) and
+`SEAT_USB` (the switcher), claimed like the others even while unplugged. A
+refusal of the receiver does not refuse the cable; `bin/test_core.py` says so.
+Both deployed to pve and checksum-matched, Core restarted, and `usb3:
+host=046d:c08a` hot-added to `personal`, which held the seat at the time.
+
+## A Realm asleep on the monitors could not be stopped — `bin/celephais_core.py`, `bin/celephais-seat`, `bin/celephais_ui.py` (2026-10-15)
+Max: `personal` went to sleep while it held the monitors, the Gate showed it
+as "booting", and neither "stop" nor "give the monitors back" was there to
+press. He stopped it in Proxmox at 21:02. Core's log has two refused releases
+before that (`realm 'personal' is running; stop it first`) and no stop at all,
+because the Gate never offered one.
+
+Three faults, one under the other:
+
+1. **Core could not see sleep.** A guest that suspends itself (ACPI S3) is
+   `status: running` to Proxmox; only `qmpstatus: suspended` says otherwise.
+   Its agent and its remote desktop are frozen, so `realm_state` found no IP,
+   no 3389, and said BOOTING. It now says **ASLEEP** and skips asking the
+   agent, which would only wait out a timeout.
+2. **Nothing could stop it.** The agent is asleep and the ACPI button reaches
+   nobody. `wake()` calls Proxmox's resume, which for a suspended guest sends
+   QEMU `system_wakeup` (`PVE/QemuServer/RunState.pm`), then gives the agent
+   up to `WAKE_WAIT` (20 s) to answer before the shutdown. Start on a sleeping
+   Realm wakes it. The switcher's `stop_realm` does the same with `qm resume`,
+   so moving the seat off a sleeping Realm no longer dies with "did not stop".
+3. **The Gate offered stop only for READY.** Anything running now gets it:
+   READY, BOOTING, ASLEEP. That covers more than sleep. A Realm on the monitors
+   whose remote desktop is not set up never becomes READY (`personal` before
+   install-realm.sh runs, and Windows, which has no agent at all and reads
+   BOOTING whenever it holds the seat). A refused "give the monitors back"
+   now shows Core's reason instead of "local seat: nobody".
+
+And the cause inside the guest: Fedora's GNOME suspends when idle.
+`install-realm.sh` now masks `suspend.target`, `hybrid-sleep.target` and
+`suspend-then-hibernate.target`, and sets GNOME's idle sleep to `nothing`.
+Hibernation is left alone, since it is the guest-side way to keep a session
+across a seat change.
+
+Tests: `bin/test_core.py` has a sleeping Realm read ASLEEP, woken once and
+then shut down by the agent, started by waking it, and an awake one never
+woken. `bin/test_seat.py` moves the seat off a sleeping `personal`, with a fake
+`qm` whose agent and button both ignore a sleeping guest; against the old
+switcher it fails with "VM 202 did not stop in 2s". `bin/test_ui.py` shows a
+sleeping Realm on the monitors with a stop button, and fails against the old
+UI. `test_ui_keyboard.py` fails here with or without this change: it needs
+keyboard focus on a desktop someone is using.
+
+Deployed: Core and the switcher on pve, checksum-matched, Core restarted.
+Gate rebuilt (`celephais-gate` 4bea4cc5, `Gate.exe` 837b84fd,
+`celephais-gate.exe` 1217dc8c) and installed in `~/.local/bin`. Not written:
+the stick, which was unplugged by then, and the copy of install-realm.sh
+staged in `personal`'s `/var/tmp/celephais/`, which predates the suspend
+masking and needs replacing the next time the VM runs. Not seen on hardware:
+a real sleeping guest woken by Core.
+
+## The monitors' speakers were already forwarded; nouveau was swallowing them — `deploy/install-nvidia.sh` (2026-10-16)
+Max: `personal` has two monitors with speakers in them and no sound output at
+all. Nothing was missing on the Proxmox side. The seat carries the RTX's audio
+function (`hostpci1: 0000:01:00.1`) beside the GPU, and the guest has it:
+
+```text
+/proc/asound/cards     0 [Intel ] HDA-Intel  (QEMU's, no codec, no PCM)
+                       1 [NVidia] HDA-Intel  HDA NVidia
+/proc/asound/pcm       01-03..01-09  HDMI 0..3, playback 1
+0000:02:00.0  0x040300  snd_hda_intel
+```
+
+Four HDMI outputs, driver bound, two monitors connected (`card1-DP-2`,
+`card1-HDMI-A-2`). What is missing is the **ELD** - the block a monitor sends
+back saying it can play sound and in which formats. Every pin reads
+`eld_valid 0`, and ALSA disables an output whose ELD is invalid, silently.
+Read twice a minute apart, `monitor_present` had even moved from one device to
+another with both still invalid, which is the flapping of a pin nobody is
+driving properly.
+
+The cause is nouveau, and it is documented by NVIDIA itself: the open drivers
+"don't send the required ELD information to the audio hardware"
+(download.nvidia.com/XFree86/gpu-hdmi-audio-document/). The live codec dump
+does show `PD = 1, ELDV = 1` on pin 0x04 dev 01 while the driver's own cache
+says invalid, so something is half-written, but nothing on the guest side
+makes it whole. `work` does not have this problem: it runs the proprietary
+driver, 595.99.02, with its key MOK-enrolled.
+
+So `deploy/install-nvidia.sh` is the fix, and it is the same road `work` took:
+RPM Fusion, `akmod-nvidia` so the module follows each new kernel, a signing
+key from `kmodgenca`, and `mokutil --import`. Secure Boot is on in these
+Realms (`mokutil --sb-state`: enabled, `pre-enrolled-keys=1` on the efidisk),
+so an unsigned module is refused and Fedora quietly comes back up on nouveau.
+The enrollment is three screens at the next boot and only someone at the
+monitors can answer them, so the script stops there and says so. It builds the
+module before the reboot rather than after, so a failure has a shell to be
+read in. Recovery if the Realm comes back blind: release the seat, which gives
+it `vga: std` again.
+
+Not verified: that the proprietary driver does produce a valid ELD on this
+card and these monitors. It cannot be tested from here - `work` holds no
+monitors while `personal` has the seat, so its own HDMI audio has never been
+looked at either.
+
+Nothing in Celephais changed. The hardware was being handed over correctly the
+whole time.
+
+### The stick, rewritten (10:53)
+All five files replaced from the current build and checksum-matched:
+`celephais-gate` 4bea4cc5, `Gate.exe` 837b84fd, `celephais-gate.exe`
+1217dc8c, plus `README.txt` and `Gate-admin.bat`. The vault was left alone.
+`/var/tmp/celephais/` inside `personal` was restaged too: the copy of
+install-realm.sh there predated the suspend masking, and install-nvidia.sh is
+new.
+
+### It worked, and `nvidia-smi` was a missing package, not a failed driver (2026-10-16, 11:28)
+Max ran both scripts and reported the sound output had appeared but
+`nvidia-smi` did not work. The driver was never the problem:
+
+```text
+lspci -nnk -s 01:00.0   Kernel driver in use: nvidia
+lsmod                   nvidia 18522112, nvidia_drm, nvidia_modeset, nvidia_uvm
+                        615.78.08 on kernel 7.2.10-200.fc44
+```
+
+MOK enrollment held and the signed module loaded. `nvidia-smi` is simply not
+in any package the driver pulls in: `akmod-nvidia` brings
+`xorg-x11-drv-nvidia-cuda-libs`, the libraries, while the tools live in
+`xorg-x11-drv-nvidia-cuda`. Installed, it answers at once - RTX 2060, 40 °C,
+414 MiB used, P8. `install-nvidia.sh` now installs it alongside the driver,
+so the verification step the script itself prints cannot fail on a working
+Realm.
+
+**The ELD came back, exactly where the EDID says it should.** One valid ELD
+now, and the desktop has a sink:
+
+```text
+/proc/asound/card1/eld#0.0   monitor_present 1  eld_valid 1  BenQ PD2500Q
+wpctl status   * 62. TU106 High Definition Audio Controller Digital Stereo
+                  (HDMI) [BenQ PD2500Q]
+```
+
+The second monitor will never join it, and not for want of a driver. Decoding
+both EDIDs off the connectors:
+
+| output | monitor | EDID | audio |
+|---|---|---|---|
+| HDMI-A-2 | BenQ PD2500Q | 256 B, CEA block rev 3 | basic-audio flag set, one SAD: PCM 2ch |
+| DP-2 | DELL U2312HM | 128 B, **no CEA extension at all** | none declared |
+
+A monitor advertises audio only in the CEA extension block, and the Dell has
+no such block: it is a 2011 panel whose sound was an optional clip-on
+soundbar fed from its own input, not from DisplayPort. There is no audio
+endpoint behind that cable to find. One monitor with speakers, one sink, both
+working - this is the finished state, not a half-finished one.
+
+Also confirmed on this boot, all from `install-realm.sh`: RDP listening on
+3389, `max` logged in automatically on seat0, `suspend.target` masked, and
+`personal` on the tailnet as 100.95.216.39 - so it is now reachable from a
+Gate away from home, which it never was. The guest agent runs unconfined
+(`virt_qemu_ga_t` permissive while the system stays Enforcing), so Core's
+egress, logout and every diagnosis above work from here.
