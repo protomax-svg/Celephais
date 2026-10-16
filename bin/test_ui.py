@@ -170,6 +170,19 @@ try:
     assert pump(app, until=lambda: any("596" in t for t in texts(app.panes[0]))), \
         f"the reason never reached the screen: {texts(app.panes[0])}"
     REALMS.pop()
+
+    # A Realm that is running but never became READY - asleep on the
+    # monitors, or with no remote desktop - must still be stoppable. Only
+    # READY used to get the button, and `personal` sat on the monitors with
+    # no way to stop it or get them back.
+    REALMS.append({"realm": "sleepy", "vmid": 202, "power": "ASLEEP", "seat": True,
+                   "ip": None})
+    app.show_realms()
+    assert pump(app, until=lambda: "asleep  ● on the monitors" in texts(app.panes[0])), \
+        f"the sleeping Realm never appeared: {texts(app.panes[0])}"
+    assert texts(app.panes[0]).count("stop") == 2, \
+        f"a sleeping Realm has no stop: {texts(app.panes[0])}"
+    REALMS.pop()
     app.show_realms()
     pump(app, 1.0)
     assert any("on the monitors" in t for t in shown), f"seat not shown: {shown}"

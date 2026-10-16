@@ -697,7 +697,7 @@ def run(args, extra):
         # running has to be restarted to take the seat. Unsaved work would be
         # lost, so say so and ask.
         victims = [r["realm"] for r in core("/realms")
-                   if r.get("power") in ("BOOTING", "READY")
+                   if r.get("power") in ("BOOTING", "READY", "ASLEEP")
                    and (r["realm"] == args.realm or r.get("seat"))]
         if victims and not args.yes:
             print(f"  this restarts: {', '.join(victims)}")
@@ -781,6 +781,10 @@ def ui_session(no_tailnet=False):
     def release(name, say, confirmed=False):
         say("taking the monitors back\u2026")
         reply = core(f"/realms/{name}/release", "POST", allow=(409,))
+        if reply.get("error"):
+            # Usually "running; stop it first": the RTX cannot be pulled out
+            # of a running VM. Said as it is, not as "local seat: nobody".
+            raise RuntimeError(reply["error"])
         say(f"local seat: {reply.get('owner') or 'nobody'}")
         return True
 

@@ -486,6 +486,11 @@ class Overlay:
                                "take_seat": ("use the monitors", False)}
                     if realm["power"] == "READY":
                         offered["park"] = ("park", False)
+                    # Anything running can be stopped, whatever it looks like
+                    # from here. Offering stop only when READY left a Realm
+                    # that never got there - asleep, or with no remote desktop
+                    # - holding the monitors with no way to get them back.
+                    if realm["power"] in ("READY", "BOOTING", "ASLEEP"):
                         offered["stop"] = ("stop", False)
                     if realm.get("seat"):
                         offered["release"] = ("give the monitors back", False)

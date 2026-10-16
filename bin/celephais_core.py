@@ -35,8 +35,8 @@ API:
   POST /devices/<id>?action=seat|never|forget
 
 power: OFF -> BOOTING -> READY, plus PARKED for a Realm whose live session is
-saved on disk, STOPPING after a stop, PARKING after a park, and ERROR if
-Proxmox cannot answer for that Realm. A parked Realm wakes with an ordinary
+saved on disk, ASLEEP for one whose guest suspended itself, STOPPING after a
+stop, PARKING after a park, and ERROR if Proxmox cannot answer for that Realm. A parked Realm wakes with an ordinary
 start: Proxmox restores the saved state instead of booting. seat is a separate boolean. CONNECTING
 and ONLINE belong to the Gate; it polls until READY and then launches RDP.
 
@@ -81,6 +81,9 @@ DEVICES_FILE = pathlib.Path(os.environ.get("CELEPHAIS_DEVICES",
 # Add a Realm here once its VM exists.
 REALMS = {"work": 201, "personal": 202, "windows": 100}
 RDP_PORT = 3389
+# How long a stop waits for a woken guest's agent before falling back to the
+# power button. A guest out of S3 answers in a few seconds.
+WAKE_WAIT = int(os.environ.get("WAKE_WAIT", "20"))
 # Which Tailscale node a Realm goes out through when it is not going out
 # directly. Per Realm, because they do not share one: EXIT_NODE_WORK names
 # work's, and EXIT_NODE is the one the rest fall back to. Empty means nobody
@@ -414,6 +417,37 @@ def ask_to_shut_down(vmid):
         return f"no agent ({exc}); pressed the power button instead"
 
 
+def is_asleep(vmid):
+    """True if the guest has suspended itself (ACPI S3) inside a running VM.
+
+    Proxmox still says "running": the QEMU process is alive. Only QEMU's own
+    status says "suspended". The agent and the remote desktop are frozen with
+    the rest of the guest, so without this a sleeping Realm reads as BOOTING
+    for ever, and the power button cannot stop it: nothing is awake to read
+    the press.
+    """
+    current = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current")
+    return current.get("status") == "running" and current.get("qmpstatus") == "suspended"
+
+
+def wake(vmid, wait=WAKE_WAIT):
+    """Wake a sleeping guest, and give its agent up to `wait` seconds to answer.
+
+    Proxmox's resume sends QEMU's system_wakeup to a guest in S3, not `cont`.
+    Waiting for the agent matters to a stop: it is the agent that shuts the
+    guest down, and the power button is ignored while GNOME holds it.
+    """
+    pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/resume")
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        try:
+            pve("POST", f"/nodes/{PVE_NODE}/qemu/{vmid}/agent/ping")
+            return True
+        except Exception:
+            time.sleep(1)
+    return False
+
+
 def vm_config(vmid):
     """The VM's Proxmox configuration. Readable with VM.Audit."""
     return pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/config")
@@ -461,7 +495,8 @@ class SeatError(Exception):
 def realm_state(name):
     vmid = REALMS[name]
     try:
-        status = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current")["status"]
+        current = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current")
+        status = current["status"]
         config = vm_config(vmid)
         seat = "hostpci0" in config
     except KeyError:
@@ -475,6 +510,10 @@ def realm_state(name):
         # so it is not OFF and must not be reported as if nothing were saved.
         power = "PARKED" if config.get("vmstate") else "OFF"
         return {"realm": name, "vmid": vmid, "power": power, "seat": seat, "ip": None}
+    if current.get("qmpstatus") == "suspended":
+        # Not asked for its address: the agent is asleep too, and the asking
+        # would only wait out its timeout.
+        return {"realm": name, "vmid": vmid, "power": "ASLEEP", "seat": seat, "ip": None}
     ip = realm_ip(vmid)
     # READY means the desktop can actually be connected to, not just that the VM runs.
     power = "READY" if ip and port_open(ip, RDP_PORT) else "BOOTING"
@@ -606,6 +645,13 @@ class Handler(BaseHTTPRequestHandler):
                     and parts[2] in ("start", "stop")):
                 name, vmid = parts[1], REALMS[parts[1]]
                 running = pve("GET", f"/nodes/{PVE_NODE}/qemu/{vmid}/status/current")["status"] == "running"
+                if running and is_asleep(vmid):
+                    # Opening a sleeping Realm wakes it; stopping one has to
+                    # wake it first, or the request reaches nobody.
+                    awake = wake(vmid, wait=0 if parts[2] == "start" else WAKE_WAIT)
+                    log(f"{parts[2]} {name} (vm {vmid}): it was asleep, woke it"
+                        + ("" if awake or parts[2] == "start"
+                           else f"; no agent after {WAKE_WAIT}s"))
                 if parts[2] == "start" and not running:
                     # A start is always headless. Never inherit a seat the last
                     # session left behind, or a remote start would silently take

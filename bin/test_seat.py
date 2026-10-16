@@ -21,7 +21,14 @@ set -eu
 d=$QM_DIR
 cmd=$1; shift
 case "$cmd" in
-  status) echo "status: $(cat "$d/$1.status")" ;;
+  status)
+    echo "status: $(cat "$d/$1.status")"
+    if [ "${2:-}" = --verbose ]; then
+      if [ -f "$d/$1.asleep" ]; then echo "qmpstatus: suspended"
+      else echo "qmpstatus: $(cat "$d/$1.status")"; fi
+    fi ;;
+  resume) rm -f "$d/$1.asleep"; echo "$1" >> "$d/woken" ;;
+  agent) [ ! -f "$d/$1.asleep" ] ;;
   config) cat "$d/$1.conf" ;;
   set)
     vmid=$1; shift
@@ -34,8 +41,9 @@ case "$cmd" in
       fi
     done ;;
   start) echo running > "$d/$1.status" ;;
-  shutdown) echo stopped > "$d/$1.status" ;;
-  guest) [ "$1" = cmd ] && echo stopped > "$d/$2.status" ;;
+  shutdown) [ ! -f "$d/$1.asleep" ] && echo stopped > "$d/$1.status" || true ;;
+  # A sleeping guest's agent hears nothing, so it cannot be shut down.
+  guest) [ "$1" = cmd ] && [ ! -f "$d/$2.asleep" ] && echo stopped > "$d/$2.status" ;;
 esac
 """
 
@@ -101,6 +109,18 @@ with tempfile.TemporaryDirectory() as tmp:
     assert conf(root, 100)["vga"] == "virtio", conf(root, 100)
     assert conf(root, 202)["vga"] == "std", conf(root, 202)
     seat(env, "release", "personal")       # nothing to do, still fine
+
+    # Moving the seat off a Realm whose guest suspended itself. Neither the
+    # agent nor the power button reaches a sleeping guest, so it used to sit
+    # there until the switcher gave up. It is woken first, then shut down.
+    seat(env, "switch", "personal")
+    (root / "202.asleep").write_text("")
+    seat(env, "switch", "work")
+    assert (root / "woken").read_text().split() == ["202"], "it was never woken"
+    assert (root / "202.status").read_text().strip() == "stopped"
+    assert "hostpci0" in conf(root, 201) and "hostpci0" not in conf(root, 202)
+    (root / "201.status").write_text("stopped\n")
+    seat(env, "release", "work")
     for vmid in (100,):
         (root / f"{vmid}.status").write_text("stopped\n")
     seat(env, "release", "windows")

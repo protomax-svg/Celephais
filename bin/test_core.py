@@ -12,12 +12,19 @@ fake = type("fake", (), {"status": "stopped", "agent": False, "rdp": False,
                          "vmstate": None, "suspended": [],
                          "exec_cmd": None, "exec_exit": 0, "exec_fails": False,
                          "exec_out": "", "exec_cmds": [], "stops": [],
-                         "agent_shutdown_fails": False, "tailnet": False})
+                         "agent_shutdown_fails": False, "tailnet": False,
+                         "qmp": None, "woken": 0})
 
 
 def fake_pve(method, path, **form):
     if path.endswith("/status/current"):
-        return {"status": fake.status}
+        return {"status": fake.status, "qmpstatus": fake.qmp or fake.status}
+    if path.endswith("/status/resume"):
+        fake.woken += 1
+        fake.qmp = None                 # system_wakeup: the guest runs again
+        return "UPID:pve:task"
+    if path.endswith("/agent/ping"):
+        return {}
     if path.endswith("/config"):
         config = ({"hostpci0": "0000:01:00.0,pcie=1", "usb0": "host=1532:02a2"}
                   if fake.seat else {"name": "vm"})
@@ -398,6 +405,28 @@ fake.stops, fake.agent_shutdown_fails = [], True
 call("/realms/work/stop", method="POST")
 assert fake.stops == ["acpi"], fake.stops
 fake.agent_shutdown_fails = False
+
+# A guest that suspended itself is "running" to Proxmox and frozen inside:
+# no agent, no remote desktop. It read as BOOTING for ever, and with nothing
+# awake to hear a shutdown it could not be stopped either. Max had to stop
+# `personal` in Proxmox while it sat on the monitors.
+fake.status, fake.qmp, fake.agent, fake.stops, fake.woken = \
+    "running", "suspended", False, [], 0
+assert c.realm_state("work")["power"] == "ASLEEP", c.realm_state("work")
+code, body = call("/realms/work/stop", method="POST")
+assert code == 202 and body["power"] == "STOPPING", body
+# Woken first, then shut down by the agent, not the button GNOME swallows.
+assert fake.woken == 1 and fake.stops == ["agent"], (fake.woken, fake.stops)
+
+# Opening a sleeping Realm wakes it rather than starting what already runs.
+fake.qmp, fake.woken = "suspended", 0
+call("/realms/work/start", method="POST")
+assert fake.woken == 1 and fake.qmp is None, fake.woken
+# Nothing asleep, nothing woken.
+fake.stops = []
+call("/realms/work/stop", method="POST")
+assert fake.woken == 1, "a Realm that was awake was woken"
+fake.status = "stopped"
 
 srv.shutdown()
 print("PASS")

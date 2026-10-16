@@ -106,9 +106,17 @@ attach_seat() {
 # key, so logind never sees the press and `qm shutdown` waits for a guest that
 # was never asked. The agent runs the shutdown inside, with no desktop in the
 # way. A Realm without a working agent still gets the button.
+#
+# A guest that suspended itself hears neither: its agent is frozen and the
+# button reaches nobody. Proxmox's resume wakes it (system_wakeup, not cont),
+# and the agent gets a moment to come back before anything is asked of it.
 stop_realm() {
   local i
   [ "$(vm_status "$1")" = running ] || return 0
+  if qm status "$1" --verbose | grep -q '^qmpstatus: suspended'; then
+    qm resume "$1"
+    for i in $(seq 20); do qm agent "$1" ping >/dev/null 2>&1 && break; sleep 1; done
+  fi
   if qm guest cmd "$1" shutdown >/dev/null 2>&1; then
     for i in $(seq "$SHUTDOWN_TIMEOUT"); do
       [ "$(vm_status "$1")" = stopped ] && break
