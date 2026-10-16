@@ -71,7 +71,7 @@ connection:
 
 "nothing answered on port 3389" means the Realm is up but this machine has no
 way to its network. Away from home, only a Realm that is on the tailnet itself
-can be reached - today that is `work`. The others answer on the house wire
+can be reached - `work` and `personal`. Windows answers on the house wire
 only.
 
 If a client cannot make sense of this machine's monitors it says so and the

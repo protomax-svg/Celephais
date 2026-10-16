@@ -29,9 +29,16 @@ export DEBIAN_FRONTEND=noninteractive
 # `apt-get update`, which used to stop this script before it did anything.
 # The package lists on hand are usually enough, so try them first and only
 # refresh if they are not, without letting a broken repository be fatal.
-command -v mount.cifs >/dev/null || apt-get install -y -qq cifs-utils >/dev/null 2>&1 || {
-  apt-get update -qq || true
-  apt-get install -y -qq cifs-utils >/dev/null; }
+# dnf is told outright that a broken repository is not fatal.
+if ! command -v mount.cifs >/dev/null; then
+  if command -v dnf >/dev/null; then
+    dnf install -y -q --setopt=skip_if_unavailable=True cifs-utils
+  else
+    apt-get install -y -qq cifs-utils >/dev/null 2>&1 || {
+      apt-get update -qq || true
+      apt-get install -y -qq cifs-utils >/dev/null; }
+  fi
+fi
 
 # The password goes in a file only root can read. On the mount line it would
 # be visible in /proc/mounts to every user on the machine.
