@@ -2573,3 +2573,33 @@ was told to; two switches seventeen seconds apart, which is what provoked the
 accounts-daemon race; 3389 on the Realm's own desktop and 3390 on the agent's
 at the same time; and the agent's desktop active across all four switches,
 same start time throughout.
+
+### The one that would have come back every reboot
+*27 October 2026*
+
+`work` came up from a cold boot with its seat in GNOME, as told, and with
+**xrdp holding port 3389** - disabled, and running anyway. Three minutes of a
+Realm whose own desktop was Wayland and whose RDP port led to a VNC bridge
+with no X session behind it.
+
+`xrdp-sesman.service` is enabled by its own package and carries
+`BindsTo=xrdp.service`, which implies Requires: starting sesman starts xrdp.
+Disabling xrdp alone therefore achieves nothing that survives a reboot - the
+service comes back, pulled in by a unit nothing here uses, because the bridge
+is autorun straight into a libvnc module and never asks sesman for a session
+at all. The two are disabled and enabled together now, in `celephais-desktop`
+and in `install-realm.sh`. It took a reboot to find, which is the point: every
+switch tested so far had been on a machine that was already up.
+
+**Proven by that same reboot:** the agent's three services came back by
+themselves, the seat logged itself into the desktop it was told to, and both
+ports were serving - which is the cold-boot path that had not been tested
+before.
+
+And a clarity fix, prompted by somebody reading the chooser and reasonably
+asking what the agent was running. The screen said only "a desktop of its own
+for an agent, on :2". It names it now - *Xfce on X11, at :2* - because that is
+the one question worth answering about an agent's desktop: whether it is the
+X11 one an agent can work in. It is, and it cannot be anything else: the
+display is an Xvfb, and no Wayland is anywhere near it. The seat's desktop and
+the agent's share nothing but a user.

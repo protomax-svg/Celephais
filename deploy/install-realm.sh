@@ -408,7 +408,10 @@ EOF
     systemctl is-active celephais-x11vnc.service xrdp.service
   else
     systemctl disable --now celephais-x11vnc.service 2>/dev/null || true
-    systemctl disable --now xrdp 2>/dev/null || true
+    # sesman too: it is enabled by its own package and BindsTo=xrdp.service,
+    # so an xrdp disabled on its own is started again at the next boot by
+    # sesman, and takes 3389 from the server this Realm actually uses.
+    systemctl disable --now xrdp xrdp-sesman 2>/dev/null || true
     echo "x11vnc and xrdp are set up and idle; the Gate can switch to them"
   fi
 

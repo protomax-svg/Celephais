@@ -45,8 +45,16 @@ GDM_CONFS = ("/etc/gdm3/custom.conf", "/etc/gdm/custom.conf")
 # The system services each backend owns, and the user services that belong to
 # the session itself. A user service is enabled rather than started: the
 # session it lives in does not exist yet when the switch happens.
+# xrdp-sesman belongs on this list although nothing here uses it. The bridge
+# is autorun straight into a libvnc module and never asks sesman for a
+# session - but xrdp-sesman.service is enabled by its own package and carries
+# BindsTo=xrdp.service, which implies Requires, so starting sesman starts
+# xrdp. Disable xrdp alone and it comes back at the next boot anyway, pulled
+# in by sesman, to take port 3389 from a GNOME Realm's own server before it
+# can have it. Disabled together, or not at all.
 BACKENDS = {
-    "x11vnc": {"system": ["xrdp", "celephais-x11vnc"], "user": []},
+    "x11vnc": {"system": ["xrdp", "xrdp-sesman", "celephais-x11vnc"],
+               "user": []},
     "gnome": {"system": [],
               "user": ["gnome-remote-desktop-headless", "celephais-monitors"]},
 }
@@ -252,16 +260,18 @@ def agent_desk():
     """
     if not os.path.exists(AGENT_UNIT):
         return None
-    display = screen = ""
+    display = screen = session = ""
     for line in open(AGENT_UNIT):
         words = line.split()
-        for flag, into in (("--display", "display"), ("--screen", "screen")):
+        for flag in ("--display", "--screen", "--session"):
             if flag in words:
                 value = words[words.index(flag) + 1]
-                if into == "display":
+                if flag == "--display":
                     display = value
-                else:
+                elif flag == "--screen":
                     screen = value
+                else:
+                    session = value
     port = 0
     try:
         for line in open(AGENT_INI):
@@ -274,8 +284,13 @@ def agent_desk():
              "celephais-xrdp-agent")
     running = all(run("systemctl", "is-active", "--quiet", unit).returncode == 0
                   for unit in units)
+    # Named, because "a desktop on :2" tells nobody what is in it, and the
+    # one question anyone has about an agent's desktop is whether it is the
+    # X11 one the agent needs. It always is: this display is an Xvfb, and
+    # there is no Wayland anywhere near it.
+    desktop = re.sub(r"4?-session$", "", session or "xfce4-session")
     return {"display": display, "screen": screen, "rdp_port": port,
-            "running": running}
+            "session": desktop, "type": "x11", "running": running}
 
 
 def show(realm):

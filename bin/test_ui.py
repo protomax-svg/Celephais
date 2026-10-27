@@ -60,7 +60,8 @@ hooks = {
 DESKTOPS = {"user": "workrealm", "current": "xfce", "running": "xfce",
             "backend": "x11vnc",
             "agent": {"display": ":2", "screen": "1920x1080",
-                      "rdp_port": 3390, "running": True},
+                      "rdp_port": 3390, "session": "xfce", "type": "x11",
+                      "running": True},
             "choices": [
                 {"name": "xfce", "label": "Xfce Session", "type": "x11",
                  "backend": "x11vnc", "usable": True, "why": ""},
@@ -363,7 +364,10 @@ try:
     assert pump(app, until=lambda: "desktop for work" in texts(app.panes[0])), \
         f"it never asked: {texts(app.panes[0])}"
     shown = texts(app.panes[0])
-    assert any(":2" in line for line in shown), shown
+    # Named, not just located: the one question anyone has about an agent's
+    # desktop is whether it is the X11 one an agent can actually work in.
+    assert any(":2" in line and "Xfce" in line and "X11" in line
+               for line in shown), shown
     labels = [b.cget("text") for b in all_buttons(app.panes[0])]
     assert labels.count("watch the agent") == 1, labels
     assert labels.count("boot into this") == 1, labels

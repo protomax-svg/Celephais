@@ -678,9 +678,11 @@ class Overlay:
             agent = info.get("agent")
             if agent:
                 where = agent.get("display", "")
+                what = (agent.get("session") or "").title() or "a desktop"
+                kind = (agent.get("type") or "").upper()
                 self.label(pane, f"this Realm also keeps a desktop of its own "
-                                 f"for an agent, on {where}", 11, DIM,
-                           pady=(16, 2))
+                                 f"for an agent: {what} on {kind}, at {where}",
+                           11, DIM, pady=(16, 2))
                 if agent.get("running"):
                     self.button(pane, "watch the agent",
                                 lambda: self.go("open_agent", name)
