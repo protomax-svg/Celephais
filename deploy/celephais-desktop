@@ -90,11 +90,19 @@ class Realm:
                  "name it with --user")
 
     def as_user(self, *command):
-        """Run something inside the user's own session bus."""
-        return run("sudo", "-u", self.name, *command, env=dict(
-            os.environ,
-            XDG_RUNTIME_DIR=f"/run/user/{self.uid}",
-            DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{self.uid}/bus"))
+        """Run something inside the user's own session bus.
+
+        The variables go to sudo as arguments, not in the environment handed
+        to sudo: sudo resets the environment before it runs anything, so a
+        DBUS_SESSION_BUS_ADDRESS set that way never arrives. Anything not
+        needing the bus works regardless, which is what made this quiet -
+        `grdctl status` answered perfectly while every `systemctl --user`
+        failed to reach the user's manager and said nothing.
+        """
+        return run("sudo", "-u", self.name,
+                   f"XDG_RUNTIME_DIR=/run/user/{self.uid}",
+                   f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{self.uid}/bus",
+                   *command)
 
     @property
     def accounts_file(self):
@@ -111,15 +119,33 @@ class Realm:
         return ""
 
     def running(self):
-        """The session actually on the screen now, if there is one.
+        """The desktop on the Realm's own seat now, if there is one.
 
-        XDG_CURRENT_DESKTOP out of the session's own environment is the
-        honest answer; it says GNOME or XFCE rather than the name of a file.
+        Not simply "a desktop of this user's is running": a Realm with an
+        agent's desktop on it has a second xfce4-session running as this same
+        user at all times, and `pgrep -u` cannot tell the two apart - it
+        answers "xfce" while the seat is logged out, empty, or showing a
+        greeter, which leaves a switch waiting for the old session to end
+        waiting for ever.
+
+        What tells them apart is which slice they are in. A desktop somebody
+        is logged into belongs to a logind session, and everything in it -
+        the session scope, and the user manager where a systemd-started GNOME
+        keeps gnome-shell - hangs under user.slice. A desktop systemd runs as
+        a service does not: celephais-agent-desktop lives in system.slice,
+        where no amount of logging out can reach it.
         """
-        for process in ("xfce4-session", "gnome-shell", "plasmashell"):
+        for process, desktop in (("xfce4-session", "xfce"),
+                                 ("gnome-shell", "gnome"),
+                                 ("plasmashell", "plasma")):
             found = run("pgrep", "-u", str(self.uid), "-x", process)
-            if found.returncode == 0:
-                return process.replace("4-session", "").replace("shell", "")
+            for pid in found.stdout.split():
+                try:
+                    where = open(f"/proc/{pid}/cgroup").read()
+                except OSError:
+                    continue
+                if "/user.slice/" in where:
+                    return desktop
         return ""
 
 
@@ -302,6 +328,25 @@ def write_accounts(realm, session):
     with open(realm.accounts_file, "w") as handle:
         handle.write("\n".join(out).rstrip("\n") + "\n")
 
+    # And then tell the daemon, which is the part that actually decides.
+    # GDM does not read this file: it asks accounts-daemon, which holds its
+    # own copy in memory and rewrites the file whenever somebody logs in.
+    # Writing the file alone is a race against that copy, and a race this
+    # loses - a switch that follows another one by a few seconds finds the
+    # daemon still holding the desktop of the login that just happened, GDM
+    # asks, and the Realm comes back up in the desktop it was told to leave.
+    # The file is still written first, for a Realm whose daemon is not
+    # running; where one is, these two calls are what GDM will be answered
+    # with.
+    path = f"/org/freedesktop/Accounts/User{realm.uid}"
+    for method, value in (("SetSession", session["name"]),
+                          ("SetSessionType", session["type"])):
+        done = run("busctl", "call", "org.freedesktop.Accounts", path,
+                   "org.freedesktop.Accounts.User", method, "s", value)
+        if done.returncode != 0:
+            print(f"celephais-desktop: accounts-daemon refused {method}: "
+                  f"{done.stderr.strip()}", file=sys.stderr)
+
 
 def switch_backend(realm, wanted):
     """Take port 3389 off the old server and hand it to the new one.
@@ -323,9 +368,46 @@ def switch_backend(realm, wanted):
     for unit in BACKENDS[wanted]["system"]:
         run("systemctl", "enable", unit)
     # A user service cannot be started into a session that does not exist, but
-    # enabling it persists, so the next session starts it itself.
+    # enabling it persists, so the next session starts it itself. Said out
+    # loud when it does not work: an enable that quietly failed is a Realm
+    # that logs out, comes back, and serves nothing, with no clue as to why.
     for unit in BACKENDS[wanted]["user"]:
-        realm.as_user("systemctl", "--user", "enable", unit)
+        done = realm.as_user("systemctl", "--user", "enable", unit)
+        if done.returncode != 0:
+            print(f"celephais-desktop: could not enable {unit}: "
+                  f"{done.stderr.strip() or done.stdout.strip()}",
+                  file=sys.stderr)
+
+
+GDM_CONF = ("/etc/gdm3/custom.conf" if os.path.isdir("/etc/gdm3")
+            else "/etc/gdm/custom.conf")
+
+
+def display_manager():
+    """The unit that owns the login screen, by whatever name it has here."""
+    name = run("systemctl", "show", "display-manager.service",
+               "-p", "Id", "--value").stdout.strip()
+    return name or "display-manager.service"
+
+
+def autologin_set(realm):
+    """Whether the login screen will let this user back in by itself.
+
+    It matters more than it looks. Changing a desktop means ending the
+    session running in it, and on a Realm there is no one sitting at a
+    screen to log back in: if the display manager comes back to a greeter,
+    the Realm has no session, no X server, nothing serving RDP, and the only
+    way to it left is the hypervisor's console. Better to refuse the switch
+    while the Realm is still working than to perform it and strand it.
+    """
+    try:
+        conf = open(GDM_CONF).read()
+    except OSError:
+        return False
+    return (re.search(r"^AutomaticLoginEnable\s*=\s*true", conf,
+                      re.M | re.I) is not None
+            and re.search(rf"^AutomaticLogin\s*=\s*{re.escape(realm.name)}\s*$",
+                          conf, re.M) is not None)
 
 
 def wait_for(what, seconds, check):
@@ -362,23 +444,43 @@ def set_session(realm, name):
     if not usable:
         sys.exit(f"celephais-desktop: cannot serve {name}: {missing or why}")
 
+    if not autologin_set(realm):
+        raise ValueError(
+            f"{realm.name} would not be logged back in: automatic login is "
+            f"not set in {GDM_CONF}. Re-run install-realm.sh, which sets it, "
+            "before changing the desktop.")
+
     write_accounts(realm, session)
     switch_backend(realm, backend)
 
-    # The session holding the old desktop has to go for the new one to start,
-    # and GDM's automatic login is what brings it back - which is why
-    # install-realm.sh insists on setting that up. Everything open in the old
-    # session is closed; there is no way to change a desktop under itself.
+    # Both of these, and in this order. Ending the session is what frees the
+    # desktop, but automatic login happens once, when the display manager
+    # starts: log the user out of a running GDM and it puts up a greeter
+    # instead, and a greeter on a Realm nobody is sitting in front of is the
+    # end of the road - no session, no X, nothing on 3389, and the way back
+    # in is the hypervisor's console. Restarting the display manager is what
+    # makes it log the user in again, into whichever desktop AccountsService
+    # now names. On its own it is not enough either: a logind session is not
+    # the display manager's child and outlives it, so restarting GDM over a
+    # running session leaves that session where it was and puts the new one
+    # beside it - two desktops for one user, and the Realm still serving the
+    # old one. Everything open in the old session closes: there is no
+    # changing a desktop underneath itself.
     run("loginctl", "terminate-user", realm.name)
-    wait_for("the old session", 10,
-             lambda: not logged_in(realm) and not os.path.isdir(
-                 f"/run/user/{realm.uid}"))
-    came_back = wait_for("the new session", 30, lambda: logged_in(realm))
+    gone = wait_for("the old session", 15, lambda: not logged_in(realm))
+    run("systemctl", "restart", display_manager())
+    came_back = wait_for("the new session", 45, lambda: logged_in(realm))
     for unit in BACKENDS[backend]["system"]:
         run("systemctl", "start", unit)
-    serving = wait_for("port 3389", 20, port_open)
+    # Enabling a user service only promises the next session will start it,
+    # and "the next session" has just happened - but a service wanted by a
+    # target this desktop does not reach would still be sitting there. Ask
+    # for it directly now that there is a session to ask in.
+    for unit in BACKENDS[backend]["user"]:
+        realm.as_user("systemctl", "--user", "start", unit)
+    serving = wait_for("port 3389", 25, port_open)
     print(json.dumps({"user": realm.name, "current": name, "backend": backend,
-                      "running": realm.running(), "logged_out": True,
+                      "running": realm.running(), "logged_out": gone,
                       "serving": serving and came_back}))
 
 

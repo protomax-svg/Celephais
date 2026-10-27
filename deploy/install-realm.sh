@@ -350,6 +350,10 @@ User=$USER_NAME
 ExecStart=/usr/local/bin/celephais-x11vnc --password-file $VNC_PASSWD --screen $SCREEN
 Restart=always
 RestartSec=5
+# x11vnc answers SIGTERM with exit 2, so every deliberate stop - and the
+# desktop switch stops it every time - would otherwise leave the unit sitting
+# in "failed" with nothing wrong with it.
+SuccessExitStatus=2
 
 [Install]
 WantedBy=graphical.target
@@ -486,6 +490,7 @@ ExecStart=/usr/local/bin/celephais-x11vnc --display $AGENT_DISPLAY \
   --auth $AGENT_AUTH --password-file $VNC_PASSWD --rfbport $AGENT_VNC_PORT
 Restart=always
 RestartSec=5
+SuccessExitStatus=2
 
 [Install]
 WantedBy=multi-user.target

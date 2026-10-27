@@ -2507,3 +2507,69 @@ own, which does not exist yet - see the entry above. One run of
 `install-realm.sh --agent` by somebody who can type the password finishes all
 of it. The staged copy at `~workrealm/celephais/` is the whole directory, not
 just the script: it installs its siblings and cannot find them otherwise.
+
+### Five reasons one switch did not work
+*27 October 2026*
+
+The first real use of the desktop chooser - Xfce to GNOME, on `work`, with an
+agent's desktop beside it - failed, and went on failing in a different way
+each time it was fixed. Every one of these was invisible in testing against a
+Realm with nothing else running on it.
+
+**GDM logs a user in automatically once, when GDM starts.** Not once per
+logout. `celephais-desktop` ended the session and waited to be let back in;
+GDM put up a greeter instead. On a Realm nobody is sitting in front of, a
+greeter is the end of the road: no session, no X server, nothing on 3389, and
+the only way back in is the hypervisor's console - which is exactly where this
+was found. Restarting the display manager is what makes it log the user in
+again. But only restarting it is not enough either, because a logind session
+is not the display manager's child and outlives it: restarting GDM over a
+running session leaves that session where it was and starts the new one beside
+it, two desktops for one user. It takes both, in order - end the session,
+then restart the display manager.
+
+**The agent's desktop died with somebody else's logout.** It had taken
+`/run/user/1000` for its runtime directory, and `loginctl terminate-user`
+takes that down. So ending the Realm user's session took the session bus out
+from under the agent's desktop, and the agent stopped - taken out by a logout
+that had nothing to do with it, which is the one thing that desktop exists to
+be safe from. It gets a runtime directory of its own now, from the service's
+own `RuntimeDirectory=`, which nothing but this service stopping removes.
+
+**`pgrep -u` cannot tell two desktops apart.** `running()` asked whether this
+user had an xfce4-session, and on a Realm with an agent's desktop the answer
+is yes, always - that is what the agent is working in. So the tool believed a
+desktop was up while the seat was logged out, empty, or showing a greeter, and
+waited for an old session to end that was never going to. What tells them
+apart is the slice: a desktop somebody is logged into hangs under user.slice,
+and a desktop systemd runs as a service lives in system.slice.
+
+**Every `systemctl --user` this tool ran failed silently.** `as_user` built an
+environment with `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` in it and
+handed that to `sudo`, which resets the environment before running anything.
+The variables never arrived. What made it quiet is that most of what goes
+through `as_user` does not need the session bus - `grdctl status` answered
+perfectly throughout - so the only symptom was a Realm that logged out, came
+back, and served nothing. The shell `as_user` in install-realm.sh had it right
+all along: the assignments go to sudo as arguments, not in its environment.
+A failed enable now says so.
+
+**GDM does not read the AccountsService file.** It asks accounts-daemon, which
+keeps its own copy in memory and writes the file itself whenever somebody logs
+in. Writing the file is therefore a race against that copy, and this is a race
+that loses: a switch a few seconds after another finds the daemon still
+holding the desktop of the login that just happened, GDM asks it, and the
+Realm comes back up in the desktop it was told to leave. The file still gets
+written, for a Realm with no daemon running; where there is one, `SetSession`
+and `SetSessionType` over the bus are what GDM will be answered with.
+
+And one cosmetic thing worth the line it takes: x11vnc answers SIGTERM with
+exit 2, and the switch stops it every time, so its unit sat in `failed` with
+nothing wrong with it. `SuccessExitStatus=2`.
+
+**Verified:** xfce -> gnome -> xfce -> gnome on the live Realm, each one
+`logged_out: true`, `serving: true`, the session coming back in the desktop it
+was told to; two switches seventeen seconds apart, which is what provoked the
+accounts-daemon race; 3389 on the Realm's own desktop and 3390 on the agent's
+at the same time; and the agent's desktop active across all four switches,
+same start time throughout.

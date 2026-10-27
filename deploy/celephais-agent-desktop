@@ -45,18 +45,25 @@ done
 # things a desktop takes for granted are simply absent. XDG_RUNTIME_DIR is the
 # one that matters: dbus, xfconf and everything downstream of them put their
 # sockets there, and with it unset they fall back to whatever they can find
-# and then disagree about where it was. The directory itself is logind's, and
-# it is there because the Realm's user lingers.
-: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+# and then disagree about where it was.
+#
+# It gets one of its own rather than logind's /run/user/<uid>, and that is the
+# whole point of this paragraph. Sharing the Realm user's runtime directory
+# read well until the first desktop switch, which ends that user's session:
+# logind takes /run/user/<uid> down with it, the session bus goes, this
+# desktop dies with it, and the agent working in it stops - taken out by
+# somebody else's logout, which is exactly the dependency this service exists
+# to avoid. systemd makes this one through RuntimeDirectory= and nothing but
+# this service's own stopping removes it.
+RUNTIME=$(dirname "$AUTH")
+install -d -m 700 "$RUNTIME"
+XDG_RUNTIME_DIR=$RUNTIME
 export XDG_RUNTIME_DIR
-[ -d "$XDG_RUNTIME_DIR" ] || {
-  echo "no $XDG_RUNTIME_DIR: the Realm's user is not lingering" >&2; exit 1; }
 
 # The cookie is made here rather than left to chance: an X server with no
 # authority file at all decides who may connect by host, and every process on
 # the Realm is on the right host. One file, readable by this user and nobody
 # else, written before the server that will demand it starts.
-install -d -m 700 "$(dirname "$AUTH")"
 rm -f "$AUTH"
 (umask 077; : > "$AUTH")
 xauth -f "$AUTH" add "$DISPLAY_NUM" MIT-MAGIC-COOKIE-1 "$(mcookie)"
