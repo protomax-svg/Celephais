@@ -334,8 +334,8 @@ _ENDED_BY_USER = ("ERRINFO_LOGOFF_BY_USER", "DISCONNECT_BY_USER",
 # and asks for the password again, which is better than any sentence here.
 _PLAIN = (
     ("ERRCONNECT_CONNECT_FAILED",
-     "nothing answered on port 3389: the Realm is up, but this machine "
-     "cannot reach its network"),
+     "nothing answered on the Realm's RDP port: the Realm is up, but this "
+     "machine cannot reach its network"),
     ("ERRCONNECT_PRE_CONNECT_FAILED",
      "no RDP client here could make sense of this machine's monitors"),
 )
@@ -519,7 +519,7 @@ def realm_login(name):
 
 
 def connect(name, ip, extra, say=None, user="", password="",
-            one_monitor=False):
+            one_monitor=False, port=3389):
     """Open the Realm in an RDP client. Returns (exit code, what went wrong).
 
     one_monitor keeps the Realm on a single screen. It works by not asking
@@ -564,14 +564,14 @@ def connect(name, ip, extra, say=None, user="", password="",
         # can take. Wait it out here, where it can be said what is happening.
         tell(f"finding the way to {name}\u2026")
         try:
-            celephais_net.reach(NET["socks5"], ip, 3389)
+            celephais_net.reach(NET["socks5"], ip, port)
         except celephais_net.NetError:
-            return 1, (f"{name} did not answer at {ip} through the Gate's "
-                       "private network")
+            return 1, (f"{name} did not answer at {ip}:{port} through the "
+                       "Gate's private network")
         # Carry the connection ourselves rather than rely on the client having
         # a proxy setting. Windows' own mstsc has none.
-        port, listener = celephais_net.forward(NET["socks5"], ip, 3389)
-        target = f"127.0.0.1:{port}"
+        local, listener = celephais_net.forward(NET["socks5"], ip, port)
+        target = f"127.0.0.1:{local}"
     # The Realm is asked to cover every monitor unless told otherwise. Absent
     # on purpose when it is: see one_monitor above.
     span = [] if one_monitor else ["/multimon"]
@@ -773,6 +773,33 @@ def ui_session(no_tailnet=False):
             raise RuntimeError(why or f"the RDP client exited with code {code}")
         return True
 
+    def open_agent(name, say, hide, user="", password="", one_monitor=False):
+        """Open the desktop the Realm keeps for an agent, not the Realm's own.
+
+        A second desktop on the same Realm, on a port of its own, which the
+        Realm itself is asked about rather than assumed: a Realm set up
+        without one says so here instead of timing out against a closed port.
+        Always on one screen, whatever the Gate is set to - the agent's
+        desktop is a single display of a fixed size, and asking FreeRDP to
+        span three monitors onto it only makes xrdp shrink the client to fit.
+        """
+        say("starting\u2026")
+        core(f"/realms/{name}/start", "POST")
+        ip = wait_ready(name, say)
+        desk = (desktops(name) or {}).get("agent") or {}
+        if not desk.get("rdp_port"):
+            raise RuntimeError(f"{name} keeps no desktop for an agent: "
+                               "re-run install-realm.sh --agent in it")
+        if not desk.get("running"):
+            raise RuntimeError(f"the agent's desktop on {name} is not running")
+        say(f"connecting to the agent's desktop on {ip}\u2026")
+        hide()
+        code, why = connect(name, ip, [], say, user, password,
+                            one_monitor=True, port=desk["rdp_port"])
+        if code:
+            raise RuntimeError(why or f"the RDP client exited with code {code}")
+        return True
+
     def stop(name, say, confirmed=False):
         say("shutting it down\u2026")
         core(f"/realms/{name}/stop", "POST")
@@ -794,6 +821,26 @@ def ui_session(no_tailnet=False):
         say(reply.get("power", "").lower() or "parked")
         return True
 
+    def desktops(name):
+        """Which desktop this Realm boots into, and what else it has."""
+        return core(f"/realms/{name}/desktop")
+
+    def set_desktop(name, choice, say=None):
+        """Move the Realm to another desktop and wait for it to answer again.
+
+        Core does not come back until the Realm has logged out, logged back
+        in and reopened the port, so there is usually nothing left to wait
+        for here - but the Realm is checked from outside all the same, since
+        a server that answers the guest's own `ss` is not yet proof that this
+        machine can reach it.
+        """
+        tell = say or (lambda _text: None)
+        tell(f"switching to {choice}\u2026")
+        core(f"/realms/{name}/desktop?name={urllib.parse.quote(choice)}", "POST")
+        tell("waiting for the desktop to come back\u2026")
+        wait_ready(name, tell)
+        return True
+
     def set_device(ident, action):
         return core(f"/devices/{urllib.parse.quote(ident, safe='')}"
                     f"?action={action}", "POST")
@@ -808,7 +855,8 @@ def ui_session(no_tailnet=False):
         return True
 
     return stack, {"unlock": unlock, "realms": lambda: core("/realms"),
-                   "open_remote": open_remote, "take_seat": take_seat,
+                   "open_remote": open_remote, "open_agent": open_agent,
+                   "take_seat": take_seat,
                    "park": park, "stop": stop, "release": release,
                    "stored_password": stored_password,
                    # Which way the overlay's own switch starts out. The vault
@@ -816,7 +864,8 @@ def ui_session(no_tailnet=False):
                    "prefer_one_monitor": lambda: flag("ONE_MONITOR"),
                    "rdp_login": rdp_login,
                    "devices": lambda: core("/devices"),
-                   "set_device": set_device}
+                   "set_device": set_device,
+                   "desktops": desktops, "set_desktop": set_desktop}
 
 
 def main():

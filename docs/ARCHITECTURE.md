@@ -11,7 +11,7 @@ Items marked **[verify]** come from research that was not confirmed at the sourc
 - The biggest risk is not technical. It is **feel**: is a remote desktop good enough to be "my computer"? We can test that **before writing code** (Phase 0).
 - v0.1 stack:
   - Server: **Proxmox VE** (KVM/QEMU).
-  - Environment: **Ubuntu VM** with headless **RDP** (gnome-remote-desktop, or xrdp as fallback).
+  - Environment: **Ubuntu VM** with headless **RDP** (gnome-remote-desktop on GNOME; x11vnc behind xrdp on Xfce — see §12).
   - Display client: **FreeRDP 3** (`sdl-freerdp`), run as a child process.
   - Network: **Go tsnet sidecar** (embedded Tailscale, userspace, no admin, no install).
   - Control: the **Proxmox API** directly, with a narrow-scope token. No custom server in v0.1.
@@ -154,7 +154,7 @@ Mitigations, in order of value:
 |---|---|
 | Hypervisor + API | Proxmox VE (KVM/QEMU, ZFS, LXC) |
 | Private network, portable | Tailscale **tsnet** (Go library), optionally **Headscale** later |
-| Remote display (v0.1) | **FreeRDP 3** client; **gnome-remote-desktop** or **xrdp** server |
+| Remote display (v0.1) | **FreeRDP 3** client; **gnome-remote-desktop** server on GNOME, **xrdp** in front of **x11vnc** on Xfce |
 | Remote display (GPU, later) | **Sunshine** + **Moonlight** (GPL-3; run as a separate process, do not link) |
 | Android environment (later) | **Redroid** or **BlissOS**; **scrcpy** |
 | Encryption | **age** (Rust crate `age`), **rustls** |
@@ -181,8 +181,15 @@ Proxmox host (ZFS)
 
 ## 12. Remote display architecture
 
-- v0.1: **RDP everywhere.**
-  - Linux VM: gnome-remote-desktop headless (Ubuntu 24.04 or 26.04), with xrdp as the fallback if session persistence fails.
+- v0.1: **RDP everywhere.** The Gate speaks RDP and only RDP. Which server answers on 3389 is the Realm's business, and depends on its desktop; `deploy/install-realm.sh` sets up either and is told which by `--desktop`.
+  - Linux VM on **GNOME**: gnome-remote-desktop in its headless mode (`personal`, Fedora). It serves the session already running, so windows survive a disconnect, and it adds one virtual monitor per client monitor — which is what `deploy/celephais-monitors` then lays out.
+  - Linux VM on **Xfce**, or any other X11 desktop: **x11vnc** attached to the X server the session already owns, with **xrdp** in front of it translating RDP to VNC over the loopback (`work`, Ubuntu). `grdctl` drives mutter's own screencast API and no other desktop implements it, so a Realm that leaves GNOME leaves gnome-remote-desktop behind with it; x11vnc asks for nothing but an X server. The VNC port stays on `127.0.0.1`, reachable by xrdp and by an `ssh -L 5900:127.0.0.1:5900` tunnel, and by nothing else.
+    - What the bridge costs, measured on `work`: **one screen**, so `/multimon` spans nothing. Its **size is set on the Realm** (`install-realm.sh --screen`, 1920x1080 by default) because x11vnc only ever follows the X screen and answers a client asking to resize it with *"resize is administratively prohibited"*; xrdp then sizes the client to the Realm instead. The **clipboard** crosses as text (ISO-8859-1). **Sound does not cross at all** — xrdp's audio belongs to its own session modules, and this path does not use them. The picture is not raw VNC on the wire: xrdp still negotiates **GFX with the RemoteFX progressive codec** with FreeRDP.
+    - `celephais-monitors` is GNOME's and is removed on such a Realm: there is one screen to lay out and mutter is not there to lay it out.
+  - **Choosing between them.** A Realm with both desktops installed can be set up with both servers (`install-realm.sh --switchable`), one of them running. `deploy/celephais-desktop` in the guest is what moves it: it writes the session AccountsService hands GDM, takes port 3389 off the old server and gives it to the new one, logs the session out and waits for the new one to answer. Core exposes it as `GET`/`POST /realms/<name>/desktop` and the Gate as a `desktop` button on the Realm's row. The cost is the logout — a desktop cannot be changed under a session that is running in it — so it is offered with that said on the screen.
+  - **A desktop for an agent, beside the Realm's own** (`install-realm.sh --agent`). An agent that works in a desktop should not work in the one a person is using: log out, or switch desktops, and the session it had everything open in is gone, and a pointer moving on its own in somebody's working session is its own problem. So a second desktop runs at the same time as the Realm's: `deploy/celephais-agent-desktop` holds an **Xvfb** display (`:2` by default) with Xfce on it, started by systemd rather than by a display manager, so no one logs into or out of it and it is up from boot to shutdown. Its own `celephais-x11vnc` serves it on **5901**, and an **xrdp of its own** (`--config /etc/xrdp/xrdp-agent.ini`, port **3390**) fronts that — a second xrdp rather than a second section in the first, because the Realm's own xrdp is stopped and started as its desktop is switched and the agent's desktop has no business going dark because somebody chose GNOME.
+    - It runs **as the Realm's own user**, so the agent has the same home, files and logged-in accounts as the person whose Realm it is. That is the point of it, and it has one cost: single-instance applications. A browser started on the agent's display while the same browser is open on the Realm's own will not start a second browser — it asks the first to open a window, which appears in the other session. An agent wants a profile of its own (`firefox -P <name> --no-remote`, or a separate `--user-data-dir`).
+    - An agent running **inside** the Realm needs nothing on the wire: `DISPLAY=:2 XAUTHORITY=/run/celephais-agent/Xauthority`. The RDP port is for watching it. `celephais-desktop show` reports the desk beside the choices (it is not one of them — nothing switches to it), Core passes that through unchanged, and the Gate offers *watch the agent* on the desktop screen, always on one screen because the display is one fixed size. **The tailnet ACL allows `vm-*:3389` only**, so watching from a Gate away from the house wire needs 3390 added to it.
   - Windows VM (later): RDP is built into Windows. It is free and needs no GPU.
   - Client: `sdl-freerdp /f /dynamic-resolution /gfx:AVC444 +clipboard /sound /microphone ...` These are FreeRDP command-line flags. The launcher builds this command.
 - Later: **Sunshine + Moonlight** for VMs with a passed-through GPU (lowest latency, 60–120 fps).

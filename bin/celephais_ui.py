@@ -494,10 +494,16 @@ class Overlay:
                         offered["stop"] = ("stop", False)
                     if realm.get("seat"):
                         offered["release"] = ("give the monitors back", False)
+                    # Only a Realm that is up can be asked: the choice is kept
+                    # inside the guest, and the agent answers for nobody when
+                    # the VM is off.
+                    if realm["power"] == "READY":
+                        offered["desktop"] = ("desktop", False)
                     # A fixed column per action, so the same button sits under
                     # the same button on every row.
                     for column, action in enumerate(("open_remote", "take_seat",
-                                                     "park", "stop", "release"),
+                                                     "park", "stop", "release",
+                                                     "desktop"),
                                                     start=2):
                         if action not in offered:
                             continue
@@ -611,6 +617,96 @@ class Overlay:
         self.focus_widgets = ()
         self.claim_focus()
 
+    def ask_desktop(self, name, info):
+        """Which desktop this Realm comes up in, and a way to change it.
+
+        The Realm answers for itself: what it boots into, what is installed on
+        it, and which of those Celephais can actually serve - a Wayland
+        desktop that is not GNOME is listed and refused, with the reason
+        where the button would be, because a desktop nobody can connect to is
+        worth knowing about before it is chosen rather than after.
+
+        Choosing is not free and the screen says so: the session is logged
+        out, so everything open in it closes, and the Realm is away for as
+        long as it takes to log back in.
+        """
+        self.clear()
+        choices = info.get("choices") or []
+        current = info.get("current", "")
+        for pane in self.panes:
+            self.label(pane, f"desktop for {name}", 24, FG, pady=(0, 4))
+            self.label(pane, "it boots into this, and comes back into it "
+                             "after every restart", 11, DIM, pady=(0, 16))
+            if not choices:
+                tk.Label(pane, text=info.get("detail", "this Realm cannot "
+                                             "choose its desktop"),
+                         bg=BG, fg=BAD, font=(FONT, 12), wraplength=560,
+                         justify="center").pack(pady=(0, 20))
+            rows = tk.Frame(pane, bg=BG)
+            rows.pack()
+            for index, choice in enumerate(choices):
+                here = choice["name"] == current
+                tk.Label(rows, text=choice["label"], bg=BG, anchor="w",
+                         fg=FG if choice.get("usable") else DIM,
+                         font=(FONT, 13), width=22
+                         ).grid(row=index, column=0, sticky="w", pady=5)
+                tk.Label(rows, text="now" if here else "", bg=BG, fg=DIM,
+                         font=(FONT, 10), width=5
+                         ).grid(row=index, column=1, sticky="w")
+                if choice.get("usable"):
+                    tk.Label(rows, text=choice.get("backend", ""), bg=BG,
+                             fg=DIM, font=(FONT, 10), width=10, anchor="w"
+                             ).grid(row=index, column=2, sticky="w", padx=6)
+                    if not here:
+                        self.button(rows, "boot into this",
+                                    lambda c=choice["name"]: self.switch(name, c)
+                                    ).grid(row=index, column=3, padx=5)
+                else:
+                    # The reason, where its button would have been: a desktop
+                    # that cannot be served is not a choice, and saying only
+                    # "no" would send somebody looking for a fault.
+                    tk.Label(rows, text=choice.get("why", ""), bg=BG, fg=DIM,
+                             font=(FONT, 10), wraplength=300, justify="left",
+                             anchor="w").grid(row=index, column=2, columnspan=2,
+                                              sticky="w", padx=6)
+            self.label(pane, "switching logs the session out: everything open "
+                             "in it closes", 11, DIM, pady=(18, 0))
+            # The agent's desktop is not one of the choices above and must not
+            # look like one: nothing switches to it, it is already running
+            # beside whichever the Realm boots into, and opening it leaves
+            # that one exactly where it was.
+            agent = info.get("agent")
+            if agent:
+                where = agent.get("display", "")
+                self.label(pane, f"this Realm also keeps a desktop of its own "
+                                 f"for an agent, on {where}", 11, DIM,
+                           pady=(16, 2))
+                if agent.get("running"):
+                    self.button(pane, "watch the agent",
+                                lambda: self.go("open_agent", name)
+                                ).pack(pady=(2, 0))
+                else:
+                    self.label(pane, "it is not running", 11, BAD, pady=(0, 0))
+            self.button(pane, "back", self.show_realms).pack(pady=(14, 0))
+        self.focus_widgets = ()
+        self.claim_focus()
+
+    def switch(self, name, choice):
+        """Carry out the change, reporting while the Realm is away."""
+        self.clear()
+        lines = []
+        for pane in self.panes:
+            self.label(pane, name, 26, FG, pady=(0, 10))
+            lines.append(self.label(pane, f"switching to {choice}\u2026", 12, DIM))
+            self.button(pane, "leave", self.leave).pack(pady=(18, 0))
+
+        def say(text):
+            self.post(lambda: self.say_on(lines, text))
+
+        self.work(lambda: self.hooks["set_desktop"](name, choice, say),
+                  lambda _result, error: self.show_realms(
+                      reason(error) if error else f"{name} boots into {choice} now"))
+
     def go(self, action, name, confirmed=False, checked=False):
         if action == "take_seat" and not checked:
             # The Realm is about to take the physical machine. Look at what is
@@ -619,7 +715,15 @@ class Overlay:
                 self.hooks["devices"],
                 lambda result, error: self.go(action, name, confirmed, True)
                 if error else self.ask_devices(name, result))
-        if action == "open_remote":
+        if action == "desktop":
+            # Asked of the Realm itself, and only when somebody wants to know:
+            # it goes through the guest agent, which is too slow to put in the
+            # list every Realm is drawn from.
+            return self.work(
+                lambda: self.hooks["desktops"](name),
+                lambda result, error: self.show_realms(reason(error))
+                if error else self.ask_desktop(name, result))
+        if action in ("open_remote", "open_agent"):
             if name not in self.rdp:
                 ask = self.hooks.get("rdp_login", lambda _n: ("", ""))
                 self.rdp[name] = tuple(ask(name))
@@ -642,7 +746,7 @@ class Overlay:
                     lambda: self.go(action, name, confirmed=True, checked=True))
             self.show_realms(reason(error) if error else "")
 
-        if action == "open_remote":
+        if action in ("open_remote", "open_agent"):
             # Stay visible and keep reporting while the Realm boots. Only the
             # RDP window itself has to be on top of us, and the Gate says when
             # it is about to open one.

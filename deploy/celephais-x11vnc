@@ -1,0 +1,131 @@
+#!/bin/sh
+# Serve the Realm's own desktop over VNC on the loopback, for xrdp to hand on
+# as RDP. Run by celephais-x11vnc.service as the Realm's own user. It waits for
+# the X session rather than requiring one to be up already, so the order the
+# Realm happens to boot in does not matter.
+#
+#   celephais-x11vnc [--password-file <file>] [--screen <width>x<height>]
+#                    [--wait <seconds>] [--display :N --auth <file>]
+#                    [--rfbport <port>]
+#
+# With no --display it serves whatever the Realm's seat has, which is the
+# Realm's own desktop and may be a different one each time it is asked. With
+# --display it serves that one and waits for it: that is the agent's desktop,
+# which belongs to celephais-agent-desktop rather than to a display manager,
+# and whose cookie is therefore a file we were told about rather than one to
+# be found.
+#
+# Finding the session is the whole job. x11vnc's own -auth guess shells out to
+# netstat, which Ubuntu no longer installs, and then falls back to
+# ~/.Xauthority, which a session started by a display manager never writes:
+# GDM keeps the cookie under /run/user/<uid>/gdm instead, and every other
+# display manager has an answer of its own. The X server is the one thing that
+# knows for certain - it was handed -auth on its command line - so read it back
+# out of /proc rather than guessing where this Realm's login screen keeps it.
+set -eu
+
+RFB_AUTH=$HOME/.vnc/celephais.passwd
+SCREEN=""
+WAIT_LEFT=120
+WANT_DISPLAY=""
+WANT_AUTH=""
+RFB_PORT=5900
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --password-file) RFB_AUTH=${2:-}; shift ;;
+    --screen) SCREEN=${2:-}; shift ;;
+    --wait) WAIT_LEFT=${2:-}; shift ;;
+    --display) WANT_DISPLAY=${2:-}; shift ;;
+    --auth) WANT_AUTH=${2:-}; shift ;;
+    --rfbport) RFB_PORT=${2:-}; shift ;;
+    *) echo "celephais-x11vnc: unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# At boot there is a stretch where graphical.target has been reached, systemd
+# has started this, and the display manager has not got an X server up yet.
+# Giving up there and leaving it to Restart= does eventually work, but it
+# leaves a hole with teeth in it: xrdp is listening on 3389 from the moment it
+# starts, so the Realm reports itself ready while the VNC port behind that
+# promise has nothing on it, and whoever connects in those few seconds is told
+# the session is broken. So wait for the session instead of racing it. The
+# same wait covers a logout - and a desktop switch, which is a logout with a
+# different session behind it: x11vnc exits with the X server it was serving,
+# and the next one sits here until the Realm has somewhere to log back in to.
+while :; do
+  DISPLAY_NAME=""
+  if [ "$WANT_DISPLAY" ]; then
+    # A display we were given: it is up when its socket is there and the
+    # cookie for it can be read, and there is nothing to search for.
+    if [ -S "/tmp/.X11-unix/X${WANT_DISPLAY#:}" ] && [ -r "$WANT_AUTH" ]; then
+      DISPLAY_NAME=$WANT_DISPLAY
+      X_AUTH=$WANT_AUTH
+      break
+    fi
+  else
+    for socket in /tmp/.X11-unix/X*; do
+      [ -S "$socket" ] || continue
+      DISPLAY_NAME=":${socket##*/X}"
+      break
+    done
+    XORG_PID=$(pgrep -u "$(id -u)" -x Xorg | head -1 || true)
+    if [ "$DISPLAY_NAME" ] && [ "$XORG_PID" ]; then
+      X_AUTH=$(tr '\0' '\n' < "/proc/$XORG_PID/cmdline" | grep -A1 -x -- -auth | tail -1)
+      [ -r "${X_AUTH:-}" ] || X_AUTH=$HOME/.Xauthority
+      [ -r "$X_AUTH" ] && break
+    fi
+  fi
+  [ "$WAIT_LEFT" -gt 0 ] ||
+    { echo "no X server after waiting: nothing to serve" >&2; exit 1; }
+  WAIT_LEFT=$((WAIT_LEFT - 2))
+  sleep 2
+done
+echo "serving the session on $DISPLAY_NAME" >&2
+export DISPLAY=$DISPLAY_NAME XAUTHORITY=$X_AUTH
+
+# A blanked screen is a black desktop at the other end: the X server blanks
+# the very framebuffer x11vnc reads out. Xfce's power manager is told to leave
+# it alone by install-realm.sh, but the X server keeps a ten-minute mind of
+# its own, and no screensaver is wanted on a screen nobody can see anyway.
+command -v xset >/dev/null && xset s off -dpms 2>/dev/null || true
+
+# A VNC desktop is whatever size the X screen is, and it is the client that
+# has to live with it: xrdp asks the VNC server to resize itself to the size
+# FreeRDP wants, x11vnc answers "resize is administratively prohibited"
+# because it only ever follows the X screen rather than driving it, and xrdp
+# shrinks the client to the Realm instead. So the size is settled here, once,
+# on a screen nobody is sitting in front of. Match it to the monitor the Gate
+# is usually opened on; anything larger wastes nothing but memory, and the
+# client letterboxes the difference.
+if [ "$SCREEN" ]; then
+  OUTPUT=$(xrandr | awk '/ connected/ {print $1; exit}')
+  if [ "$OUTPUT" ]; then
+    if ! xrandr | grep -qE "^ +$SCREEN( |$)" && command -v cvt >/dev/null; then
+      # Not in the list the virtual GPU offers: work one out and add it.
+      MODELINE=$(cvt "${SCREEN%x*}" "${SCREEN#*x}" 60 | sed -n 's/^Modeline //p')
+      MODE_NAME=$(echo "$MODELINE" | cut -d' ' -f1 | tr -d '"')
+      # shellcheck disable=SC2086
+      xrandr --newmode $(echo "$MODELINE" | tr -d '"') 2>/dev/null || true
+      xrandr --addmode "$OUTPUT" "$MODE_NAME" 2>/dev/null || true
+      SCREEN=$MODE_NAME
+    fi
+    # Worth saying and not worth failing over: a Realm at the wrong size is
+    # still a Realm somebody can work in.
+    xrandr --output "$OUTPUT" --mode "$SCREEN" ||
+      echo "could not set $OUTPUT to $SCREEN; serving it as it is" >&2
+  fi
+fi
+
+# -localhost: the VNC port is for xrdp on this machine and for an
+#   `ssh -N -L 5900:127.0.0.1:5900` tunnel, and for nobody else.
+# -shared: the Gate and such a tunnel see the one desktop at the same time.
+# -forever: one client leaving is not a reason to stop serving the session.
+# -xrandr resize: follow the X screen when something else changes its size,
+#   rather than exiting, which is what x11vnc does about it by default.
+# -noxdamage: poll the screen rather than trust the damage events, which a
+#   compositing xfwm4 is known to under-report - a cheap way to be wrong is to
+#   leave half a window on the client's screen that is no longer on the
+#   Realm's. The polling only runs while somebody is connected.
+exec x11vnc -display "$DISPLAY_NAME" -auth "$X_AUTH" -rfbauth "$RFB_AUTH" \
+  -rfbport "$RFB_PORT" -localhost -shared -forever -xrandr resize -noxdamage -q

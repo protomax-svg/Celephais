@@ -331,6 +331,50 @@ assert ["/bin/sh", "-c", "tailscale set --exit-node=server-yo"] \
     in fake.exec_cmds, fake.exec_cmds
 fake.exec_out = ""
 
+# --- the desktop a Realm boots into ---
+# Read from the guest, like egress, because the answer lives there: anybody
+# with a terminal in the Realm can change it and a remembered one would lie.
+fake.exec_exit = 0
+fake.exec_out = ('{"user": "workrealm", "current": "xfce", "running": "xfce",'
+                 ' "backend": "x11vnc", "choices": [{"name": "xfce",'
+                 ' "label": "Xfce Session", "type": "x11", "backend":'
+                 ' "x11vnc", "usable": true, "why": ""}]}')
+assert c.desktops(201)["current"] == "xfce", c.desktops(201)
+code, body = call("/realms/work/desktop")
+assert code == 200 and body["backend"] == "x11vnc", body
+
+# A Realm set up before any of this existed has no such script. It says so in
+# words somebody can act on, rather than looking like a Realm that is broken.
+fake.exec_exit, fake.exec_out = 1, ""
+body = c.desktops(201)
+assert body["choices"] == [] and "install-realm.sh" in body["detail"], body
+
+# Switching is a POST with the desktop named; without a name it is a mistake,
+# not a request to switch to nothing.
+assert status_of("/realms/work/desktop", method="POST") == 400
+fake.exec_exit = 0
+fake.exec_out = ('{"user": "workrealm", "current": "gnome", "backend":'
+                 ' "gnome", "logged_out": true, "serving": true}')
+fake.exec_cmds = []
+code, body = call("/realms/work/desktop?name=gnome", method="POST")
+assert code == 202 and body["current"] == "gnome", body
+# BOOTING whatever the guest says: the old server is gone and the Gate has to
+# wait for the new one exactly as it waits after a start.
+assert body["power"] == "BOOTING", body
+assert any("celephais-desktop set gnome" in part
+           for cmd in fake.exec_cmds for part in cmd), fake.exec_cmds
+
+# A desktop the Realm cannot serve is refused by the guest, and the refusal is
+# the Realm's own words rather than a number.
+fake.exec_exit, fake.exec_out = 1, "cannot serve gnome: not set up here"
+try:
+    call("/realms/work/desktop?name=gnome", method="POST")
+    raise AssertionError("a desktop that cannot be served was accepted")
+except urllib.error.HTTPError as refused:
+    assert refused.code == 409, refused.code
+    assert "not set up here" in json.load(refused)["error"], refused
+fake.exec_exit, fake.exec_out = 0, ""
+
 # --- devices over HTTP ---
 code, body = call("/devices")
 assert code == 200 and all(d["action"] is None for d in body), body

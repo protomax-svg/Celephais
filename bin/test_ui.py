@@ -51,7 +51,25 @@ hooks = {
     "devices": lambda: DEVICES,
     "set_device": lambda ident, action: (calls.append(("device", ident, action))
                                          or DEVICES[0].update(action=action)),
+    "desktops": lambda name: DESKTOPS,
+    "open_agent": lambda name, say, hide, user, password, one_monitor=False:
+        calls.append(("agent", name)),
+    "set_desktop": lambda name, choice, say=None:
+        calls.append(("desktop", name, choice)),
 }
+DESKTOPS = {"user": "workrealm", "current": "xfce", "running": "xfce",
+            "backend": "x11vnc",
+            "agent": {"display": ":2", "screen": "1920x1080",
+                      "rdp_port": 3390, "running": True},
+            "choices": [
+                {"name": "xfce", "label": "Xfce Session", "type": "x11",
+                 "backend": "x11vnc", "usable": True, "why": ""},
+                {"name": "gnome", "label": "GNOME", "type": "wayland",
+                 "backend": "gnome", "usable": True, "why": ""},
+                {"name": "xfce-wayland", "label": "Xfce (Wayland)",
+                 "type": "wayland", "backend": "", "usable": False,
+                 "why": "nothing here can serve a Wayland desktop that is "
+                        "not GNOME"}]}
 DEVICES = [{"id": "1532:02a2", "name": "Razer Ornata V3 X", "usb": "1532:02a2",
             "action": None, "present": True},
            {"id": "8087:0aaa", "name": "Bluetooth", "usb": "8087:0aaa",
@@ -314,6 +332,46 @@ try:
     pump(app, 1.0)
     # It stays decided from here on, which is the point: the screens that
     # follow must not stop to ask about it again.
+
+    # The Realm says which desktops it has and which of them it can serve.
+    # One that cannot be served is shown with the reason where its button
+    # would be, so nobody picks it and waits for a Realm that never answers.
+    calls.clear()
+    app.go("desktop", "work")
+    assert pump(app, until=lambda: "desktop for work" in texts(app.panes[0])), \
+        f"it never asked: {texts(app.panes[0])}"
+    shown = texts(app.panes[0])
+    assert "GNOME" in shown and "Xfce (Wayland)" in shown, shown
+    assert any("not GNOME" in line for line in shown), shown
+    buttons = [b.cget("text") for b in all_buttons(app.panes[0])]
+    # One button for GNOME, none for the desktop it cannot serve, and none
+    # for the one it is already in.
+    assert buttons.count("boot into this") == 1, buttons
+    [b for b in all_buttons(app.panes[0])
+     if b.cget("text") == "boot into this"][0].invoke()
+    assert pump(app, until=lambda: ("desktop", "work", "gnome") in calls), \
+        f"the choice never reached Core: {calls}"
+    pump(app, 1.0)
+
+    # A Realm that keeps a desktop for an agent offers to show it, and does
+    # not offer it as something to boot into: it is already running beside
+    # whichever desktop the Realm comes up in, and watching it switches
+    # nothing and logs nobody out.
+    calls.clear()
+    app.rdp["work"] = ("workrealm", "secret")
+    app.go("desktop", "work")
+    assert pump(app, until=lambda: "desktop for work" in texts(app.panes[0])), \
+        f"it never asked: {texts(app.panes[0])}"
+    shown = texts(app.panes[0])
+    assert any(":2" in line for line in shown), shown
+    labels = [b.cget("text") for b in all_buttons(app.panes[0])]
+    assert labels.count("watch the agent") == 1, labels
+    assert labels.count("boot into this") == 1, labels
+    [b for b in all_buttons(app.panes[0])
+     if b.cget("text") == "watch the agent"][0].invoke()
+    assert pump(app, until=lambda: ("agent", "work") in calls), \
+        f"watching never reached the Gate: {calls}"
+    pump(app, 1.0)
 
     # Core refuses to throw a saved session away without being told twice, so
     # the overlay must say what is lost and wait for a second, deliberate press.

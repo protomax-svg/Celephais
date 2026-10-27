@@ -29,6 +29,8 @@ API:
   POST /realms/<name>/release -> 200, strip the seat from a stopped Realm
   POST /realms/<name>/logout  -> 200, log out the Realm's desktop session
   POST /realms/<name>/park    -> 202, save the live session to disk and stop
+  GET  /realms/<name>/desktop -> {current, running, backend, choices: [...]}
+  POST /realms/<name>/desktop?name=<session> -> 202, switches and logs out
   GET  /realms/<name>/egress  -> {mode: exit-node|direct, node}
   POST /realms/<name>/egress?mode=exit-node|direct
   GET  /devices             -> every USB device on the host, with what we do with it
@@ -249,6 +251,53 @@ def logout_realm(vmid):
     except Exception as exc:
         return {"ok": False, "detail": str(exc)}
     return {"ok": code == 0, "detail": out or f"exit {code}"}
+
+
+DESKTOP_CMD = "/usr/local/bin/celephais-desktop"
+
+
+def desktops(vmid):
+    """Which desktop this Realm boots into, and what else it could boot into.
+
+    Asked of the Realm every time, like egress and for the same reason: the
+    answer lives in the guest, where anybody with a terminal can change it.
+    A Realm set up before this existed, or one that is not Linux at all, has
+    no such script and says so rather than looking broken.
+    """
+    try:
+        code, out = guest_exec(vmid, "/bin/sh", "-c",
+                               f"test -x {DESKTOP_CMD} && {DESKTOP_CMD} show")
+    except Exception as exc:
+        return {"choices": [], "detail": str(exc)}
+    if code != 0 or not out.lstrip().startswith("{"):
+        return {"choices": [],
+                "detail": out or "this Realm cannot choose its desktop: "
+                                 "re-run install-realm.sh --switchable in it"}
+    try:
+        return json.loads(out)
+    except ValueError:
+        return {"choices": [], "detail": out[:200]}
+
+
+def set_desktop(vmid, name):
+    """Move the Realm to another desktop. The session is logged out to do it.
+
+    Takes as long as the guest takes to let go and come back; the Gate polls
+    for READY afterwards exactly as it does after a start, because the server
+    behind port 3389 is a different one by then.
+    """
+    code, out = guest_exec(vmid, "/bin/sh", "-c",
+                           f"{DESKTOP_CMD} set {shlex.quote(name)}",
+                           # Logging out, logging back in and waiting for the
+                           # new server to answer: the guest does all three
+                           # before it replies, so this is a long one.
+                           timeout=90)
+    if code != 0:
+        raise ValueError(out or f"celephais-desktop exited {code}")
+    try:
+        return json.loads(out)
+    except ValueError:
+        return {"current": name, "detail": out[:200]}
 
 
 def port_open(ip, port, timeout=1.0):
@@ -610,6 +659,22 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"device {ident} -> {action}")
                 return self._reply(200, {"id": ident, "action":
                                          None if action == "forget" else action})
+            if (len(parts) == 3 and parts[0] == "realms"
+                    and parts[2] == "desktop"):
+                name, vmid = parts[1], REALMS[parts[1]]
+                if method == "GET":
+                    return self._reply(200, desktops(vmid))
+                wanted = urllib.parse.parse_qs(query).get("name", [""])[0]
+                if not wanted:
+                    return self._reply(400, {"error": "say which desktop"})
+                log(f"desktop {name} -> {wanted}: logging the session out")
+                try:
+                    result = set_desktop(vmid, wanted)
+                except ValueError as exc:
+                    return self._reply(409, {"error": str(exc)})
+                # The old desktop's server is gone and the new one's is not up
+                # yet, so this Realm is BOOTING again whatever it says now.
+                return self._reply(202, dict(result, realm=name, power="BOOTING"))
             if (len(parts) == 3 and parts[0] == "realms" and parts[2] == "egress"):
                 vmid = REALMS[parts[1]]
                 if method == "GET":

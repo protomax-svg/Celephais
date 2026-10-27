@@ -1,0 +1,105 @@
+#!/bin/sh
+# Hold a desktop open for an agent to work in, on an X server of its own that
+# no display manager owns and no human logs in or out of.
+#
+#   celephais-agent-desktop [--display :N] [--screen <width>x<height>]
+#                           [--session <command>] [--auth <file>]
+#
+# The Realm's own desktop - the one on seat0, the one GDM starts and the Gate
+# connects to - is a bad place to put an agent. It comes and goes with the
+# person using the Realm: log out and the session the agent was working in is
+# gone, along with whatever it had open. Switch desktops and it is gone too.
+# And an agent moving the pointer around in the desktop somebody is working in
+# is its own kind of unpleasant.
+#
+# So this is a second desktop that exists for the agent alone. Xvfb is the
+# whole trick: an X server that draws into memory and has no screen behind it,
+# which is exactly what is wanted here, because nobody is ever going to sit in
+# front of this one. It is started by systemd at boot, it does not care
+# whether anyone is logged in, and it stays up for as long as the Realm does.
+# x11vnc serves it on a port of its own for anyone who wants to watch.
+#
+# It runs as the Realm's own user, which means the agent works with the same
+# home directory, the same files and the same logged-in accounts as the person
+# whose Realm it is - deliberately, because an agent that cannot see any of
+# that is not much use. The cost is at the bottom of this file: single-
+# instance applications.
+set -eu
+
+DISPLAY_NUM=:2
+SCREEN=1920x1080
+SESSION=xfce4-session
+AUTH=/run/celephais-agent/Xauthority
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --display) DISPLAY_NUM=${2:-}; shift ;;
+    --screen) SCREEN=${2:-}; shift ;;
+    --session) SESSION=${2:-}; shift ;;
+    --auth) AUTH=${2:-}; shift ;;
+    *) echo "celephais-agent-desktop: unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# A system service started with User= never gets a login session, so the
+# things a desktop takes for granted are simply absent. XDG_RUNTIME_DIR is the
+# one that matters: dbus, xfconf and everything downstream of them put their
+# sockets there, and with it unset they fall back to whatever they can find
+# and then disagree about where it was. The directory itself is logind's, and
+# it is there because the Realm's user lingers.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+[ -d "$XDG_RUNTIME_DIR" ] || {
+  echo "no $XDG_RUNTIME_DIR: the Realm's user is not lingering" >&2; exit 1; }
+
+# The cookie is made here rather than left to chance: an X server with no
+# authority file at all decides who may connect by host, and every process on
+# the Realm is on the right host. One file, readable by this user and nobody
+# else, written before the server that will demand it starts.
+install -d -m 700 "$(dirname "$AUTH")"
+rm -f "$AUTH"
+(umask 077; : > "$AUTH")
+xauth -f "$AUTH" add "$DISPLAY_NUM" MIT-MAGIC-COOKIE-1 "$(mcookie)"
+
+# -noreset: without it the X server throws away its whole state the moment the
+#   last client disconnects, so one crashed panel takes the desktop with it.
+# -nolisten tcp: this server is reachable through its socket and through
+#   x11vnc, and there is no third way in.
+Xvfb "$DISPLAY_NUM" -screen 0 "${SCREEN}x24" -auth "$AUTH" \
+  -noreset -nolisten tcp +extension RANDR &
+XVFB_PID=$!
+trap 'kill "$XVFB_PID" 2>/dev/null || true' EXIT
+trap 'kill "$XVFB_PID" 2>/dev/null || true; exit 143' INT TERM
+
+WAIT_LEFT=30
+until [ -S "/tmp/.X11-unix/X${DISPLAY_NUM#:}" ]; do
+  kill -0 "$XVFB_PID" 2>/dev/null ||
+    { echo "Xvfb died before it was serving $DISPLAY_NUM" >&2; exit 1; }
+  [ "$WAIT_LEFT" -gt 0 ] ||
+    { echo "Xvfb never came up on $DISPLAY_NUM" >&2; exit 1; }
+  WAIT_LEFT=$((WAIT_LEFT - 1))
+  sleep 1
+done
+echo "agent desktop: $SESSION on $DISPLAY_NUM at $SCREEN" >&2
+
+# dbus-run-session gives this desktop a session bus of its own. It has to have
+# one: the Realm's user may well be logged in to a desktop on seat0 at the
+# same time, and two desktops sharing a session bus is two sets of xfconfd,
+# xfsettingsd and the rest answering on the same names and taking each other's
+# work. XDG_CURRENT_DESKTOP is what the applications read to know which
+# desktop they are in, and xfce4-session on its own does not set it.
+export DISPLAY=$DISPLAY_NUM XAUTHORITY=$AUTH
+export XDG_CURRENT_DESKTOP=XFCE XDG_SESSION_TYPE=x11
+dbus-run-session -- "$SESSION"
+
+# One thing to know about sharing a user with the person whose Realm this is.
+# A browser is a single-instance application: start Firefox here while a
+# Firefox on the same profile is open in the desktop on seat0, and it does not
+# start a browser at all - it asks the one already running to open a window,
+# and that window appears over there, in somebody's working session, not here.
+# An agent needs a profile of its own for this not to happen:
+#
+#   firefox -P hermes --no-remote
+#   chromium --user-data-dir="$HOME/.config/hermes-chromium"
+#
+# Same files, same downloads, same home; separate browser.

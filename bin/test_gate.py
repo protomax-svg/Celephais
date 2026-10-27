@@ -65,7 +65,9 @@ assert "logon" in gate._last_error(KERBEROS).lower(), gate._last_error(KERBEROS)
 # node holding the whole LAN, say - is the one Max met.
 UNREACHABLE = ("[15:20:57:369] [ERROR][com.freerdp.core] - [get_next_addrinfo]: "
                "ERRCONNECT_CONNECT_FAILED [0x00020006]")
-assert "port 3389" in gate._last_error(UNREACHABLE), gate._last_error(UNREACHABLE)
+# Not a port number: a Realm's own desktop answers on 3389 and the one it
+# keeps for an agent on a port of its own, and the sentence is for both.
+assert "RDP port" in gate._last_error(UNREACHABLE), gate._last_error(UNREACHABLE)
 # and a logon failure is left alone: the overlay reads the word and asks for
 # the password again, which no sentence here would do better.
 assert "logon" in gate._last_error(

@@ -41,6 +41,8 @@ Second screen: the Realms. Each row offers only what makes sense for it.
     park                     saves its open desktop to disk and frees its memory
     stop                     shuts it down
     give the monitors back   takes the graphics card off it again
+    desktop                  which desktop that Realm comes up in, on a Realm
+                             that has more than one installed
 
 A parked Realm says "parked", not "off": its open windows are waiting on disk
 and come back when you open it again.
@@ -56,6 +58,13 @@ about. A Realm on the monitors can only use what it is given, so say whether
 each one travels with the monitors or stays put. Decided once, by make and
 model, and it holds in any socket.
 
+Which desktop: a Realm with more than one desktop installed can come up in
+any of them, and it says which ones it can actually serve - a Wayland desktop
+that is not GNOME is listed with the reason it cannot be offered. Choosing one
+logs that Realm's session out, so everything open in it closes, and the Realm
+is away for the half-minute it takes to come back up. What you choose is what
+it boots into from then on.
+
 A red screen with one button: going on throws something away, usually a saved
 desktop that cannot survive the hardware change being asked for. Read it. The
 button is deliberate.
@@ -69,8 +78,8 @@ connection:
     Windows   %LOCALAPPDATA%\celephais\rdp-<realm>.log
     Linux     ~/.cache/celephais/rdp-<realm>.log
 
-"nothing answered on port 3389" means the Realm is up but this machine has no
-way to its network. Away from home, only a Realm that is on the tailnet itself
+"nothing answered on the Realm's RDP port" means the Realm is up but this
+machine has no way to its network. Away from home, only a Realm on the tailnet
 can be reached - `work` and `personal`. Windows answers on the house wire
 only.
 

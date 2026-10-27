@@ -2193,3 +2193,317 @@ Also confirmed on this boot, all from `install-realm.sh`: RDP listening on
 Gate away from home, which it never was. The guest agent runs unconfined
 (`virt_qemu_ga_t` permissive while the system stays Enforcing), so Core's
 egress, logout and every diagnosis above work from here.
+
+## `work` left GNOME, and the way in went with it — `deploy/install-realm.sh`, `deploy/celephais-x11vnc` (2026-10-26)
+Max switched VM 201 from GNOME to Xfce. The desktop came up fine; the Realm
+went dark. `grdctl` is not even installed any more, nothing listened on 3389,
+and Core had `work` at `BOOTING` with the VM plainly running - the state
+`celephais-seat` was written to warn about, arrived at from the other
+direction. What was there instead was an `x11vnc` somebody had started from a
+shell, bound to `127.0.0.1:5900`, reached by hand with:
+
+```bash
+ssh -N -L 5900:127.0.0.1:5900 workrealm@100.99.187.90
+```
+
+A working way in, and one that dies with the shell it was typed into, lives
+only as long as this boot, and that the Gate knows nothing about.
+
+**gnome-remote-desktop was never going to follow.** `grdctl` drives mutter's
+own screencast API: it is not a remote desktop that happens to ship with
+GNOME, it is GNOME's, and Xfce does not implement a line of it. x11vnc is the
+other half of the same promise - attach to the session that is already
+running, rather than start a second one beside it - and it needs nothing but
+an X server.
+
+The Gate, though, speaks RDP and only RDP: FreeRDP with its monitor handling
+and its log parsing, the install bootstrap for hosts that have no client,
+Core's readiness probe on 3389, the tailnet forward to 3389. So xrdp now sits
+in front of x11vnc and translates, and nothing above the Realm had to change:
+
+```text
+Gate --FreeRDP--> :3389 xrdp --VNC--> 127.0.0.1:5900 x11vnc --> :0 Xfce
+```
+
+`install-realm.sh` takes `--desktop gnome|xfce` (and works it out from what is
+running when not told), and sets up whichever of the two the Realm needs. On
+the x11vnc side it writes the VNC password only when given one, installs
+`celephais-x11vnc` with a system service in front of it, rewrites
+`/etc/xrdp/xrdp.ini` to listen on 3389 with `autorun=x11vnc`, and adds the
+section that does the translating:
+
+```ini
+[x11vnc]
+name=x11vnc
+lib=libvnc.so
+ip=127.0.0.1
+port=5900
+username=na
+password=ask
+```
+
+`username=na` because a VNC server has no idea what a user is, and
+`password=ask` so the password the Gate sends is the one x11vnc is asked for:
+one password, in one place, the way it was with grdctl. `autorun` means
+FreeRDP lands in the session rather than at xrdp's chooser. xrdp's own
+`[Xorg]` section is left alone and unused - it would start a second desktop
+beside the one on the screen, which is the reattach problem again under
+another name.
+
+**Two things bit on the way.** `x11vnc -auth guess` fails on Ubuntu: it shells
+out to `netstat`, which is not installed, and falls back to `~/.Xauthority`,
+which a session started by a display manager never writes - GDM keeps the
+cookie in `/run/user/1000/gdm/Xauthority`. The service restarted on that
+twice a minute:
+
+```text
+/tmp/fd.KBXMXJ: 1: netstat: not found
+xauth:  file /home/workrealm/.Xauthority does not exist
+```
+
+`celephais-x11vnc` reads it out of `/proc/<Xorg>/cmdline` instead, where the X
+server keeps the `-auth` it was started with, and finds the display from
+`/tmp/.X11-unix` rather than assuming `:0`. Started before there is an X
+server it says so and exits, and systemd tries again until there is one.
+
+The second is the size of the desktop. x11vnc only ever follows the X screen;
+asked by xrdp to become what FreeRDP wants, it refuses:
+
+```text
+Layout from ClientLayout     (geom=1920x1080 #screens=1) : 0:(1920x1080+0+0)
+Layout from OldServerLayout  (geom=1280x800  #screens=1) : 1:(1280x800+0+0)
+VNC server resize failed - error code 1 [Resize is administratively prohibited]
+Resizing client to server
+```
+
+So the size is settled on the Realm, where nobody is sitting: the helper sets
+the screen with xrandr before it serves it, `--screen` on the installer
+chooses it, 1920x1080 by default, and a size the virtual GPU does not offer is
+added from `cvt`. With the screen at 1920x1080 the same connection negotiates
+clean, GFX and all - this is not raw VNC on the wire:
+
+```text
+Layout from ClientLayout     (geom=1920x1080 #screens=1) : 0:(1920x1080+0+0)
+Layout from OldServerLayout  (geom=1920x1080 #screens=1) : 1:(1920x1080+0+0)
+xrdp_egfx_reset_graphics: width 1920 height 1080 monitorcount 1
+xrdp_encoder_create: starting gfx rfx pro codec session
+```
+
+**What the bridge costs, said plainly:** one screen, so `/multimon` spans
+nothing and the Gate shows 1920x1080 on the monitor it opens on. The clipboard
+crosses as text only (`VNC: Clipboard supports ISO-8859-1 text only`). Sound
+does not cross at all - xrdp's audio belongs to its own session modules, and
+this path does not use them. A Realm that needs its monitors and its speakers
+is a Realm for GNOME, or for the seat.
+
+**Else on the way past:** GDM's automatic login had been lost somewhere in the
+switch, so a cold boot would have come up with a login screen, no session, no
+X server and nothing for x11vnc to attach to; it is back, and
+AccountsService already remembered `Session=xfce`. `light-locker` is Ubuntu's
+Xfce locker and would have locked a Realm nobody can reach a keyboard to: it
+is stopped and told not to autostart, with the screensaver and DPMS off in
+xfconf. `celephais-monitors` is removed on an Xfce Realm - it talks to mutter
+and nothing else, so it could only fail there, and there is one screen to lay
+out anyway.
+
+**Verified from here**, with the installer run through the guest agent and a
+real FreeRDP connection over the tailnet:
+
+```text
+celephais-x11vnc  active      x11vnc  127.0.0.1:5900  (loopback only)
+xrdp              active      xrdp    *:3389
+core /realms      {"realm":"work","power":"READY","ip":"100.99.187.90"}
+```
+
+The VNC password was borrowed for that test and put back byte for byte
+afterwards; `work` still signs in with the one Max set.
+
+**Not verified:** a reboot, and a logout-and-back-in. Both are the service's
+reason for being a system unit that restarts for ever rather than a user one,
+but `work` was being worked in and neither was worth taking it away for. The
+first `--desktop gnome` run since the split has not happened either: `personal`
+was off, and the GNOME path is unchanged code on an unchanged Realm.
+
+### The Realm chooses its own desktop — `deploy/celephais-desktop`, `bin/celephais_core.py`, `bin/celephais-gate`, `bin/celephais_ui.py` (2026-10-26)
+Having two desktops on one Realm and no way to pick between them is half a
+feature, so the Gate now asks. A `desktop` button on the row of any Realm that
+is READY, a screen listing what that Realm has installed, and a button beside
+each one Celephais can actually serve.
+
+Two things have to agree, and they are kept by different people: what GDM
+starts at boot (AccountsService remembers `Session=` for the Realm's user) and
+what serves it on 3389. Neither is any use without the other, so
+`celephais-desktop` in the guest owns both. The rule it applies is the whole
+design:
+
+| where the session comes from | served by |
+|---|---|
+| `/usr/share/xsessions` | x11vnc behind xrdp |
+| `/usr/share/wayland-sessions`, GNOME | gnome-remote-desktop |
+| `/usr/share/wayland-sessions`, anything else | nothing, and it says so |
+
+`work` offers five, and the fifth is the interesting one:
+
+```json
+{"name": "xfce-wayland", "label": "Xfce Session (Wayland)", "usable": false,
+ "why": "nothing here can serve a Wayland desktop that is not GNOME: x11vnc
+         needs an X server and gnome-remote-desktop is GNOME's"}
+```
+
+It is listed and refused, with the reason where its button would be. A desktop
+nobody can connect to is worth knowing about before it is chosen, not after.
+
+**The switch had a hole in it on the first pass.** Enabling the new server
+before logging out meant xrdp opened 3389 while the old session was still
+dying, Core read that as READY, and a Gate watching for exactly that would
+have connected to a desktop with seconds to live. So the order is: write what
+GDM should start, take the port off the old server, log the session out, wait
+for the new session to actually appear, and only then start the new server and
+wait for 3389. Core gets one answer when it is all over, which is why its
+guest call is allowed ninety seconds rather than the usual thirty.
+
+**`grdctl` was there the whole time.** The first probe of this Realm ran
+`command -v x11vnc xrdp ... grdctl` and reported only x11vnc, which read as
+"GNOME's server is gone". It is not: `command -v` in dash answers for the
+first name and ignores the rest. gnome-remote-desktop is installed on `work`,
+still enabled, still holding the credentials from when `work` ran GNOME -
+which is why `--switchable` needed no password to set up and why GNOME shows
+as usable rather than greyed out. The old probe was wrong, not the Realm.
+Worth remembering next time a one-line check says something is missing.
+
+**One small trap, twice.** `grdctl --headless status` prints `Status: enabled`
+or `Status: disabled`, and "disabled" contains "enabled": both the installer
+and `celephais-desktop` match the colon in front of it.
+
+**Verified:** `celephais-desktop show` on `work`, listing all five sessions
+with the right backend and the right refusal; `install-realm.sh --switchable`
+setting up both servers with xfce left running and RDP still on 3389; Core's
+new endpoints against its fake Proxmox, including the Realm that has no such
+script and the desktop that cannot be served; the overlay's chooser against a
+fake Realm, including that an unusable desktop gets no button.
+
+**Not verified: an actual switch.** It logs the session out, and `work` was
+being worked in. The Realm is ready for it - both servers set up, the script
+installed - and it wants one quiet moment and about half a minute.
+
+**Core is staged, not deployed.** `/tmp/celephais_core.new.py` on pve is the
+new one; `/opt/celephais/celephais_core.py` is still the old. The two differ
+by 65 lines, all of them the desktop endpoints. Installing it over the running
+control plane is the one step that was not taken from here.
+
+### The two ways the first connection failed
+*26 October 2026*
+
+The Gate's first real attempt at the Xfce `work` came back with xrdp's own
+connection log: *VNC connecting to 127.0.0.1 5900 / VNC error - problem
+connecting*. Two different faults, one on top of the other.
+
+**The boot race.** `celephais-x11vnc` is `WantedBy=graphical.target`, and
+reaching graphical.target is not the same as having an X server: GDM is still
+getting one up. The launcher looked, found nothing, said so and exited 1, and
+systemd waited five seconds and tried again. It recovers on its own, which is
+why nothing looked broken afterwards - the service had been up for five and a
+half hours by the time anyone read the journal, with a restart counter of 17
+behind it. The hole is that xrdp listens on 3389 from the moment it starts,
+so throughout that gap the Realm answers Core's probe, reports itself READY,
+and hands the Gate a VNC port with nothing behind it. The launcher now waits
+for the session rather than racing it - up to two minutes, checking every two
+- which also covers a logout and the desktop switch, where x11vnc exits with
+the X server it was serving and the next one has to sit and wait for GDM to
+bring the new session up.
+
+**The password was somebody else's.** The server-side log is more precise than
+the client's: `VNC error 1 after security negotiation`. That is not a failure
+to connect - x11vnc answered and refused the password. xrdp with
+`password=ask` hands the VNC server whatever password the RDP client sent, so
+the password in the Realm's rfbauth file has to be the one the Gate's vault
+holds. The installer kept `~/.vnc/passwd` if it found one there, and there was
+one there: the Realm's own, set by hand long before Celephais for the
+`ssh -N -L 5900:127.0.0.1:5900` tunnel. So the installer skipped the prompt,
+printed "kept the password already in ...", and left a Realm that looks
+perfectly configured and fails authentication every time. The end-to-end test
+earlier that day passed only because a temporary password had been put in that
+file for it, and restoring the file byte-for-byte afterwards - which was the
+right thing to do with somebody's own password - restored the mismatch too.
+
+Celephais now keeps its own `~/.vnc/celephais.passwd` and always writes it
+from the password it was given, and leaves an unrelated `~/.vnc/passwd` where
+it is. Finding a credential already in the right place and keeping it is the
+kind of thrift that produces a system which is wrong and quiet about it.
+
+And one thing worth knowing about this wire: VNC authentication is DES with
+the password as the key, and a DES key is eight bytes. Both ends drop
+everything past the eighth character, so only the first eight have to match -
+and only the first eight are doing any work. The installer says so when it is
+given a longer one.
+
+### Two desktops at once, one for the agent
+*27 October 2026*
+
+The Xfce that `work` was switched to is not where its owner wants to work. It
+is where Hermes - an agent - works. The desktop chooser built yesterday
+answers the wrong question for that: it moves a Realm from one desktop to the
+other, and what is wanted is both of them at the same time, one each.
+
+So `--agent` adds a second desktop that exists beside whichever the Realm
+boots into. Xvfb is the whole trick - an X server that draws into memory with
+no screen behind it, which is precisely right for a desktop nobody will ever
+sit in front of. `celephais-agent-desktop` starts it on `:2`, puts Xfce on it
+under a session bus of its own, and systemd keeps it up. No display manager
+owns it, so nobody logs into it and nobody can log out of it: the agent's
+desktop stops depending on whether its owner is logged in, which the old
+arrangement did, and badly - x11vnc followed whatever GDM had on seat0, so
+logging out took the agent's session with it.
+
+Three services, and they compose with what was already there rather than
+replacing it. `celephais-x11vnc` learned `--display`, `--auth` and
+`--rfbport`, so the same script serves either the seat's desktop (hunting for
+it, as before) or a named one (waiting for it, cookie handed to it). The
+agent's gets 5901. In front of that is a **second xrdp** - `--config` with an
+ini of its own on 3390 - rather than a second section in the first one,
+because the Realm's own xrdp is stopped and started every time its desktop is
+switched, and the agent's desktop has no business going dark because somebody
+chose GNOME. Nothing in the switching path touches any of it.
+
+**It runs as the Realm's own user**, which was asked for: the agent then has
+the same home, the same files, the same logged-in accounts. The screenshot
+taken to prove the desktop renders has `workserver.txt` sitting on it, which
+is exactly the point. The cost is single-instance applications. Start Firefox
+on `:2` while a Firefox on the same profile is open on seat0 and no second
+browser starts - the running one is asked to open a window, and that window
+appears in the other session, in somebody's working desktop. An agent needs a
+profile of its own. It is written at the bottom of `celephais-agent-desktop`
+where whoever sets the agent up will be reading.
+
+And a smaller cost, measured rather than guessed: with two Xfce sessions as
+one user, `xfdesktop` on the agent's display rewrote `icons.screen0.yaml` -
+the desktop icon positions - under the session on seat0. Backed up to
+`/root/xfce4-config.celephais-bak.tgz`. It stops when seat0 becomes GNOME,
+which is where this is all going; two desktops that are not the same desktop
+share almost nothing, since xfconf and dconf keep their settings apart.
+
+**The Gate.** `celephais-desktop show` reports the agent's desk beside the
+choices rather than among them - nothing switches to it - and Core passes the
+guest's JSON through untouched, so this needed no Core change at all. The
+overlay's desktop screen grew a *watch the agent* button; `connect()` takes a
+port now, and the Gate forces one screen for that desktop whatever the Gate
+is set to, because it is one display of a fixed size and asking FreeRDP to
+span three monitors onto it only makes xrdp shrink the client.
+
+**The tailnet ACL allows `vm-*:3389` and nothing else**, so watching the
+agent from a Gate that is not on the house wire wants 3390 added to it. An
+agent running inside the Realm - which this one does - needs none of that:
+`DISPLAY=:2`, and no port at all.
+
+**Verified:** Xvfb and Xfce up on `:2` at 1920x1080 with RANDR, 1920x1080
+screenshot showing a rendered desktop with panel, dock and the user's own
+files on it, ~400 MB for the second desktop with 6.4 GB still free; both Xfce
+stacks running side by side; `celephais-desktop show` reporting the desk; the
+full test suite, including the overlay's new button.
+
+**Not done from here: the services that need the password.** x11vnc and xrdp
+for the agent's display read the same Celephais password file as the Realm's
+own, which does not exist yet - see the entry above. One run of
+`install-realm.sh --agent` by somebody who can type the password finishes all
+of it. The staged copy at `~workrealm/celephais/` is the whole directory, not
+just the script: it installs its siblings and cannot find them otherwise.

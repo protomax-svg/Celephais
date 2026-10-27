@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Say which desktop a Realm comes up in, and change it. Run as root.
+
+    celephais-desktop show [--user <name>]
+    celephais-desktop set <session> [--user <name>]
+
+`show` prints JSON: what the Realm boots into, what is running now, and every
+desktop installed on it with whether Celephais can serve that one. `set` makes
+one of them the desktop it boots into, moves the remote desktop over to the
+server that desktop needs, and logs the session out so the new one comes up at
+once. Core drives both through the guest agent; nothing here needs the network.
+
+Two things have to agree, and they are kept by different people:
+
+  - What GDM starts. It logs the Realm's user in by itself (install-realm.sh
+    sets that up) and starts whatever AccountsService remembers for them.
+  - What serves it. gnome-remote-desktop is GNOME's own and serves nothing
+    else; x11vnc behind xrdp serves any X11 desktop and cannot see a Wayland
+    one at all. They both want port 3389, so exactly one may run.
+
+Hence: a session out of /usr/share/xsessions is served by x11vnc, GNOME out of
+/usr/share/wayland-sessions by gnome-remote-desktop, and a Wayland desktop that
+is not GNOME by nothing at all - it is listed, and refused with the reason.
+
+The switch is not free: the session is logged out, so everything open in it is
+closed, and the Realm is unreachable for the few seconds the next one takes to
+come up. There is no way around that. The two servers cannot share the port,
+and a desktop cannot change out from under a session that is already running.
+"""
+import argparse
+import glob
+import json
+import os
+import pwd
+import re
+import subprocess
+import time
+import sys
+
+SESSION_DIRS = (("/usr/share/xsessions", "x11"),
+                ("/usr/share/wayland-sessions", "wayland"))
+ACCOUNTS = "/var/lib/AccountsService/users"
+GDM_CONFS = ("/etc/gdm3/custom.conf", "/etc/gdm/custom.conf")
+
+# The system services each backend owns, and the user services that belong to
+# the session itself. A user service is enabled rather than started: the
+# session it lives in does not exist yet when the switch happens.
+BACKENDS = {
+    "x11vnc": {"system": ["xrdp", "celephais-x11vnc"], "user": []},
+    "gnome": {"system": [],
+              "user": ["gnome-remote-desktop-headless", "celephais-monitors"]},
+}
+
+
+def run(*command, **kwargs):
+    return subprocess.run(command, capture_output=True, text=True, **kwargs)
+
+
+class Realm:
+    """The Realm's own user, and the session it is logged into."""
+
+    def __init__(self, name=""):
+        self.name = name or self.autologin_user()
+        try:
+            self.entry = pwd.getpwnam(self.name)
+        except KeyError:
+            sys.exit(f"celephais-desktop: no user called {self.name}")
+        self.uid = self.entry.pw_uid
+
+    @staticmethod
+    def autologin_user():
+        """Who GDM logs in, or the one person logged in, or give up.
+
+        A Realm has exactly one account in it. Asking GDM first means the
+        answer is the same whether or not anybody is logged in at the time.
+        """
+        for conf in GDM_CONFS:
+            try:
+                for line in open(conf):
+                    if line.startswith("AutomaticLogin="):
+                        return line.split("=", 1)[1].strip()
+            except OSError:
+                pass
+        people = [line.split()[1] for line in
+                  run("loginctl", "--no-legend", "list-users").stdout.splitlines()
+                  if line.split() and 1000 <= int(line.split()[0]) < 60000]
+        if len(set(people)) == 1:
+            return people[0]
+        sys.exit("celephais-desktop: cannot tell whose desktop this is; "
+                 "name it with --user")
+
+    def as_user(self, *command):
+        """Run something inside the user's own session bus."""
+        return run("sudo", "-u", self.name, *command, env=dict(
+            os.environ,
+            XDG_RUNTIME_DIR=f"/run/user/{self.uid}",
+            DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{self.uid}/bus"))
+
+    @property
+    def accounts_file(self):
+        return os.path.join(ACCOUNTS, self.name)
+
+    def remembered(self):
+        """The session AccountsService will start them in next time."""
+        try:
+            for line in open(self.accounts_file):
+                if line.startswith("Session="):
+                    return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+        return ""
+
+    def running(self):
+        """The session actually on the screen now, if there is one.
+
+        XDG_CURRENT_DESKTOP out of the session's own environment is the
+        honest answer; it says GNOME or XFCE rather than the name of a file.
+        """
+        for process in ("xfce4-session", "gnome-shell", "plasmashell"):
+            found = run("pgrep", "-u", str(self.uid), "-x", process)
+            if found.returncode == 0:
+                return process.replace("4-session", "").replace("shell", "")
+        return ""
+
+
+def installed_sessions():
+    """Every desktop on this Realm, as the display manager sees them."""
+    found = []
+    for directory, kind in SESSION_DIRS:
+        for path in sorted(glob.glob(os.path.join(directory, "*.desktop"))):
+            name = os.path.basename(path)[: -len(".desktop")]
+            label, hidden = name, False
+            for line in open(path, errors="replace"):
+                if line.startswith("Name=") and label == name:
+                    label = line.split("=", 1)[1].strip()
+                if line.strip() in ("Hidden=true", "NoDisplay=true"):
+                    hidden = True
+            if not hidden:
+                found.append({"name": name, "label": label, "type": kind})
+    return found
+
+
+def backend_for(session):
+    """Which server can serve this desktop, and why not when none can."""
+    if session["type"] == "x11":
+        return "x11vnc", ""
+    if "gnome" in session["name"] or "ubuntu" in session["name"]:
+        return "gnome", ""
+    return "", ("nothing here can serve a Wayland desktop that is not GNOME: "
+                "x11vnc needs an X server and gnome-remote-desktop is GNOME's")
+
+
+X11VNC_UNIT = "/etc/systemd/system/celephais-x11vnc.service"
+
+
+def vnc_password_file(realm):
+    """The rfbauth file x11vnc is actually started with.
+
+    Asking the unit rather than keeping a second copy of the path here: the
+    installer writes it into ExecStart, and a Realm set up before Celephais
+    had a password file of its own is still pointed at the old one. Guessing
+    would mean reporting a desktop as ready on the strength of a file nothing
+    reads.
+    """
+    default = f"{realm.entry.pw_dir}/.vnc/celephais.passwd"
+    try:
+        for line in open(X11VNC_UNIT):
+            if not line.startswith("ExecStart="):
+                continue
+            words = line.split()
+            if "--password-file" in words:
+                return words[words.index("--password-file") + 1]
+    except (OSError, IndexError):
+        pass
+    return default
+
+
+def backend_ready(realm, backend):
+    """Whether that server is installed and set up, and what is missing."""
+    if backend == "x11vnc":
+        for path in ("/usr/local/bin/celephais-x11vnc", "/usr/sbin/xrdp"):
+            if not os.path.exists(path):
+                return False, f"{os.path.basename(path)} is not installed here"
+        if not os.path.exists(vnc_password_file(realm)):
+            return False, ("no VNC password is set: run install-realm.sh "
+                           "with one")
+        return True, ""
+    if backend == "gnome":
+        if not run("sh", "-c", "command -v grdctl").stdout.strip():
+            return False, "gnome-remote-desktop is not installed here"
+        # grdctl keeps the password in the user's keyring and will not show
+        # it, but it does say whether the headless server was ever set up.
+        # "disabled" contains "enabled", so match the colon in front of it.
+        status = realm.as_user("grdctl", "--headless", "status").stdout
+        if not re.search(r"status:\s*enabled", status, re.I):
+            return False, ("gnome-remote-desktop is installed but not set up: "
+                           "re-run install-realm.sh --switchable with the "
+                           "password")
+        return True, ""
+    return False, "no server for this desktop"
+
+
+def active_backend():
+    """The one serving the Realm now, by what is running rather than by what
+    was asked for: a service that was switched on and then died is not it."""
+    if run("systemctl", "is-active", "--quiet", "xrdp").returncode == 0:
+        return "x11vnc"
+    if run("pgrep", "-f", "gnome-remote-desktop-daemon").returncode == 0:
+        return "gnome"
+    return ""
+
+
+AGENT_UNIT = "/etc/systemd/system/celephais-agent-desktop.service"
+AGENT_INI = "/etc/xrdp/xrdp-agent.ini"
+
+
+def agent_desk():
+    """The desktop that belongs to an agent rather than to anyone logged in.
+
+    Reported beside the choices rather than among them, because it is not one
+    of them: it is a second desktop that exists at the same time as whichever
+    the Realm boots into, on a display and a port of its own, and nothing
+    here switches to it. Said at all so the Gate can offer to look at what
+    the agent is doing. A Realm set up without --agent has none and says so
+    by saying nothing.
+    """
+    if not os.path.exists(AGENT_UNIT):
+        return None
+    display = screen = ""
+    for line in open(AGENT_UNIT):
+        words = line.split()
+        for flag, into in (("--display", "display"), ("--screen", "screen")):
+            if flag in words:
+                value = words[words.index(flag) + 1]
+                if into == "display":
+                    display = value
+                else:
+                    screen = value
+    port = 0
+    try:
+        for line in open(AGENT_INI):
+            if line.startswith("port="):
+                port = int(line.split("=", 1)[1].strip())
+                break
+    except (OSError, ValueError):
+        pass
+    units = ("celephais-agent-desktop", "celephais-x11vnc-agent",
+             "celephais-xrdp-agent")
+    running = all(run("systemctl", "is-active", "--quiet", unit).returncode == 0
+                  for unit in units)
+    return {"display": display, "screen": screen, "rdp_port": port,
+            "running": running}
+
+
+def show(realm):
+    choices = []
+    for session in installed_sessions():
+        backend, why = backend_for(session)
+        usable, missing = (backend_ready(realm, backend) if backend
+                           else (False, why))
+        choices.append(dict(session, backend=backend, usable=usable,
+                            why="" if usable else (missing or why)))
+    print(json.dumps({"user": realm.name,
+                      "current": realm.remembered(),
+                      "running": realm.running(),
+                      "backend": active_backend(),
+                      "agent": agent_desk(),
+                      "choices": choices}, indent=1))
+
+
+def write_accounts(realm, session):
+    """Tell AccountsService which desktop to start them in from now on.
+
+    Written the way GDM reads it: Session is the file's name without its
+    suffix, SessionType says which of the two directories it came from. Both
+    are rewritten every time, so a Realm moving from Wayland to X11 does not
+    keep a SessionType that contradicts its Session.
+    """
+    lines, seen = [], False
+    try:
+        lines = open(realm.accounts_file).read().splitlines()
+    except OSError:
+        lines = ["[User]"]
+    out, in_user = [], False
+    for line in lines:
+        if line.startswith("["):
+            if in_user and not seen:
+                out += [f"Session={session['name']}",
+                        f"SessionType={session['type']}"]
+                seen = True
+            in_user = line.strip() == "[User]"
+        if line.startswith(("Session=", "SessionType=", "XSession=")):
+            continue
+        out.append(line)
+    if not seen:
+        if "[User]" not in out:
+            out.append("[User]")
+        index = out.index("[User]") + 1
+        out[index:index] = [f"Session={session['name']}",
+                            f"SessionType={session['type']}"]
+    os.makedirs(ACCOUNTS, exist_ok=True)
+    with open(realm.accounts_file, "w") as handle:
+        handle.write("\n".join(out).rstrip("\n") + "\n")
+
+
+def switch_backend(realm, wanted):
+    """Take port 3389 off the old server and hand it to the new one.
+
+    The old one goes down first, because they cannot both have the port. The
+    new one is only enabled here, not started: there is nothing for it to
+    serve until the next session exists, and an xrdp listening on 3389 in the
+    meantime would tell Core the Realm is READY while the desktop behind it is
+    still being logged out. It is started further down, once there is a
+    session.
+    """
+    for backend, services in BACKENDS.items():
+        if backend == wanted:
+            continue
+        for unit in services["system"]:
+            run("systemctl", "disable", "--now", unit)
+        for unit in services["user"]:
+            realm.as_user("systemctl", "--user", "disable", "--now", unit)
+    for unit in BACKENDS[wanted]["system"]:
+        run("systemctl", "enable", unit)
+    # A user service cannot be started into a session that does not exist, but
+    # enabling it persists, so the next session starts it itself.
+    for unit in BACKENDS[wanted]["user"]:
+        realm.as_user("systemctl", "--user", "enable", unit)
+
+
+def wait_for(what, seconds, check):
+    """Poll until it is true, and say how it went. Nothing here is fast."""
+    for _ in range(seconds * 2):
+        if check():
+            return True
+        time.sleep(0.5)
+    print(f"celephais-desktop: {what} did not happen in {seconds}s",
+          file=sys.stderr)
+    return False
+
+
+def logged_in(realm):
+    """A session with a desktop in it, not merely a user systemd manager:
+    GDM's autologin brings the latter back seconds before the former."""
+    return bool(realm.running())
+
+
+def port_open(port=3389):
+    return bool([line for line in run("ss", "-ltn").stdout.splitlines()
+                 if f":{port} " in line])
+
+
+def set_session(realm, name):
+    sessions = {session["name"]: session for session in installed_sessions()}
+    if name not in sessions:
+        sys.exit(f"celephais-desktop: no desktop called {name} is installed; "
+                 f"there is " + ", ".join(sorted(sessions)))
+    session = sessions[name]
+    backend, why = backend_for(session)
+    usable, missing = (backend_ready(realm, backend) if backend
+                       else (False, why))
+    if not usable:
+        sys.exit(f"celephais-desktop: cannot serve {name}: {missing or why}")
+
+    write_accounts(realm, session)
+    switch_backend(realm, backend)
+
+    # The session holding the old desktop has to go for the new one to start,
+    # and GDM's automatic login is what brings it back - which is why
+    # install-realm.sh insists on setting that up. Everything open in the old
+    # session is closed; there is no way to change a desktop under itself.
+    run("loginctl", "terminate-user", realm.name)
+    wait_for("the old session", 10,
+             lambda: not logged_in(realm) and not os.path.isdir(
+                 f"/run/user/{realm.uid}"))
+    came_back = wait_for("the new session", 30, lambda: logged_in(realm))
+    for unit in BACKENDS[backend]["system"]:
+        run("systemctl", "start", unit)
+    serving = wait_for("port 3389", 20, port_open)
+    print(json.dumps({"user": realm.name, "current": name, "backend": backend,
+                      "running": realm.running(), "logged_out": True,
+                      "serving": serving and came_back}))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("command", choices=("show", "set"))
+    parser.add_argument("session", nargs="?", help="the desktop to boot into")
+    parser.add_argument("--user", default="", help="the Realm's own account")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("celephais-desktop: run this as root")
+    realm = Realm(args.user)
+    if args.command == "show":
+        return show(realm)
+    if not args.session:
+        sys.exit("celephais-desktop: say which desktop to set")
+    set_session(realm, args.session)
+
+
+if __name__ == "__main__":
+    main()
