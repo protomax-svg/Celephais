@@ -31,7 +31,12 @@ export DEBIAN_FRONTEND=noninteractive
 # refresh if they are not, without letting a broken repository be fatal.
 # dnf is told outright that a broken repository is not fatal.
 if ! command -v mount.cifs >/dev/null; then
-  if command -v dnf >/dev/null; then
+  if command -v pacman >/dev/null; then
+    # Omarchy. -Sy on its own would be a partial upgrade; -Syu would drag a
+    # whole system update into what is meant to be a five-second mount.
+    # --needed makes the whole thing a no-op when the package is already in.
+    pacman -S --needed --noconfirm cifs-utils
+  elif command -v dnf >/dev/null; then
     dnf install -y -q --setopt=skip_if_unavailable=True cifs-utils
   else
     apt-get install -y -qq cifs-utils >/dev/null 2>&1 || {
