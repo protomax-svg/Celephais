@@ -62,6 +62,15 @@ fi
 # session to a new state volume. Grant exactly those two, on VMs only.
 TOKENID=${PVE_TOKEN#PVEAPIToken=}; TOKENID=${TOKENID%%=*}
 if [ -n "$TOKENID" ] && command -v pveum >/dev/null; then
+  # The role Core does its ordinary work with: read a Realm's state, ask its
+  # agent for an address, power it on and off. It used to be created and
+  # granted by hand, once per Realm, and the loop below granted only the other
+  # two - so `work2`, added to REALMS and otherwise set up correctly, answered
+  # every poll with `403 Permission check failed (/vms/203, VM.Audit)` and sat
+  # in the Gate as ERROR. There is nothing per-Realm about it; it belongs here.
+  CORE_PRIVS=VM.Audit,VM.GuestAgent.Audit,VM.PowerMgmt
+  pveum role add CelephaisCore -privs "$CORE_PRIVS" 2>/dev/null ||
+    pveum role modify CelephaisCore -privs "$CORE_PRIVS"
   pveum role add CelephaisGuest -privs VM.GuestAgent.Unrestricted 2>/dev/null ||
     pveum role modify CelephaisGuest -privs VM.GuestAgent.Unrestricted
   # qm suspend --todisk allocates the state volume: a disk change on the VM,
@@ -78,9 +87,9 @@ if [ -n "$TOKENID" ] && command -v pveum >/dev/null; then
   # that already has its own entry needs the role named on that entry too.
   for _path in /vms $(grep '^REALMS *=' "$SRC/bin/celephais_core.py" |
                       grep -oE '[0-9]+' | sed 's|^|/vms/|'); do
-    pveum acl modify "$_path" --tokens "$TOKENID" --roles CelephaisGuest,CelephaisPark &&
-    pveum acl modify "$_path" --users "${TOKENID%%!*}" --roles CelephaisGuest,CelephaisPark ||
-      echo "could not grant the extra privileges on $_path; logout and park will fail" >&2
+    pveum acl modify "$_path" --tokens "$TOKENID" --roles CelephaisCore,CelephaisGuest,CelephaisPark &&
+    pveum acl modify "$_path" --users "${TOKENID%%!*}" --roles CelephaisCore,CelephaisGuest,CelephaisPark ||
+      echo "could not grant the privileges on $_path; that Realm will read as ERROR" >&2
   done
 fi
 

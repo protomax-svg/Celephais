@@ -11,7 +11,7 @@ SEAT_USB=(1532:02a2 046d:c52b 046d:c08a)  # Razer Ornata V3 X, Logitech Unifying
 # its own registry, where a serial number identifies a device properly. The
 # list above is the fallback for running this by hand on a fresh host.
 
-declare -A REALMS=( [work]=201 [personal]=202 [windows]=100 )
+declare -A REALMS=( [work]=201 [personal]=202 [work2]=203 [windows]=100 )
 
 # The display a Linux Realm needs when it has no GPU of its own, and must not
 # have while it has the RTX. A Realm's remote desktop lives inside its GNOME
@@ -23,7 +23,14 @@ declare -A REALMS=( [work]=201 [personal]=202 [windows]=100 )
 # display while it holds the RTX is the other mistake: GNOME puts the top bar
 # on the screen nobody looks at. So it follows the seat. Windows is not
 # listed and is never touched.
-declare -A HEADLESS_VGA=( [work]=std [personal]=std )
+#
+# `work2` is Omarchy, so there is no GDM and no autologin to wait on, but the
+# rule is the same one and it bites harder: Hyprland opens a DRM device or it
+# does not start. With the RTX that device is the RTX. Without it and without
+# a virtual display there is no /dev/dri at all, so the Realm would boot to a
+# console nobody can reach - the Proxmox one included, since `vga: none` is
+# what takes that away too.
+declare -A HEADLESS_VGA=( [work]=std [personal]=std [work2]=std )
 
 SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-120}
 

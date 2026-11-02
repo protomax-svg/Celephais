@@ -81,7 +81,7 @@ DEVICES_FILE = pathlib.Path(os.environ.get("CELEPHAIS_DEVICES",
                                            "/var/lib/celephais/devices.json"))
 
 # Add a Realm here once its VM exists.
-REALMS = {"work": 201, "personal": 202, "windows": 100}
+REALMS = {"work": 201, "personal": 202, "work2": 203, "windows": 100}
 RDP_PORT = 3389
 # How long a stop waits for a woken guest's agent before falling back to the
 # power button. A guest out of S3 answers in a few seconds.

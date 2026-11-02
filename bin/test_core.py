@@ -212,7 +212,7 @@ assert status_of("/nonsense") == 404
 
 code, body = call("/realms")
 assert code == 200 and {r["realm"] for r in body} == {"work", "personal",
-                                                      "windows"}, body
+                                                      "work2", "windows"}, body
 
 # A start of a seatless Realm must not touch the switcher at all.
 fake.status, fake.seat, fake.seat_calls = "stopped", False, []

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Give a Fedora Realm the proprietary NVIDIA driver. Run as root INSIDE the
-# Realm, at its own console, while it holds the Local Seat.
+# Give a Realm the NVIDIA driver. Run as root INSIDE the Realm. Fedora and
+# Omarchy; `work`'s Ubuntu driver is already installed and is not handled here.
 #
 #   sudo bash install-nvidia.sh
+#
+# On Fedora, run it at the Realm's own console while it holds the Local Seat.
+# On Omarchy it can be run either way, and before is better - see below.
 #
 # This is what makes the monitors' own speakers work, and it is not a sound
 # setting. The RTX's audio function is passed to the Realm already - the seat
@@ -28,8 +31,93 @@
 set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "run this as root: sudo bash $0" >&2; exit 1; }
+
+# ---------------------------------------------------------------- Omarchy ---
+# Omarchy already knows how to do this: install/hardware/nvidia.sh picks the
+# driver by GPU generation, writes the modprobe and mkinitcpio drop-ins, and
+# is idempotent. It is the source of truth for a machine that has the card,
+# and this hands straight over to it when the card is there.
+#
+# The card is only there while the Realm holds the Local Seat, and that is the
+# awkward part. `celephais-seat switch` takes the virtual display away in the
+# same breath as it gives out the RTX, so a Realm that reboots onto the
+# monitors with no driver has no screen to install one from - not its own, and
+# not the Proxmox console either. nouveau would probably carry it; "probably"
+# is not what you want to find out with the monitors dark.
+#
+# So the branch below does the same work ahead of the switch, off the same
+# package list, while the virtual display is still there to fall back on.
+# Afterwards run it again with the card attached: Omarchy's own script then
+# takes over and settles the initramfs properly, because its mkinitcpio
+# drop-in reads the live PCI tree - with the RTX the only display controller
+# in the Realm, it drops the `kms` hook and leaves nouveau and its ~100 MB of
+# GSP firmware out.
+if command -v pacman >/dev/null; then
+  OMARCHY_NVIDIA=/usr/share/omarchy/install/hardware/nvidia.sh
+  [ -f "$OMARCHY_NVIDIA" ] || {
+    echo "no $OMARCHY_NVIDIA: this is the Omarchy route and needs the omarchy package" >&2
+    exit 1; }
+
+  # nvidia-open-dkms builds an unsigned module. These Realms boot OVMF, and
+  # `work2`'s firmware has no keys enrolled, so nothing checks it. A Realm set
+  # up like `work` or `personal`, with pre-enrolled keys, would need the
+  # module signed, and this script does not do that.
+  if [ "$(bootctl status 2>/dev/null | grep -ci 'Secure Boot: enabled')" != 0 ]; then
+    echo "Secure Boot is on in this Realm. nvidia-open-dkms is not signed and" >&2
+    echo "will not load. Turn it off in the firmware, or sign the module." >&2
+    exit 1
+  fi
+
+  if lspci | grep -qi nvidia; then
+    echo "the RTX is attached; handing over to Omarchy's own installer"
+    bash "$OMARCHY_NVIDIA"
+  else
+    echo "no NVIDIA card in this Realm yet - installing ahead of the seat switch."
+    # Kept in step with the GSP branch of $OMARCHY_NVIDIA. Turing and newer,
+    # which the RTX 2060 is; the pre-GSP 580xx branch there is for cards the
+    # Local Seat does not have and is deliberately not mirrored.
+    omarchy-pkg-add nvidia-open-dkms nvidia-utils lib32-nvidia-utils libva-nvidia-driver
+    mkdir -p /etc/modprobe.d /etc/mkinitcpio.conf.d
+    printf 'options nvidia_drm modeset=1\n' > /etc/modprobe.d/nvidia.conf
+    printf 'MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)\n' \
+      > /etc/mkinitcpio.conf.d/nvidia.conf
+  fi
+
+  # Omarchy's script writes the mkinitcpio drop-in but does not rebuild, and
+  # the drop-in is written after the packages install, so the hook that fires
+  # during the install has not seen it yet.
+  #
+  # Not `mkinitcpio -P`. Omarchy boots a unified kernel image through limine
+  # and keeps no presets in /etc/mkinitcpio.d, so -P fails there; worse,
+  # /usr/local/bin/mkinitcpio is a wrapper that answers that failure by
+  # *asking on the terminal* whether to run limine-mkinitcpio instead. Run
+  # with no stdin that prompt reads EOF and takes the default, which happens
+  # to be yes - the image came out right here by that accident, and would not
+  # on a wrapper whose default ever changed. Ask for the image directly.
+  if command -v limine-mkinitcpio >/dev/null; then
+    limine-mkinitcpio
+  else
+    mkinitcpio -P
+  fi
+
+  echo
+  echo "driver: $(pacman -Q nvidia-open-dkms 2>/dev/null || echo 'not installed')"
+  if lspci | grep -qi nvidia; then
+    echo "Reboot, then check: nvidia-smi"
+  else
+    cat <<'NOTE'
+
+Installed, with nothing to drive yet. Now give the Realm the monitors from
+Celephais ("take the monitors"), which reboots it onto the RTX. Then run this
+again in the Realm, with the card attached, to let Omarchy settle the rest.
+NOTE
+  fi
+  exit 0
+fi
+
+# ----------------------------------------------------------------- Fedora ---
 command -v dnf >/dev/null || {
-  echo "this is the Fedora route; work's Ubuntu driver is already installed" >&2
+  echo "no dnf and no pacman here; work's Ubuntu driver is already installed" >&2
   exit 1; }
 RELEASE=$(rpm -E %fedora)
 

@@ -2603,3 +2603,102 @@ the one question worth answering about an agent's desktop: whether it is the
 X11 one an agent can work in. It is, and it cannot be anything else: the
 display is an Xvfb, and no Wayland is anywhere near it. The seat's desktop and
 the agent's share nothing but a user.
+
+## `work2` is a Realm, and it is Omarchy — `bin/celephais_core.py`, `bin/celephais-seat`, `deploy/install-nvidia.sh`, `deploy/install-core.sh` (2026-11-01)
+A fourth Realm: VM 203, Omarchy 4.0.6 off an ISO uploaded this morning, named
+`work2` on Proxmox and in Celephais both. The ask was the monitors first, so
+that is all this did - it has no remote desktop and is not meant to have one
+yet. Neither of the two ways in fits it: gnome-remote-desktop drives mutter's
+screencast API and there is no mutter, and x11vnc needs an X server where this
+has Hyprland on Wayland. It therefore reads **BOOTING** in the Gate for ever,
+which is honest - nothing answers on 3389 - and is the one loose end.
+
+Registering it was two lines, and then four things that were not.
+
+**The token could not see it.** `work2` went into `REALMS` in both places and
+came back `ERROR: HTTP Error 403: Permission check failed (/vms/203,
+VM.Audit)`. `install-core.sh` derives the VM list from `REALMS` itself, so the
+loop did reach /vms/203 - but it granted only `CelephaisGuest,CelephaisPark`.
+`CelephaisCore`, the role carrying VM.Audit and VM.PowerMgmt, had been created
+by hand once (line 544 of this file) and granted by hand per Realm ever since,
+and nobody noticed because no Realm had been added since the loop was written.
+There is nothing per-Realm about it. The role is created and granted in
+`install-core.sh` now, beside the other two, and the next Realm needs no
+`pveum` at all.
+
+**`HEADLESS_VGA` matters more here, not less.** The entry reads `[work2]=std`
+for a reason that is not GDM's. `work` and `personal` need a display because
+GDM will not autologin without one and the remote desktop lives inside that
+session. Omarchy has SDDM and autologin already configured, so that argument
+does not apply - but Hyprland opens a DRM device or it does not start, and
+`vga: none` with no RTX leaves no `/dev/dri` at all. It would also take the
+Proxmox console away, which is the only way back in. Same line, harder edge.
+
+**The driver had to go on before the seat moved, and Omarchy's own installer
+will not do that.** `install/hardware/nvidia.sh` gates on `lspci | grep -qi
+nvidia`, and the card only exists in the Realm once the seat is there - by
+which time, with `vga: none`, a Realm with no driver has no screen to install
+one from. So `install-nvidia.sh` grew an Omarchy branch that works from either
+side: with the card present it hands straight to Omarchy's script, and without
+it installs the same GSP-branch packages ahead of the switch. Secure Boot is
+checked and refused rather than worked around - `work2`'s efidisk has no
+pre-enrolled keys, unlike `work` and `personal`, so `nvidia-open-dkms` being
+unsigned costs nothing here and would cost everything there.
+
+**`mkinitcpio -P` is the wrong command on Omarchy, and got away with it.**
+Omarchy boots a unified kernel image through limine and keeps no presets in
+/etc/mkinitcpio.d, so `-P` fails. Worse: `/usr/local/bin/mkinitcpio` is a
+wrapper that answers that failure by *asking on the terminal* whether to run
+`limine-mkinitcpio` instead. Run from a script with no stdin the `read` took
+EOF, fell through to the default, and ran it - the image came out correct by
+an accident that would not survive the wrapper's default changing. It calls
+`limine-mkinitcpio` directly now.
+
+**Proven on the hardware.** Seat taken through Core, the path the Gate uses:
+
+```text
+update VM 100: -delete hostpci0,hostpci1,usb0,usb1,usb2,usb3
+update VM 203: -vga none ... -hostpci0 0000:01:00.0,pcie=1 ... Local Seat -> work2
+```
+
+It booted slower than its agent's patience looked - five minutes of no network
+and no agent, with the balloon still reporting memory, which is what a Realm
+looks like while it is coming up and not what one looks like when it is stuck.
+Then:
+
+```text
+NVIDIA GeForce RTX 2060   Disp.A: On   550MiB / 6144MiB   45C   driver 615.78.08
+/dev/dri/card1            DP-2 connected, HDMI-A-2 connected
+sddm-helper --start uwsm start -D Hyprland --user workrealm2 --autologin
+eld_valid 1   monitor_name  BenQ PD2500Q
+```
+
+Both monitors, logged in by itself, and the monitors' own speakers working on
+the first try - the thing that took a day and a half to find on `personal` in
+October, because the proprietary driver was there from the start. The second
+pass, run with the card attached, let Omarchy settle the image: nouveau and
+its GSP firmware are gone from the initramfs entirely (`kms` hook dropped,
+`lsinitcpio | grep -c nouveau` = 0) and the four DKMS modules plus
+`gsp_tu10x.bin` are in it.
+
+**USB.** The keyboard, the MX Vertical and the gamepad crossed with the seat
+and were live in the Realm. Two did not: the webcam on the same hub, and the
+Bluetooth adapter, which was standing at `never`. Both are `seat` now - and
+registering the webcam found the sharp edge in Core's identity scheme.
+`POST /devices/0c45:636d` looked right and was not: that device has a serial,
+so its identity is `0c45:636d:SN0001`, and the bare VID:PID matched no device
+present. Core did as asked and wrote a second registry entry for a device that
+does not exist, which then listed beside the real one as `present: false`. It
+is not wrong - a decision can be recorded about something unplugged, which is
+the point of that branch - but an id that is close enough to look right is
+worth knowing about. The `/devices` listing prints the id to use.
+
+`bin/test_seat.sh` was red on HEAD before any of this, and had been since
+`stop_realm` learned `qm guest cmd shutdown`: the fake `qm` never grew the
+case, so every stop waited out `SHUTDOWN_TIMEOUT` and failed. The fake answers
+it now (the vmid is in `$3` there, not `$2`), the two assertions that named
+`qm shutdown` ask whether the Realm is down rather than how it was asked, and
+a sixth case moves the seat to `work2` - which is the only thing that checks
+both registries agree, since the switcher reads one and Core the other.
+`bin/test_ui_keyboard.py` also fails on HEAD; it wants a focused interactive
+Hyprland session and was left alone.
