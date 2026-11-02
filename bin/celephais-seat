@@ -5,8 +5,8 @@ set -euo pipefail
 
 # Local Seat hardware. Verify with: lspci -nn | grep -i nvidia ; lsusb
 SEAT_PCI=(0000:01:00.0 0000:01:00.1)   # GPU + HDMI/DP audio
-SEAT_USB=(1532:02a2 046d:c52b 046d:c08a)  # Razer Ornata V3 X, Logitech Unifying,
-                                          # MX Vertical on its cable
+SEAT_USB=(1532:02a2 046d:c52b 046d:c08a 0c45:636d)  # Razer Ornata V3 X, Logitech
+                                  # Unifying, MX Vertical on its cable, webcam
 # Core passes the approved devices as extra arguments to switch, taken from
 # its own registry, where a serial number identifies a device properly. The
 # list above is the fallback for running this by hand on a fresh host.

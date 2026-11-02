@@ -103,8 +103,17 @@ SEAT_CMD = os.environ.get("SEAT_CMD", "sudo -n /usr/local/bin/celephais-seat").s
 # must never be the thing that takes them away. The MX Vertical is one mouse
 # with two identities: through the Unifying receiver (c52b), and as itself on
 # its charging cable (c08a), so both are claimed.
+#
+# The webcam is here for the same reason, and it took a while to see why.
+# Approving it in the registry was not enough: seat_usb() writes a standing
+# claim for these defaults whether or not the device is visible, but an
+# approved extra is only claimed if it is plugged in at that moment. The
+# webcam hangs off the same USB switch as the keyboard and mouse, so it is
+# absent at exactly the moment the seat is asked for - that is when Max is
+# sitting at the other machine. It belongs to the seat, so it travels like
+# the seat, and it carries the microphone with it.
 SEAT_DEFAULT_USB = [d for d in os.environ.get(
-    "SEAT_DEFAULT_USB", "1532:02a2 046d:c52b 046d:c08a").split() if d]
+    "SEAT_DEFAULT_USB", "1532:02a2 046d:c52b 046d:c08a 0c45:636d").split() if d]
 
 PVE_HOST = os.environ.get("PVE_HOST", "")
 PVE_NODE = os.environ.get("PVE_NODE", "pve")
