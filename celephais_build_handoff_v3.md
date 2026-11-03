@@ -2702,3 +2702,63 @@ a sixth case moves the seat to `work2` - which is the only thing that checks
 both registries agree, since the switcher reads one and Core the other.
 `bin/test_ui_keyboard.py` also fails on HEAD; it wants a focused interactive
 Hyprland session and was left alone.
+
+## Backups, onto a disk that was already somebody's — deploy/install-backup.sh, bin/celephais-backup-cloud (2026-11-03)
+
+A 2 TB disk arrived and the brief was "a backup folder on it, snapshots plus
+the cloud data". The first thing worth knowing is what was already on it:
+314 GB of `3D`, `VOS`, `QUANT`, `Disk`, `Disk_R` and a Windows recycle bin.
+So nothing here formats anything. It stays exfat, and everything written to
+it lives under `/mnt/backup/celephais` and nowhere else.
+
+exfat decides the shape of the rest. It cannot store Unix ownership or
+permissions, which rules out the obvious answer of rsyncing the share across
+and rules in container formats: vzdump archives for the guests, a restic
+repository for the files. Both carry their metadata inside themselves.
+
+The second thing worth knowing is that the cloud data is not in any guest.
+`celephais-cloud` is CT 210, and its 25 GB lives on the host at
+`/mnt/hdd/cloud`, bind-mounted in as `/srv/cloud`. vzdump says so in its own
+log - "excluding bind mount point mp0 ('/srv/cloud') from backup (not a
+volume)" - and it is right to: it is not one of the container's volumes. So
+the container's 8 GB rootfs goes in the nightly job and the files get their
+own. That split is the correct one anyway. The rootfs is rebuildable from
+`install-cloud.sh`; the files are not rebuildable from anything.
+
+`win11-test` is left out of the job on purpose. Its second disk is an 800 GB
+preallocated raw file on `/mnt/hdd`, and vzdump reads a raw file whole. That
+is hours of spindle time every night, taken from the same disk the cloud
+share lives on, to protect a machine with nothing in it.
+
+Measured rather than guessed, because allocated size says nothing here:
+
+    201 work      64 GB allocated, 59% used   -> 18.8 GB archive, 3m06
+    202 personal 120 GB allocated,  0% used   ->  7.0 GB archive, 1m19
+    203 work2    128 GB allocated, 13% used   -> 18.7 GB archive, 2m36
+    210 cloud      8 GB rootfs               ->  0.4 GB archive, 0m10
+    cloud files   23.4 GB read                ->  7.3 GB stored,  7m53
+
+A full set is about 45 GB and seven minutes. At keep-daily=7 plus
+keep-weekly=4 the worst case is eleven sets, so roughly 500 GB against the
+1.5 TB still free. The restic repository grows by what changed, not by 23 GB
+a night.
+
+Two guards that are the whole point of the exercise. `is_mountpoint` on the
+storage, and a `mountpoint -q` check at the top of the cloud script: the
+destination is USB, and an unplugged USB disk leaves behind an ordinary empty
+directory on `pve-root`. Without either guard the first night the disk was
+out, Proxmox and restic would both write a full set of backups into the root
+filesystem, fill it, and stop writing to the real repository without saying
+anything.
+
+The restic key is at `/etc/celephais/restic-cloud.pass`, on `pve-root` and
+deliberately not on the backup disk - a key kept beside the data it encrypts
+is not doing anything. The consequence is that losing the host loses the key
+and every cloud snapshot with it, so it has to be copied somewhere else by
+hand. That is the one step this script cannot do for anybody.
+
+Noticed in passing and not acted on: LVM warns that the `celephais-ssd` thin
+pool is overcommitted - 328 GB of volumes over a 221 GB pool, in a 233 GB
+volume group with no room to autoextend into. It is at 30% today and fine.
+If the Realms ever write enough to fill it, thin provisioning does not fail
+politely.

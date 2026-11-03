@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Back up the cloud container's data to the external disk. Run on the
+# Proxmox host, as root, from the systemd timer beside it.
+#
+# The data is CT 210's mp0: a bind mount of /mnt/hdd/cloud into /srv/cloud.
+# vzdump deliberately leaves it alone - "excluding bind mount point mp0 (not
+# a volume)" - because it is not one of the container's own volumes. So the
+# container's rootfs is in the nightly vzdump job and the 25 GB that actually
+# matters is here, which is the right split anyway: the rootfs is rebuildable
+# and the files are not.
+#
+# restic rather than tar because this runs every night. The first run writes
+# the lot; after that it writes only what changed, and the repository format
+# carries ownership and permissions inside itself - which matters, because
+# the destination is exfat and cannot store either.
+set -euo pipefail
+
+SOURCE=${SOURCE:-/mnt/hdd/cloud}
+MOUNT=${MOUNT:-/mnt/backup}
+export RESTIC_REPOSITORY=${RESTIC_REPOSITORY:-$MOUNT/celephais/restic-cloud}
+export RESTIC_PASSWORD_FILE=${RESTIC_PASSWORD_FILE:-/etc/celephais/restic-cloud.pass}
+
+die() { echo "celephais-backup-cloud: $*" >&2; exit 1; }
+
+# The guard that matters. /mnt/backup is a USB disk; unplug it and the
+# mountpoint becomes an ordinary empty directory on pve-root. Without this
+# check restic would cheerfully create a second repository there and fill the
+# root filesystem with backups nobody asked for, and the real repository on
+# the disk would quietly stop being written to.
+mountpoint -q "$MOUNT" || die "$MOUNT is not mounted; the backup disk is not there"
+[ -d "$SOURCE" ] || die "$SOURCE does not exist"
+[ -s "$RESTIC_PASSWORD_FILE" ] || die "no repository key at $RESTIC_PASSWORD_FILE"
+
+# .trash and .Trash-1000 are what the share already considers deleted, and
+# .pnpm-store is a package cache that rebuilds itself. Backing up a trash can
+# is how a backup disk fills with things somebody meant to throw away.
+restic backup "$SOURCE" \
+  --tag cloud \
+  --exclude "$SOURCE/.trash" \
+  --exclude "$SOURCE/.Trash-1000" \
+  --exclude "$SOURCE/.pnpm-store"
+
+# Same retention the vzdump job uses, so the two halves of a restore are
+# always from the same stretch of time.
+restic forget --tag cloud --keep-daily 7 --keep-weekly 4 --prune
+
+# Cheap: reads the metadata and checks the repository is internally
+# consistent. It does not re-read the data blobs - `restic check --read-data`
+# does that, and on a USB disk it is an hour's work, so it is left for a
+# human to run when they want to be sure.
+restic check
