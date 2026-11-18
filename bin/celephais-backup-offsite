@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Nightly offsite copy of the cloud share to MEGA. Proxmox host, root, from
+# celephais-backup-offsite.timer.
+#
+# A second restic repository, not a copy of the one on the USB disk. It reads
+# /mnt/hdd/cloud directly, so it keeps working on nights the USB disk is
+# unplugged - which is exactly when you want the other copy to be current -
+# and a fault in one repository cannot travel into the other.
+#
+# restic encrypts before anything leaves the host (AES-256, key in
+# restic-offsite.pass, which is NOT the same key as the USB repository's).
+# MEGA stores opaque pack files and cannot read names, sizes or contents.
+# rclone carries them; it has to be the upstream build in /usr/local/bin,
+# because Debian's package ships without the MEGA backend.
+#
+# MEGA's free plan is 20 GB of storage, uploads unthrottled, downloads capped
+# at a few GB per several hours. Fine for a last-resort copy - a full restore
+# takes about a day - and the reason the excludes below are a little wider than
+# the USB job's: every GB left out is a GB that does not have to come back
+# through that cap.
+set -euo pipefail
+
+SOURCE=${SOURCE:-/mnt/hdd/cloud}
+export RCLONE_CONFIG=${RCLONE_CONFIG:-/etc/celephais/rclone.conf}
+REMOTE=${REMOTE:-mega}
+export RESTIC_REPOSITORY=${RESTIC_REPOSITORY:-rclone:$REMOTE:celephais-restic}
+export RESTIC_PASSWORD_FILE=${RESTIC_PASSWORD_FILE:-/etc/celephais/restic-offsite.pass}
+STATUS=${STATUS:-/var/lib/celephais/offsite.json}
+
+die() { echo "celephais-backup-offsite: $*" >&2; exit 1; }
+[ -d "$SOURCE" ] || die "$SOURCE does not exist"
+[ -s "$RESTIC_PASSWORD_FILE" ] || die "no repository key at $RESTIC_PASSWORD_FILE"
+[ -s "$RCLONE_CONFIG" ] || die "no rclone config at $RCLONE_CONFIG"
+
+restic cat config >/dev/null 2>&1 || restic init
+
+# The USB job's excludes (trash, package cache), plus what any project can
+# rebuild from its lockfile: dependency trees, virtualenvs, bytecode, Next.js
+# build output. ~8 GB raw that would otherwise be ~2 GB of upload. build/,
+# dist/ and .git stay in - in some projects build/ is source.
+restic backup "$SOURCE" \
+  --tag cloud \
+  --exclude "$SOURCE/.trash" \
+  --exclude "$SOURCE/.Trash-1000" \
+  --exclude "$SOURCE/.pnpm-store" \
+  --exclude node_modules \
+  --exclude .venv \
+  --exclude venv \
+  --exclude __pycache__ \
+  --exclude .next
+
+restic forget --tag cloud --keep-daily 7 --keep-weekly 4 --prune
+
+# Metadata only. Reading every pack back would spend the download cap every
+# night; run `restic check --read-data-subset=5%` by hand now and then.
+restic check
+
+# The morning report reads this rather than asking MEGA itself, so a slow or
+# unreachable MEGA does not hold up the report.
+install -d -m 755 "$(dirname "$STATUS")"
+about=$(rclone about "$REMOTE:" --json 2>/dev/null || echo '{}')
+python3 -c '
+import json, sys, time
+about = json.loads(sys.argv[2] or "{}")
+json.dump({"time": time.time(), "free": about.get("free"), "used": about.get("used"),
+           "total": about.get("total")}, open(sys.argv[1], "w"))
+' "$STATUS" "$about"
