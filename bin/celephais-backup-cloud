@@ -40,6 +40,14 @@ restic backup "$SOURCE" \
   --exclude "$SOURCE/.Trash-1000" \
   --exclude "$SOURCE/.pnpm-store"
 
+# TSDROP's server data (CT 211 serves it from here; vzdump skips bind mounts
+# for the same reason it skips the share). All of it - the MEGA switches in
+# the app decide only what leaves the building, not what is kept here.
+if [ -d /mnt/hdd/tsdrop/data ]; then
+  restic backup /mnt/hdd/tsdrop/data --tag tsdrop
+  restic forget --tag tsdrop --keep-daily 7 --keep-weekly 4
+fi
+
 # Same retention the vzdump job uses, so the two halves of a restore are
 # always from the same stretch of time.
 restic forget --tag cloud --keep-daily 7 --keep-weekly 4 --prune

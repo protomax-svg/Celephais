@@ -32,7 +32,7 @@ MOUNT=${MOUNT:-/mnt/backup}
 ROOT=$MOUNT/celephais
 STORAGE=${STORAGE:-backup-hdd}
 RETENTION=${RETENTION:-keep-daily=7,keep-weekly=4}
-GUESTS=${GUESTS:-201,202,203,210}
+GUESTS=${GUESTS:-201,202,203,210,211}
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 
 mountpoint -q "$MOUNT" || {
@@ -67,7 +67,8 @@ if ! grep -q "^vzdump: celephais-nightly" /etc/pve/jobs.cfg 2>/dev/null; then
     --enabled 1
   echo "created the nightly vzdump job"
 else
-  echo "vzdump job already present"
+  pvesh set /cluster/backup/celephais-nightly --vmid "$GUESTS"
+  echo "vzdump job already present; guests set to $GUESTS"
 fi
 
 # --- the cloud data ---------------------------------------------------------

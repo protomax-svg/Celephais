@@ -150,6 +150,52 @@ def check_offsite(now):
     return [], [line]
 
 
+def check_tsdrop(now, usb_mounted):
+    """Laptop mirror, MEGA selection, USB snapshot. Silent if TSDROP is not installed."""
+    if not os.path.isdir("/mnt/hdd/tsdrop/data"):
+        return [], []
+    problems, lines = [], []
+    m = {}
+    try:
+        m = json.load(open("/var/lib/celephais/tsdrop-mirror.json"))
+    except (OSError, ValueError):
+        pass
+    ok = m.get("last_ok", 0)
+    if now - ok > 24 * 3600:
+        why = "laptop unreachable" if m.get("reachable") is False else (m.get("last_error") or "never ran")
+        problems.append(f"TSDROP laptop mirror: last good sync "
+                        f"{time.strftime('%d %b %H:%M', time.localtime(ok)) if ok else 'never'} ({why})")
+    else:
+        lines.append(f"TSDROP → laptop: ✓ {int((now - ok) // 60)} min ago")
+
+    try:
+        o = json.load(open("/var/lib/celephais/tsdrop-offsite.json"))
+    except (OSError, ValueError):
+        o = None
+    if o is None or now - o.get("time", 0) > 3 * 3600:
+        problems.append("TSDROP → MEGA: no successful run in the last 3 hours")
+    elif o.get("selected"):
+        lines.append(f"TSDROP → MEGA: ✓ {', '.join(o['selected'])}")
+    else:
+        lines.append("TSDROP → MEGA: nothing switched on")
+
+    if usb_mounted:
+        env = dict(os.environ, RESTIC_REPOSITORY=RESTIC_REPO, RESTIC_PASSWORD_FILE=RESTIC_PASS)
+        r = subprocess.run(["restic", "snapshots", "--latest", "1", "--tag", "tsdrop",
+                            "--json", "--no-lock", "--no-cache"],
+                           capture_output=True, text=True, env=env)
+        try:
+            stamp = re.sub(r"\.\d+", "", json.loads(r.stdout)[-1]["time"])
+            taken = time.mktime(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+        except (ValueError, IndexError, KeyError):
+            taken = 0
+        if now - taken > MAX_AGE:
+            problems.append("TSDROP → USB: no snapshot from last night")
+        else:
+            lines.append(f"TSDROP → USB: ✓ {stamp[11:16]}")
+    return problems, lines
+
+
 def main():
     now = time.time()
     problems, lines = [], []
@@ -170,6 +216,10 @@ def main():
                      f"({100 * u.used // u.total}% used)")
 
     p, l = check_offsite(now)
+    problems += p
+    lines += l
+
+    p, l = check_tsdrop(now, os.path.ismount(MOUNT))
     problems += p
     lines += l
 

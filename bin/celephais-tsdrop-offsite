@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Hourly: the parts of TSDROP its owner chose, encrypted, to MEGA.
+
+Off by default, everywhere. Something goes to MEGA only once it is switched on
+in the app, and the switches are plain markers on the server, so this job can
+read them without any key:
+
+    chats/<id>/chat.json  with "backup": true   -> chats/<id>/ and inbox/<id>/
+    vault/.tsbackup                             -> vault/
+    files/<folder>/.tsbackup                    -> files/<folder>/
+
+Everything (switched on or not) still goes to the USB disk nightly and to the
+laptop every 5 minutes; this is only the copy that leaves the building.
+
+Same restic repository as the cloud share's offsite copy, tagged `tsdrop`.
+Only `forget` here, no `prune`: the nightly celephais-backup-offsite prunes
+the whole repository at 04:00, and pruning hourly would mean re-reading MEGA
+every hour for a few kilobytes.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+DATA = "/mnt/hdd/tsdrop/data"
+STATUS = "/var/lib/celephais/tsdrop-offsite.json"
+ENV = dict(os.environ,
+           RCLONE_CONFIG="/etc/celephais/rclone.conf",
+           RESTIC_REPOSITORY="rclone:mega:celephais-restic",
+           RESTIC_PASSWORD_FILE="/etc/celephais/restic-offsite.pass",
+           XDG_CACHE_HOME="/var/cache/celephais")
+MARKER = ".tsbackup"
+
+
+def selected():
+    """[(path relative to DATA, human label)] of everything switched on."""
+    out = []
+    chats = os.path.join(DATA, "chats")
+    for cid in sorted(os.listdir(chats)) if os.path.isdir(chats) else []:
+        try:
+            with open(os.path.join(chats, cid, "chat.json")) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if meta.get("backup") is True:
+            label = f"container “{meta.get('name', cid)}”"
+            out.append((f"chats/{cid}", label))
+            if os.path.isdir(os.path.join(DATA, "inbox", cid)):
+                out.append((f"inbox/{cid}", None))
+    if os.path.exists(os.path.join(DATA, "vault", MARKER)):
+        out.append(("vault", "authenticator vault"))
+    files = os.path.join(DATA, "files")
+    for d in sorted(os.listdir(files)) if os.path.isdir(files) else []:
+        if os.path.exists(os.path.join(files, d, MARKER)):
+            out.append((f"files/{d}", f"folder “{d}”"))
+    return out
+
+
+def restic(*args):
+    subprocess.run(["restic", *args, "--retry-lock", "30m"], env=ENV, check=True)
+
+
+def main():
+    sel = selected()
+    status = {"time": time.time(), "selected": [l for _, l in sel if l]}
+    if sel:
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("\n".join(os.path.join(DATA, p) for p, _ in sel) + "\n")
+            lst = f.name
+        try:
+            restic("backup", "--tag", "tsdrop", "--files-from-raw", lst,
+                   "--group-by", "host,tags")
+        finally:
+            os.unlink(lst)
+    else:
+        print("nothing is switched on for MEGA; skipping the upload")
+    # Keep a day of hours, then thin out. Runs even with nothing selected, so
+    # switching everything off lets the old copies age out instead of
+    # sitting there forever.
+    restic("forget", "--tag", "tsdrop", "--group-by", "host,tags",
+           "--keep-hourly", "24", "--keep-daily", "7", "--keep-weekly", "4", "--keep-monthly", "6")
+    os.makedirs(os.path.dirname(STATUS), exist_ok=True)
+    with open(STATUS, "w") as f:
+        json.dump(status, f)
+    print("selected:", ", ".join(status["selected"]) or "nothing")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

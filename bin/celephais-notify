@@ -89,7 +89,18 @@ def main(argv):
     if argv and argv[0] == "--unit-failed":
         if len(argv) != 2:
             raise SystemExit("usage: celephais-notify --unit-failed UNIT")
+        # An hourly job that keeps failing should not become an hourly
+        # message. One per unit per 6 hours; the morning report covers the rest.
+        import os
+        stamp = f"/var/lib/celephais/alerted-{argv[1]}"
+        try:
+            if time.time() - os.path.getmtime(stamp) < 6 * 3600:
+                return
+        except OSError:
+            pass
         text = unit_failed(argv[1])
+        os.makedirs(os.path.dirname(stamp), exist_ok=True)
+        open(stamp, "w").close()
     elif argv:
         text = " ".join(argv)
     else:

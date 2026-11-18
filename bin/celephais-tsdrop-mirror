@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Keep the laptop's fallback copy of TSDROP in step with Proxmox. Every 5
+minutes, from celephais-tsdrop-mirror.timer, as root on the Proxmox host.
+
+Proxmox is the one true copy. The laptop serves a mirror of it (the
+tsdrop-mirror container, port 8081) that the app falls over to when Proxmox
+is down. While it is, people may write to the laptop - and when Proxmox comes
+back, the rule is:
+
+    new things come back; changes to old things do not.
+
+A message, an attachment, a file, a whole container that did not exist before
+the outage is carried over to Proxmox. Deleting or editing something that
+already existed is not: the next mirror puts Proxmox's version back. Nothing
+is lost either way, because the mirror never deletes on the laptop - whatever
+it removes or overwrites there is moved into archive/<timestamp>/ instead.
+
+"New" is decided against a manifest of what the laptop held after the last
+successful mirror. Without the manifest a file deleted on Proxmox would look
+new on the laptop and come straight back, every five minutes, forever.
+
+A laptop that is off or asleep is normal, not a failure: the run records it
+and exits 0. Real errors are reported to Telegram at most every 6 hours, so a
+broken mirror does not become a message every five minutes.
+"""
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+DATA = "/mnt/hdd/tsdrop/data"
+REMOTE = "laptop:tsdrop-mirror"
+CTID = "211"
+HTPASSWD = "/etc/apache2/tsdrop.htpasswd"
+STATE = "/var/lib/celephais"
+MANIFEST = f"{STATE}/tsdrop-mirror.manifest.json"
+STATUS = f"{STATE}/tsdrop-mirror.json"
+OWNER = 100033            # www-data (33) inside the unprivileged CT 211
+ALERT_EVERY = 6 * 3600
+ENV = dict(os.environ, RCLONE_CONFIG="/etc/celephais/rclone.conf",
+           XDG_CACHE_HOME="/var/cache/celephais")
+NET = ["--contimeout", "10s", "--timeout", "60s", "--low-level-retries", "2", "--retries", "1"]
+
+
+class Unreachable(Exception):
+    pass
+
+
+def rclone(*args, capture=True):
+    r = subprocess.run(["rclone", *args, *NET], env=ENV, capture_output=True, text=True)
+    if r.returncode != 0:
+        err = (r.stderr or "").strip().splitlines()[-1:] or [""]
+        if any(s in r.stderr for s in ("couldn't connect SSH", "connection refused",
+                                        "no route to host", "i/o timeout", "connect: ")):
+            raise Unreachable(err[0])
+        raise RuntimeError(f"rclone {args[0]}: {err[0]}")
+    return r.stdout
+
+
+def listing(target):
+    """Relative paths of every file under target; empty if it does not exist yet."""
+    try:
+        out = rclone("lsjson", "-R", "--files-only", "--no-mimetype", target)
+    except RuntimeError as e:
+        if "directory not found" in str(e):
+            return set()
+        raise
+    return {f["Path"] for f in json.loads(out or "[]")}
+
+
+def local_listing(root):
+    out = set()
+    for d, _, files in os.walk(root):
+        for f in files:
+            out.add(os.path.relpath(os.path.join(d, f), root))
+    return out
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def notify(text, quiet=False):
+    subprocess.run(["/usr/local/bin/celephais-notify"] + (["--quiet"] if quiet else []) + [text])
+
+
+def chown_tree(paths):
+    """rclone writes as root; Apache in the CT needs to own what it serves."""
+    dirs = set()
+    for p in paths:
+        full = os.path.join(DATA, p)
+        if os.path.exists(full):
+            os.chown(full, OWNER, OWNER)
+        d = os.path.dirname(p)
+        while d:
+            dirs.add(d)
+            d = os.path.dirname(d)
+    for d in dirs:
+        os.chown(os.path.join(DATA, d), OWNER, OWNER)
+
+
+def merge_new_from_laptop():
+    laptop = listing(f"{REMOTE}/data")
+    known = load(MANIFEST, None)
+    if known is None:
+        # No record of what the laptop held: anything there could be a file
+        # Proxmox deleted. Claim nothing; the mirror below sets the baseline.
+        return []
+    new = sorted(laptop - set(known) - local_listing(DATA))
+    if not new:
+        return []
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write("\n".join(new) + "\n")
+        lst = f.name
+    try:
+        rclone("copy", f"{REMOTE}/data", DATA, "--files-from-raw", lst, "--ignore-existing")
+    finally:
+        os.unlink(lst)
+    chown_tree(new)
+    return new
+
+
+def push_htpasswd():
+    """One password for both servers. Copied only when it changed."""
+    r = subprocess.run(["pct", "exec", CTID, "--", "cat", HTPASSWD],
+                       capture_output=True, text=True, env=dict(ENV, LC_ALL="C"))
+    if r.returncode != 0:
+        return
+    digest = hashlib.sha256(r.stdout.encode()).hexdigest()
+    if load(STATUS, {}).get("htpasswd_sha256") == digest:
+        return
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write(r.stdout)
+        tmp = f.name
+    try:
+        rclone("copyto", tmp, f"{REMOTE}/conf/htpasswd")
+    finally:
+        os.unlink(tmp)
+    return digest
+
+
+def main():
+    os.makedirs(STATE, exist_ok=True)
+    status = load(STATUS, {})
+    now = time.time()
+    try:
+        merged = merge_new_from_laptop()
+        ht = push_htpasswd()
+        stamp = time.strftime("%Y-%m-%d_%H%M%S")
+        rclone("sync", DATA, f"{REMOTE}/data", "--backup-dir", f"{REMOTE}/archive/{stamp}")
+        save(MANIFEST, sorted(listing(f"{REMOTE}/data")))
+    except Unreachable as e:
+        status.update(reachable=False, last_try=now, last_error=str(e))
+        save(STATUS, status)
+        print(f"laptop not reachable ({e}); nothing to do")
+        return 0
+    except Exception as e:
+        status.update(reachable=True, last_try=now, last_error=str(e))
+        if now - status.get("last_alert", 0) > ALERT_EVERY:
+            notify(f"❌ TSDROP laptop mirror failed: {e}\n\njournalctl -u celephais-tsdrop-mirror")
+            status["last_alert"] = now
+        save(STATUS, status)
+        print(f"error: {e}", file=sys.stderr)
+        return 0
+
+    status.update(reachable=True, last_try=now, last_ok=now, last_error=None,
+                  merged_last=len(merged))
+    if ht:
+        status["htpasswd_sha256"] = ht
+    save(STATUS, status)
+    if merged:
+        shown = "\n".join(f"• {p}" for p in merged[:15])
+        more = f"\n…and {len(merged) - 15} more" if len(merged) > 15 else ""
+        notify(f"↩️ TSDROP: {len(merged)} new item(s) made on the laptop while Proxmox was "
+               f"away were merged back.\n\n{shown}{more}")
+    print(f"mirrored; {len(merged)} new from laptop")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
