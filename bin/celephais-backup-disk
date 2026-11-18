@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Started by udev whenever the backup disk appears or disappears. Remounts it
+# if it came back, and tells Telegram when its state changes.
+#
+# Why this exists: on 2026-11-14 the disk dropped off USB and re-enumerated
+# about ten times in two minutes. systemd unmounted /mnt/backup when the device
+# went away - correctly - but nothing mounts an fstab entry again when the
+# device returns, so the disk sat there connected and unmounted. The 02:30
+# vzdump run found no mountpoint and skipped every guest; nobody found out,
+# because the failure mail went to root's mailbox on the host.
+#
+# The sleep is the debounce. A flapping cable fires a dozen udev events in a
+# minute; this unit is a oneshot, so every start request that arrives while
+# it is sleeping merges into the run already in progress, and you get one
+# message about where things ended up instead of twenty about the journey.
+set -uo pipefail
+
+MOUNT=${MOUNT:-/mnt/backup}
+UUID=${UUID:-6380-6E6F}
+STATE=${STATE:-/var/lib/celephais/backup-disk.state}
+DEV=/dev/disk/by-uuid/$UUID
+
+sleep "${SETTLE:-60}"
+
+if [ -e "$DEV" ] && ! mountpoint -q "$MOUNT"; then
+  systemctl start "$(systemd-escape -p --suffix=mount "$MOUNT")" || true
+fi
+
+if mountpoint -q "$MOUNT"; then
+  now=mounted
+elif [ -e "$DEV" ]; then
+  now=unmountable
+else
+  now=gone
+fi
+
+install -d -m 755 "$(dirname "$STATE")"
+last=$(cat "$STATE" 2>/dev/null || echo mounted)
+[ "$now" = "$last" ] && exit 0
+echo "$now" > "$STATE"
+
+case $now in
+  mounted)
+    free=$(df -h --output=avail "$MOUNT" | tail -1 | tr -d ' ')
+    msg="🟢 Backup disk is back and mounted at $MOUNT ($free free). Backups will run tonight as usual." ;;
+  gone)
+    msg="🔴 Backup disk disconnected from $(hostname). Backups are skipped until it is plugged back in - check the USB cable and power." ;;
+  unmountable)
+    msg="🟠 Backup disk is connected but will not mount. On the host: journalctl -u mnt-backup.mount -n 20" ;;
+esac
+/usr/local/bin/celephais-notify "$msg"

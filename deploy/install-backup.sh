@@ -103,6 +103,10 @@ RequiresMountsFor=/mnt/backup /mnt/hdd
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/celephais-backup-cloud
+# systemd gives the unit no $HOME, so without this restic runs with no cache
+# at all ("unable to locate cache directory") and re-reads the repository
+# index off the USB disk every night.
+Environment=XDG_CACHE_HOME=/var/cache/celephais
 # It reads 25 GB of somebody's working files every night, and it is never
 # more urgent than the Realms somebody is actually sitting in front of.
 Nice=10

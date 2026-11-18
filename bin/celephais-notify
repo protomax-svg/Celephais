@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Send a message to the Celephais Telegram bot. Runs on the Proxmox host.
+
+    celephais-notify "text"                 # loud: phone buzzes
+    celephais-notify --quiet "text"         # arrives silently
+    echo text | celephais-notify
+    celephais-notify --unit-failed UNIT     # for OnFailure= hooks
+
+The token and the chat live in /etc/celephais/telegram.env (root, 0600):
+
+    TG_TOKEN=123456:ABC...
+    TG_CHAT=123456789
+
+Python rather than curl so the token never appears on a command line, where
+any user on the host could read it out of ps.
+"""
+import json
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ENV = "/etc/celephais/telegram.env"
+LIMIT = 4000  # Telegram refuses anything over 4096 characters
+
+
+def load_env(path=ENV):
+    env = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip("'\"")
+    return env
+
+
+def send(text, quiet=False, path=ENV):
+    env = load_env(path)
+    token, chat = env.get("TG_TOKEN"), env.get("TG_CHAT")
+    if not token or not chat:
+        raise SystemExit(f"celephais-notify: TG_TOKEN and TG_CHAT must both be set in {path}")
+    if len(text) > LIMIT:
+        text = text[: LIMIT - 2] + "\n…"
+    data = urllib.parse.urlencode({
+        "chat_id": chat,
+        "text": text,
+        "disable_notification": "true" if quiet else "false",
+    }).encode()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    err = None
+    # The host may be the thing having a bad night - DNS not up yet after a
+    # reboot, the uplink flapping - so try a few times before giving up.
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(url, data, timeout=20) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            # A 4xx will not get better by retrying. str(e) carries no URL,
+            # so the token stays out of the journal.
+            body = e.read().decode(errors="replace")[:300]
+            if e.code < 500:
+                raise SystemExit(f"celephais-notify: Telegram said {e.code}: {body}")
+            err = f"{e.code}: {body}"
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            err = getattr(e, "reason", e)
+        time.sleep(5 * (attempt + 1))
+    raise SystemExit(f"celephais-notify: could not reach Telegram: {err}")
+
+
+def unit_failed(unit):
+    tail = subprocess.run(
+        ["journalctl", "-u", unit, "-n", "15", "--no-pager", "-o", "cat"],
+        capture_output=True, text=True).stdout.strip()
+    return f"❌ {unit} failed on {os_host()}\n\n{tail}"
+
+
+def os_host():
+    import socket
+    return socket.gethostname()
+
+
+def main(argv):
+    quiet = False
+    if argv and argv[0] == "--quiet":
+        quiet, argv = True, argv[1:]
+    if argv and argv[0] == "--unit-failed":
+        if len(argv) != 2:
+            raise SystemExit("usage: celephais-notify --unit-failed UNIT")
+        text = unit_failed(argv[1])
+    elif argv:
+        text = " ".join(argv)
+    else:
+        text = sys.stdin.read()
+    if not text.strip():
+        raise SystemExit("celephais-notify: nothing to send")
+    send(text, quiet=quiet)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

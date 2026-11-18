@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Morning report on last night's backups, sent to Telegram. Proxmox host.
+
+It checks outcomes, not events. Hooking each failure path separately misses
+the ones nobody thought of - the night of 2026-11-15 vzdump failed before the
+job even started, so a job-end hook would never have fired. Asking "is there
+an archive from last night for every guest, and a cloud snapshot, and room
+on the disk?" catches all of them, whatever the cause.
+
+A good night is sent silently; a bad one makes the phone buzz. The silent one
+still matters: it is the dead-man switch. If no message arrives one morning,
+the host, the timer or the bot is down, and that is worth noticing too.
+
+    celephais-backup-report            # send
+    celephais-backup-report --print    # print instead, for testing
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+MOUNT = "/mnt/backup"
+DUMP = f"{MOUNT}/celephais/dump"
+JOB = "celephais-nightly"
+RESTIC_REPO = f"{MOUNT}/celephais/restic-cloud"
+RESTIC_PASS = "/etc/celephais/restic-cloud.pass"
+CLOUD_UNIT = "celephais-backup-cloud.service"
+OFFSITE_UNIT = "celephais-backup-offsite.service"
+OFFSITE_STATUS = "/var/lib/celephais/offsite.json"
+MAX_AGE = 26 * 3600            # "last night", with slack for a late run
+MIN_FREE = 150 * 1024**3       # roughly two nights of full guest archives
+
+
+def run(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def gb(n):
+    return f"{n / 1024**3:.0f}G" if n >= 10 * 1024**3 else f"{n / 1024**3:.1f}G"
+
+
+def job_guests():
+    try:
+        cfg = open("/etc/pve/jobs.cfg").read()
+    except OSError:
+        return []
+    m = re.search(rf"^vzdump: {JOB}\n((?:[ \t].*\n?)*)", cfg, re.M)
+    if not m:
+        return []
+    v = re.search(r"^\s+vmid\s+(\S+)", m.group(1), re.M)
+    return v.group(1).split(",") if v else []
+
+
+def guest_name(vmid):
+    for path, key in ((f"/etc/pve/qemu-server/{vmid}.conf", "name"),
+                      (f"/etc/pve/lxc/{vmid}.conf", "hostname")):
+        try:
+            for line in open(path):
+                if line.startswith(f"{key}:"):
+                    return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+    return vmid
+
+
+def check_guests(now):
+    problems, lines = [], []
+    tasks = run("pvesh", "get", f"/nodes/{socket.gethostname()}/tasks",
+                "--typefilter", "vzdump", "--limit", "5", "--output-format", "json")
+    recent = [t for t in json.loads(tasks.stdout or "[]")
+              if now - t.get("starttime", 0) < MAX_AGE]
+    if not recent:
+        problems.append("No guest backup job ran in the last 26 hours.")
+    else:
+        t = max(recent, key=lambda t: t["starttime"])
+        status = t.get("status", "still running")
+        if status != "OK":
+            problems.append(f"Guest backup job: {status}")
+        if t.get("endtime"):
+            lines.append(f"VMs ({time.strftime('%H:%M', time.localtime(t['starttime']))}, "
+                         f"{(t['endtime'] - t['starttime']) // 60} min):")
+
+    for vmid in job_guests():
+        name = guest_name(vmid)
+        files = glob.glob(f"{DUMP}/vzdump-*-{vmid}-*.zst")
+        newest = max(files, key=os.path.getmtime) if files else None
+        if not newest or now - os.path.getmtime(newest) > MAX_AGE:
+            problems.append(f"{name} ({vmid}): no archive from last night")
+        else:
+            lines.append(f"  ✓ {name} {gb(os.path.getsize(newest))}")
+    return problems, lines
+
+
+def check_cloud(now):
+    problems, lines = [], []
+    r = run("systemctl", "show", CLOUD_UNIT, "-p", "Result", "--value")
+    if r.stdout.strip() not in ("success", ""):
+        problems.append(f"Cloud backup unit: {r.stdout.strip()} "
+                        f"(journalctl -u {CLOUD_UNIT})")
+    env = dict(os.environ, RESTIC_REPOSITORY=RESTIC_REPO,
+               RESTIC_PASSWORD_FILE=RESTIC_PASS)
+    r = subprocess.run(["restic", "snapshots", "--latest", "1", "--tag", "cloud",
+                        "--json", "--no-lock", "--no-cache"],
+                       capture_output=True, text=True, env=env)
+    try:
+        snap = json.loads(r.stdout)[-1]
+    except (ValueError, IndexError):
+        problems.append("Cloud files: could not read the restic repository")
+        return problems, lines
+    # restic writes nanoseconds and a numeric offset; trim to what Python reads.
+    stamp = re.sub(r"\.\d+", "", snap["time"])
+    taken = time.mktime(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+    if now - taken > MAX_AGE:
+        problems.append(f"Cloud files: newest snapshot is from {stamp[:16].replace('T', ' ')}")
+    else:
+        s = snap.get("summary", {})
+        size = gb(s["total_bytes_processed"]) if "total_bytes_processed" in s else "?"
+        changed = s.get("files_new", 0) + s.get("files_changed", 0)
+        lines.append(f"Cloud files ({stamp[11:16]}): ✓ {size}, {changed} files new/changed")
+    return problems, lines
+
+
+def check_offsite(now):
+    # Not installed is not a problem; installed and stale is.
+    if run("systemctl", "cat", OFFSITE_UNIT).returncode != 0:
+        return [], []
+    r = run("systemctl", "show", OFFSITE_UNIT, "-p", "Result", "-p", "ActiveState")
+    state = dict(l.split("=", 1) for l in r.stdout.split() if "=" in l)
+    try:
+        status = json.load(open(OFFSITE_STATUS))
+    except (OSError, ValueError):
+        status = {}
+    if state.get("ActiveState") == "activating":
+        return [], ["Offsite (MEGA): upload still running"]
+    if state.get("Result") not in ("success", None):
+        return [f"Offsite (MEGA): last run {state['Result']} "
+                f"(journalctl -u {OFFSITE_UNIT})"], []
+    if now - status.get("time", 0) > MAX_AGE:
+        return ["Offsite (MEGA): no successful upload in the last 26 hours"], []
+    line = f"Offsite (MEGA, {time.strftime('%H:%M', time.localtime(status['time']))}): ✓"
+    if status.get("free") is not None:
+        line += f" {gb(status['used'] or 0)} used, {gb(status['free'])} free"
+        if status["free"] < 2 * 1024**3:
+            return [f"Offsite (MEGA) nearly full: {gb(status['free'])} free"], [line]
+    return [], [line]
+
+
+def main():
+    now = time.time()
+    problems, lines = [], []
+
+    if not os.path.ismount(MOUNT):
+        problems.append(f"Backup disk is not mounted at {MOUNT}.")
+    else:
+        u = shutil.disk_usage(MOUNT)
+        if u.free < MIN_FREE:
+            problems.append(f"Backup disk nearly full: {gb(u.free)} free")
+        p, l = check_guests(now)
+        problems += p
+        lines += l
+        p, l = check_cloud(now)
+        problems += p
+        lines += l
+        lines.append(f"Disk: {gb(u.free)} free of {gb(u.total)} "
+                     f"({100 * u.used // u.total}% used)")
+
+    p, l = check_offsite(now)
+    problems += p
+    lines += l
+
+    day = time.strftime("%a %d %b")
+    if problems:
+        text = f"❌ Backups {day}: problems\n\n" + "\n".join(f"• {p}" for p in problems)
+        if lines:
+            text += "\n\n" + "\n".join(lines)
+    else:
+        text = f"✅ Backups {day}: all good\n\n" + "\n".join(lines)
+
+    if "--print" in sys.argv:
+        print(text)
+        return
+    subprocess.run(["/usr/local/bin/celephais-notify"] + ([] if problems else ["--quiet"]) + [text],
+                   check=True)
+
+
+if __name__ == "__main__":
+    main()
