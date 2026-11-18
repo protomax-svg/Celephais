@@ -54,6 +54,10 @@ ExecStart=/usr/local/bin/celephais-backup-offsite
 Environment=XDG_CACHE_HOME=/var/cache/celephais
 Nice=10
 IOSchedulingClass=idle
+# The first run peaked at 10.5 GB, most of it page cache from reading 16 GB
+# of files, all charged to this unit. A soft ceiling: past it the kernel
+# reclaims this unit's cache before it touches the Realms'. Never a kill.
+MemoryHigh=4G
 # The first upload is several GB over a home uplink; the nightly ones are
 # minutes. Generous, but not unbounded.
 TimeoutStartSec=12h
