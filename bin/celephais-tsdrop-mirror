@@ -43,6 +43,10 @@ ALERT_EVERY = 6 * 3600
 ENV = dict(os.environ, RCLONE_CONFIG="/etc/celephais/rclone.conf",
            XDG_CACHE_HOME="/var/cache/celephais")
 NET = ["--contimeout", "10s", "--timeout", "60s", "--low-level-retries", "2", "--retries", "1"]
+# The mirror shares the LAN (100 Mbit/s here) with the app itself. A big new file copied to
+# the laptop at full speed would make the app crawl for everyone meanwhile, so: a third of
+# the link, two files at a time. The steady state is a few KB every 5 minutes anyway.
+NET += ["--bwlimit", "4M", "--transfers", "2", "--checkers", "4"]
 
 
 class Unreachable(Exception):

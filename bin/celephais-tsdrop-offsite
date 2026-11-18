@@ -32,6 +32,7 @@ ENV = dict(os.environ,
            RESTIC_PASSWORD_FILE="/etc/celephais/restic-offsite.pass",
            XDG_CACHE_HOME="/var/cache/celephais")
 MARKER = ".tsbackup"
+UPLOAD_KIB = os.environ.get("TSDROP_MEGA_KIB", "512")
 
 
 def selected():
@@ -70,8 +71,10 @@ def main():
             f.write("\n".join(os.path.join(DATA, p) for p, _ in sel) + "\n")
             lst = f.name
         try:
+            # Daytime job on the home uplink, which is also what a phone away from home
+            # downloads through: never take more than half of it (~1.2 MB/s measured).
             restic("backup", "--tag", "tsdrop", "--files-from-raw", lst,
-                   "--group-by", "host,tags")
+                   "--group-by", "host,tags", "--limit-upload", UPLOAD_KIB)
         finally:
             os.unlink(lst)
     else:

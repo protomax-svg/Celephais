@@ -10,7 +10,7 @@ DAV_PATH=/remote.php/dav/files/transferapp/file-transfer-app
 apt-get update -qq
 apt-get install -y -qq apache2 apache2-utils curl ca-certificates >/dev/null
 
-a2enmod -q dav dav_fs auth_basic authn_file headers >/dev/null
+a2enmod -q dav dav_fs auth_basic authn_file headers deflate >/dev/null
 a2dissite -q 000-default >/dev/null 2>&1 || true
 
 echo "Listen 8080" > /etc/apache2/ports.conf
@@ -36,9 +36,24 @@ cat > /etc/apache2/sites-available/tsdrop.conf <<EOF
   LimitRequestBody 0
   Timeout 3600
 
+  # The app polls every few seconds, so let a connection live across polls instead of
+  # paying a new TCP (and, remotely, WireGuard) round trip each time.
+  KeepAlive On
+  KeepAliveTimeout 30
+  MaxKeepAliveRequests 2000
+  # Large downloads straight from the page cache, without a copy through Apache.
+  EnableSendfile On
+
   Alias $DAV_PATH /srv/tsdrop/data
   <Directory /srv/tsdrop/data>
     DAV On
+    # Folder listings (PROPFIND) and message JSON shrink ~10x when gzipped. By type
+    # (AddOutputFilterByType) does not reach mod_dav's own responses, so: gzip every
+    # reply, then exempt file transfers - media is compressed already and big files
+    # should keep sendfile - except .json, which is what the app reads all day.
+    SetOutputFilter DEFLATE
+    SetEnvIf Request_Method "^(GET|HEAD|PUT)$" no-gzip
+    SetEnvIfNoCase Request_URI "\.json$" !no-gzip
     Options None
     AllowOverride None
     # mod_dir would answer a collection without its trailing slash with a
