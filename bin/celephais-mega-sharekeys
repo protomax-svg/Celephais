@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Give every file in a shared MEGA folder a key the folder's link can open.
+
+    celephais-mega-sharekeys tsdrop-restic /etc/celephais/tsdrop-restic.link
+
+Why: on MEGA every file has its own key. A folder link can only open files whose
+key has also been encrypted with that folder's share key, which the official
+clients do on upload. rclone's MEGA library does not, so everything restic
+uploads after the link was made shows up through the link nameless and
+unreadable. This adds the missing keys (the API's `k` command with a `cr`
+request, as the web client does) and changes nothing else: no file is moved,
+renamed or deleted, and the link stays the same.
+
+Signs in with the `mega` remote in /etc/celephais/rclone.conf (password revealed
+through `rclone reveal`). Needs python3-cryptography. Hourly, after the upload,
+from celephais-tsdrop-offsite.
+"""
+import base64
+import configparser
+import hashlib
+import json
+import random
+import subprocess
+import sys
+import time
+import urllib.request
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+RCLONE_CONFIG = "/etc/celephais/rclone.conf"
+LINK_FILE = "/etc/celephais/tsdrop-restic.link"
+API = "https://g.api.mega.co.nz/cs"
+
+
+def b64d(s):
+    s = s.replace(",", "")
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def b64e(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def ecb(key, data, enc):
+    c = Cipher(algorithms.AES(key), modes.ECB())
+    x = c.encryptor() if enc else c.decryptor()
+    return x.update(data) + x.finalize()
+
+
+def fold(key):
+    """A file key is 32 bytes; the AES key in it is the two halves XORed."""
+    return bytes(a ^ b for a, b in zip(key[:16], key[16:])) if len(key) == 32 else key
+
+
+class Mega:
+    def __init__(self):
+        self.seq = random.randint(0, 0x7FFFFFFF)
+        self.sid = None
+
+    def req(self, cmd):
+        for attempt in range(8):
+            url = f"{API}?id={self.seq}" + (f"&sid={self.sid}" if self.sid else "")
+            self.seq += 1
+            r = urllib.request.Request(url, json.dumps([cmd]).encode(), {"Content-Type": "application/json"})
+            with urllib.request.urlopen(r, timeout=120) as resp:
+                out = json.loads(resp.read())
+            res = out if isinstance(out, int) else out[0]
+            if res == -3:                   # EAGAIN: MEGA says try again
+                time.sleep(2 ** attempt)
+                continue
+            if isinstance(res, int) and res < 0:
+                raise SystemExit(f"MEGA refused {cmd.get('a')}: error {res}")
+            return res
+        raise SystemExit(f"MEGA kept saying 'try again' to {cmd.get('a')}")
+
+    def login(self, email, password):
+        email = email.lower()
+        pre = self.req({"a": "us0", "user": email})
+        if pre.get("v") == 2:
+            dk = hashlib.pbkdf2_hmac("sha512", password.encode(), b64d(pre["s"]), 100000, 32)
+            pkey, uh = dk[:16], b64e(dk[16:32])
+        else:
+            pkey = self.v1_key(password.encode())
+            uh = self.v1_hash(email.encode(), pkey)
+        res = self.req({"a": "us", "user": email, "uh": uh})
+        if "csid" not in res:
+            raise SystemExit("MEGA login gave no session (two-factor login is not supported here)")
+        master = ecb(pkey, b64d(res["k"]), False)
+        priv = ecb(master, b64d(res["privk"]), False)
+        mpis = []
+        while len(mpis) < 4:                # p, q, d, u: 2-byte bit length, then the number
+            n = (int.from_bytes(priv[:2], "big") + 7) // 8
+            mpis.append(int.from_bytes(priv[2:2 + n], "big"))
+            priv = priv[2 + n:]
+        p, q, d, _ = mpis
+        c = b64d(res["csid"])
+        n = (int.from_bytes(c[:2], "big") + 7) // 8
+        m = pow(int.from_bytes(c[2:2 + n], "big"), d, p * q)
+        sid = m.to_bytes((m.bit_length() + 7) // 8, "big")
+        self.sid = b64e(sid[:43])
+        self.master = master
+        self.user = res["u"]
+
+    @staticmethod
+    def v1_key(pw):
+        pw = pw + b"\0" * (-len(pw) % 16)
+        keys = [pw[i:i + 16] for i in range(0, len(pw), 16)]
+        k = bytes.fromhex("93C467E37DB0C7A4D1BE3F810152CB56")
+        for _ in range(65536):
+            for key in keys:
+                k = ecb(key, k, True)
+        return k
+
+    @staticmethod
+    def v1_hash(email, pkey):
+        h = bytearray(16)
+        for i, b in enumerate(email):
+            h[i % 16] ^= b
+        h = bytes(h)
+        for _ in range(16384):
+            h = ecb(pkey, h, True)
+        return b64e(h[0:4] + h[8:12])
+
+    def node_key(self, n, share_keys):
+        """This account's copy of a node's key, or None."""
+        for part in (n.get("k") or "").split("/"):
+            owner, _, enc = part.partition(":")
+            if not enc:
+                continue
+            if owner == self.user:
+                return ecb(self.master, b64d(enc), False)
+            if owner in share_keys:
+                return ecb(share_keys[owner], b64d(enc), False)
+        return None
+
+
+def name_of(n, key):
+    if not key or not n.get("a"):
+        return None
+    c = Cipher(algorithms.AES(fold(key)), modes.CBC(b"\0" * 16)).decryptor()
+    a = (c.update(b64d(n["a"])) + c.finalize()).rstrip(b"\0")
+    if not a.startswith(b'MEGA{"'):
+        return None
+    try:
+        return json.loads(a[4:].decode()).get("n")
+    except ValueError:
+        return None
+
+
+def link_key(path):
+    """The share key is the part of a folder link after # (or the last ! of an old one)."""
+    with open(path) as f:
+        link = f.read().strip()
+    key = link.split("#", 1)[1] if "/folder/" in link else link.rsplit("!", 1)[-1]
+    k = b64d(key.split("/")[0])
+    if len(k) != 16:
+        raise SystemExit(f"{path} does not hold a folder link with its key")
+    return k
+
+
+def main():
+    folder = sys.argv[1] if len(sys.argv) > 1 else "tsdrop-restic"
+    link_file = sys.argv[2] if len(sys.argv) > 2 else LINK_FILE
+    cfg = configparser.ConfigParser()
+    cfg.read(RCLONE_CONFIG)
+    if "mega" not in cfg:
+        raise SystemExit(f"no [mega] remote in {RCLONE_CONFIG}")
+    password = subprocess.run(["rclone", "reveal", cfg["mega"]["pass"]], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    mega = Mega()
+    mega.login(cfg["mega"]["user"], password)
+
+    tree = mega.req({"a": "f", "c": 1, "r": 1})
+    share_keys = {s["h"]: ecb(mega.master, b64d(s["k"]), False) for s in tree.get("ok", [])}
+    nodes = tree["f"]
+    root = next(n["h"] for n in nodes if n["t"] == 2)
+    keys = {n["h"]: mega.node_key(n, share_keys) for n in nodes}
+    top = [n for n in nodes if n["p"] == root and n["t"] == 1 and name_of(n, keys[n["h"]]) == folder]
+    if not top:
+        raise SystemExit(f"no folder {folder!r} at the top of the MEGA drive")
+    share = top[0]["h"]
+    # Accounts made since MEGA's key manager keep share keys in an encrypted user
+    # attribute instead of the `ok` list; the link carries the same key, so use that.
+    share_keys.setdefault(share, link_key(link_file))
+
+    kids = {}
+    for n in nodes:
+        kids.setdefault(n["p"], []).append(n)
+    todo, stack = [], [share]
+    while stack:
+        for n in kids.get(stack.pop(), []):
+            if n["t"] == 1:
+                stack.append(n["h"])
+            has = any(part.split(":")[0] == share for part in (n.get("k") or "").split("/"))
+            if not has and keys[n["h"]]:
+                todo.append(n)
+    if not todo:
+        print(f"{folder}: every file already opens through the link")
+        return
+    sk = share_keys[share]
+    for i in range(0, len(todo), 500):
+        batch = todo[i:i + 500]
+        cr = [[share], [n["h"] for n in batch], []]
+        for j, n in enumerate(batch):
+            cr[2] += [0, j, b64e(ecb(sk, keys[n["h"]], True))]
+        mega.req({"a": "k", "cr": cr})
+    print(f"{folder}: link keys added for {len(todo)} new files and folders")
+
+
+if __name__ == "__main__":
+    main()

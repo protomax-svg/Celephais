@@ -12,10 +12,15 @@ read them without any key:
 Everything (switched on or not) still goes to the USB disk nightly and to the
 laptop every 5 minutes; this is only the copy that leaves the building.
 
-Same restic repository as the cloud share's offsite copy, tagged `tsdrop`.
-Only `forget` here, no `prune`: the nightly celephais-backup-offsite prunes
-the whole repository at 04:00, and pruning hourly would mean re-reading MEGA
-every hour for a few kilobytes.
+A restic repository of its own on MEGA (tsdrop-restic), with its own password,
+not the cloud share's: the TSDROP app reads this one back when no server
+answers, so a phone holding its key must not hold the key to everything else.
+The app gets in through a read-only MEGA folder link, so it cannot delete
+anything either. Link and password reach the app through /.offsite.json in
+TSDROP's root, rewritten here every run (install-tsdrop-backup.sh makes them).
+
+`forget` every hour, `prune` once a day (03:xx): pruning hourly would re-read
+MEGA every hour for a few kilobytes.
 """
 import json
 import os
@@ -26,10 +31,14 @@ import time
 
 DATA = "/mnt/hdd/tsdrop/data"
 STATUS = "/var/lib/celephais/tsdrop-offsite.json"
+PASS_FILE = "/etc/celephais/tsdrop-restic.pass"
+LINK_FILE = "/etc/celephais/tsdrop-restic.link"
+FOR_APP = os.path.join(DATA, ".offsite.json")
+OWNER = 100033            # www-data (33) inside the unprivileged CT 211
 ENV = dict(os.environ,
            RCLONE_CONFIG="/etc/celephais/rclone.conf",
-           RESTIC_REPOSITORY="rclone:mega:celephais-restic",
-           RESTIC_PASSWORD_FILE="/etc/celephais/restic-offsite.pass",
+           RESTIC_REPOSITORY="rclone:mega:tsdrop-restic",
+           RESTIC_PASSWORD_FILE=PASS_FILE,
            XDG_CACHE_HOME="/var/cache/celephais")
 MARKER = ".tsbackup"
 UPLOAD_KIB = os.environ.get("TSDROP_MEGA_KIB", "512")
@@ -60,15 +69,53 @@ def selected():
 
 
 def restic(*args):
-    subprocess.run(["restic", *args, "--retry-lock", "30m"], env=ENV, check=True)
+    """Fails with restic's own last words, not a Python traceback: the failure alert
+    shows the end of the log, and that is where the reason has to be."""
+    p = subprocess.run(["restic", *args, "--retry-lock", "30m"], env=ENV,
+                       stderr=subprocess.PIPE, text=True)
+    if p.stderr:
+        sys.stderr.write(p.stderr)
+    if p.returncode != 0:
+        why = " | ".join(p.stderr.strip().splitlines()[-4:]) or "no message"
+        raise SystemExit(f"restic {args[0]} failed (exit {p.returncode}): {why}")
+
+
+def tell_the_app():
+    """/.offsite.json: what the app keeps on each device for the day no server answers.
+    Readable only by the web server (and so only with TSDROP's password); written only
+    when it changed, so the laptop mirror does not copy it every hour."""
+    try:
+        with open(PASS_FILE) as f:
+            password = f.read().strip()
+        with open(LINK_FILE) as f:
+            link = f.read().strip()
+    except OSError:
+        print("no link or password for the app yet; run install-tsdrop-backup.sh")
+        return
+    body = json.dumps({"link": link, "password": password, "root": DATA}) + "\n"
+    try:
+        with open(FOR_APP) as f:
+            if f.read() == body:
+                return
+    except OSError:
+        pass
+    tmp = FOR_APP + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(body)
+    os.chown(tmp, OWNER, OWNER)
+    os.replace(tmp, FOR_APP)
 
 
 def main():
+    # first, so the app gets its way back in even on a run whose upload fails
+    tell_the_app()
     sel = selected()
     status = {"time": time.time(), "selected": [l for _, l in sel if l]}
     if sel:
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
-            f.write("\n".join(os.path.join(DATA, p) for p, _ in sel) + "\n")
+            # --files-from-raw is NUL-separated, NUL-terminated (restic 0.18 refuses newlines)
+            f.write("".join(os.path.join(DATA, p) + "\0" for p, _ in sel))
             lst = f.name
         try:
             # Daytime job on the home uplink, which is also what a phone away from home
@@ -82,8 +129,15 @@ def main():
     # Keep a day of hours, then thin out. Runs even with nothing selected, so
     # switching everything off lets the old copies age out instead of
     # sitting there forever.
+    prune = ["--prune"] if time.localtime().tm_hour == 3 else []
     restic("forget", "--tag", "tsdrop", "--group-by", "host,tags",
-           "--keep-hourly", "24", "--keep-daily", "7", "--keep-weekly", "4", "--keep-monthly", "6")
+           "--keep-hourly", "24", "--keep-daily", "7", "--keep-weekly", "4", "--keep-monthly", "6", *prune)
+    if prune:
+        restic("check")      # metadata only; reading the packs back would spend MEGA's download cap
+    # rclone uploads without the share-link key, so the app could not open anything new
+    # through the link; give the new files theirs (celephais-mega-sharekeys says why)
+    if os.path.exists(LINK_FILE):
+        subprocess.run(["celephais-mega-sharekeys", "tsdrop-restic", LINK_FILE], check=True)
     os.makedirs(os.path.dirname(STATUS), exist_ok=True)
     with open(STATUS, "w") as f:
         json.dump(status, f)
